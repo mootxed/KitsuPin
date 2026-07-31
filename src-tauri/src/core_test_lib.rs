@@ -1,0 +1,8 @@
+#[path = "domain/mod.rs"]
+pub mod domain;
+#[path = "persistence/mod.rs"]
+pub mod persistence;
+#[path = "browser_metadata/mod.rs"]
+pub mod browser_metadata;
+#[path = "native_host.rs"]
+pub mod native_host;

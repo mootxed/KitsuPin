@@ -1,0 +1,21 @@
+[package]
+name = "pastily-core-tests"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "../src/core_test_lib.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+log = "0.4"
+parking_lot = "0.12"
+regex = "1"
+rusqlite = { version = "0.32", features = ["bundled", "chrono", "functions"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+url = "2"
+uuid = { version = "1", features = ["v4"] }

@@ -1,0 +1,46 @@
+[package]
+name = "pastily"
+version = "0.1.0"
+description = "Локальная история буфера обмена для KDE X11"
+authors = ["Pastily contributors"]
+edition = "2021"
+default-run = "pastily"
+
+[lib]
+name = "pastily_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "pastily"
+path = "src/main.rs"
+
+[[bin]]
+name = "pastily-native-host"
+path = "src/bin/native_host.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1"
+arboard = { version = "3.6", default-features = false }
+chrono = { version = "0.4", features = ["serde"] }
+directories = "6"
+hex = "0.4"
+log = "0.4"
+parking_lot = "0.12"
+regex = "1"
+rusqlite = { version = "0.32", features = ["bundled", "chrono", "functions"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-log = "2"
+thiserror = "2"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+x11rb = { version = "0.13", features = ["xfixes"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Pastily
+Comment=Локальная история буфера обмена
+Exec=pastily --background
+Icon=pastily
+Terminal=false
+OnlyShowIn=KDE;
+X-GNOME-Autostart-enabled=true

@@ -1,0 +1,6 @@
+.category-list { display: grid; gap: 7px; margin: 20px 0; }
+.category-edit { display: grid !important; grid-template-columns: 1fr 48px auto 34px; gap: 6px !important; margin: 0 !important; }
+.category-edit input, .category-edit button { min-width: 0; border: 1px solid var(--line); background: white; padding: 8px; }
+.category-edit button svg { width: 14px; }
+.category-edit button:last-child { color: #92463a; }
+.load-more { display: block; margin: 28px auto 0; padding: 10px 18px; border: 1px solid var(--line); background: var(--paper); font-weight: 700; }
