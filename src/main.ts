@@ -1,5 +1,4 @@
 import "./styles.css";
-import "./category-editor.css";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, isTauri } from "./api";
@@ -102,21 +101,17 @@ async function refresh() {
 
 function filtersMarkup(): string {
   const types: ContentType[] = ["Text", "Links", "Email", "Numbers"];
+  const typeLabels: Record<ContentType, string> = { Text: "Текст", Links: "Ссылки", Email: "Почта", Numbers: "Числа" };
   const domains = [...new Set(state.clips.map((c) => c.domain).filter((v): v is string => !!v))].slice(0, 5);
-  return `<div class="filter-rail" role="toolbar" aria-label="Фильтры"><button class="filter ${
-    !state.type && !state.category && !state.domain ? "active" : ""
-  }" data-filter="all">Все</button>${types
-    .map((t) => `<button class="filter type-${t.toLowerCase()} ${state.type === t ? "active" : ""}" data-type="${t}">${t}</button>`)
-    .join("")}${state.categories
-    .map(
-      (c) =>
-        `<button class="filter user-filter ${state.category === c.id ? "active" : ""}" data-category="${c.id}" style="--tag:${
-          c.color
-        }">${esc(c.name)}</button>`
-    )
-    .join("")}${domains
-    .map((d) => `<button class="filter domain-filter ${state.domain === d ? "active" : ""}" data-domain="${esc(d)}">${esc(d)}</button>`)
-    .join("")}${popup ? "" : `<button class="filter add-category" data-action="new-category"><i data-lucide="plus"></i> Категория</button>`}</div>`;
+  const allActive = !state.type && !state.category && !state.domain;
+  return [
+    `<button class="chip ${allActive ? "active" : ""}" data-filter="all">Все</button>`,
+    ...types.map((t) => `<button class="chip ${state.type === t ? "active" : ""}" data-type="${t}">${typeLabels[t]}</button>`),
+    ...state.categories.map((c) => `<button class="chip user-chip ${state.category === c.id ? "active" : ""}" data-category="${c.id}" style="--tag:${c.color}">${esc(c.name)}</button>`),
+    ...domains.map((d) => `<button class="chip ${state.domain === d ? "active" : ""}" data-domain="${esc(d)}">${esc(d)}</button>`),
+    `<span class="spacer"></span>`,
+    popup ? "" : `<select class="grouping-select" id="grouping" aria-label="Группировка"><option value="none">Без группировки</option><option value="domain">По домену</option><option value="category">По категории</option><option value="type">По типу</option></select>`,
+  ].join("");
 }
 
 function renderFilters() {
@@ -171,61 +166,135 @@ function bindFilters(root: HTMLElement) {
 
 function renderShell() {
   app.className = popup ? "popup-shell" : "main-shell";
-  // No arguments — no duplicate filters-container ID.
   app.innerHTML = popup ? popupShell() : mainWindowShell();
   bindShell();
   hydrateIcons(app);
 }
 
+function showScreen(id: string) {
+  document.querySelectorAll<HTMLElement>(".screen").forEach((s) => {
+    s.classList.toggle("active", s.id === id);
+  });
+  document.querySelectorAll<HTMLElement>(".sidebar .navbtn[data-screen]").forEach((b) => {
+    const active = b.dataset.screen === id;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-current", active ? "page" : "false");
+  });
+  // When switching to settings screen, hydrate its content
+  if (id === "settings") renderSettingsScreen();
+  // When switching to categories screen, render list
+  if (id === "categories") renderCategoriesScreen();
+}
+
 function bindShell() {
-  const input = document.querySelector<HTMLInputElement>("#search")!;
+  const input = document.querySelector<HTMLInputElement>("#search");
   let timer = 0;
   input?.addEventListener("input", () => {
-    state.search = input.value;
+    state.search = input!.value;
     clearTimeout(timer);
     timer = window.setTimeout(refresh, 120);
   });
   if (popup && input) setTimeout(() => input.focus(), 20);
-  document.querySelector("#grouping")?.addEventListener("change", (e) => {
-    state.grouping = (e.target as HTMLSelectElement).value as Grouping;
-    renderCards();
+
+  // Sidebar navigation
+  document.querySelectorAll<HTMLElement>(".sidebar .navbtn[data-screen]").forEach((b) => {
+    b.addEventListener("click", () => showScreen(b.dataset.screen!));
   });
-  document.querySelector("[data-action=settings]")?.addEventListener("click", showSettings);
+
+  // Settings button in toolbar navigates to settings screen
+  document.querySelector("[data-action=settings]")?.addEventListener("click", () => showScreen("settings"));
+
+  // Pause/resume button
+  const pauseBtn = document.querySelector<HTMLButtonElement>("#btn-pause");
+  pauseBtn?.addEventListener("click", () => {
+    const s = state.settings;
+    if (!s) return;
+    const paused = !s.paused;
+    api.saveSettings({ ...s, paused }).then(() => {
+      state.settings = { ...s, paused };
+      updateRecordingStatus(paused);
+      if (pauseBtn) pauseBtn.querySelector("span")!.textContent = paused ? "Продолжить" : "Пауза";
+      showToast(paused ? "Запись приостановлена" : "Запись возобновлена", "info");
+    }).catch(() => showToast("Не удалось изменить статус записи"));
+  });
+
+  // Window buttons (Tauri)
+  if (isTauri) {
+    document.querySelector("#btn-minimize")?.addEventListener("click", () => getCurrentWindow().minimize());
+    document.querySelector("#btn-close")?.addEventListener("click", () => getCurrentWindow().close());
+  }
+
+  // New category button on categories screen
+  document.querySelector("#btn-new-category")?.addEventListener("click", showCategoryModal);
+
+  // Grouping select (delegated — filters-container is re-rendered)
+  document.querySelector("#filters-container")?.addEventListener("change", (e) => {
+    const sel = e.target as HTMLSelectElement;
+    if (sel.id === "grouping") {
+      state.grouping = sel.value as Grouping;
+      renderCards();
+    }
+  });
+}
+
+function updateRecordingStatus(paused: boolean) {
+  const dot = document.querySelector<HTMLElement>("#status-dot");
+  const text = document.querySelector<HTMLElement>("#status-text");
+  dot?.classList.toggle("paused", paused);
+  if (text) text.textContent = paused ? "Запись приостановлена" : "История записывается";
 }
 
 // ── Card rendering ────────────────────────────────────────────────────────────
 
+const TYPE_LABELS: Record<string, string> = { Text: "Текст", Links: "Ссылка", Email: "Почта", Numbers: "Число" };
+
 function clipCard(c: ClipSummary, index: number) {
-  const categories = c.categories
-    .map((x) =>
-      popup
-        ? `<span class="tag user-tag" style="--tag:${x.color}">${esc(x.name)}</span>`
-        : `<button class="tag user-tag" style="--tag:${x.color}" data-unassign="${x.id}" title="Убрать категорию">${esc(x.name)} ×</button>`
-    )
-    .join("");
-  // 6.3: use backend is_truncated flag (not JS string.length comparison).
   const isTruncated = c.isTruncated;
-  // 6.1: details button only in main window (no #modal-root in popup).
-  const detailsButton =
-    isTruncated && !popup
-      ? `<button data-action="details" aria-label="Просмотреть полностью" title="Просмотреть полностью"><i data-lucide="eye"></i></button>`
-      : "";
-  return `<article class="clip-card type-edge-${c.contentType.toLowerCase()} ${
-    popup && index === state.selected ? "selected" : ""
-  }" tabindex="0" data-clip="${c.id}" draggable="${!popup}" aria-label="Скопировать фрагмент"><div class="card-meta">${tag(
-    c.contentType,
-    `type-${c.contentType.toLowerCase()}`
-  )}${c.domain ? tag(c.domain, "domain-tag") : ""}${categories}<time>${relativeTime(
-    c.lastCopiedAt
-  )}</time></div><p class="preview">${esc(c.preview)}${isTruncated ? "…" : ""}</p>${c.pageTitle ? `<p class="page-title">${esc(c.pageTitle)}</p>` : ""}<div class="card-foot"><span>${
-    c.copyCount > 1 ? `скопировано ${c.copyCount} раза` : "одна копия"
-  }${isTruncated ? ` · ${c.contentLength} симв.` : ""}</span><div class="card-actions">${detailsButton}${
-    popup
-      ? ""
-      : `<button data-action="pin" aria-label="${c.pinned ? "Открепить" : "Закрепить"}"><i data-lucide="${
-          c.pinned ? "pin-off" : "pin"
-        }"></i></button><button data-action="delete" aria-label="Удалить"><i data-lucide="trash-2"></i></button>`
-  }</div>${c.pinned ? `<i class="pin-corner" data-lucide="pin"></i>` : ""}</div></article>`;
+  const typeLabel = TYPE_LABELS[c.contentType] ?? c.contentType;
+
+  if (popup) {
+    // Compact popup style — popitem
+    const metaLabel = c.domain ? `${typeLabel} · ${c.domain}` : typeLabel;
+    return `<button class="popitem ${index === state.selected ? "selected" : ""}" tabindex="0" data-clip="${c.id}" aria-label="Скопировать фрагмент">
+      <span class="popnum">${index + 1 <= 9 ? index + 1 : "·"}</span>
+      <span><p>${esc(c.preview)}${isTruncated ? "…" : ""}</p><small>${metaLabel}</small></span>
+      <span class="kbd">Enter</span>
+    </button>`;
+  }
+
+  // Main window — list item style matching prototype
+  const categories = c.categories
+    .map((x) => `<button class="tag user-tag" style="--tag:${x.color}" data-unassign="${x.id}" title="Убрать категорию">${esc(x.name)} ×</button>`)
+    .join("");
+  const detailsButton = isTruncated
+    ? `<button class="iconbtn" data-action="details" aria-label="Полный текст" title="Полный текст"><i data-lucide="eye"></i></button>`
+    : "";
+  const pinIcon = c.pinned
+    ? `<button class="iconbtn" data-action="pin" aria-label="Открепить"><i data-lucide="pin-off"></i></button>`
+    : `<button class="iconbtn" data-action="pin" aria-label="Закрепить"><i data-lucide="pin"></i></button>`;
+
+  return `<article class="clip ${c.pinned ? "pinned" : ""}" tabindex="0" data-clip="${c.id}" draggable="true" aria-label="Скопировать фрагмент">
+    <button class="clip-main">
+      <div class="clip-top">
+        <strong>${esc(typeLabel)}</strong>
+        ${c.domain ? `<span>${esc(c.domain)}</span>` : ""}
+        ${c.pageTitle ? `<span>·</span><span>${esc(c.pageTitle)}</span>` : ""}
+      </div>
+      <div class="clip-text">${esc(c.preview)}${isTruncated ? "…" : ""}</div>
+      <div class="clip-meta">
+        ${tag(c.contentType, `type-${c.contentType.toLowerCase()}`)}
+        ${categories}
+        <span>${c.copyCount > 1 ? `скопировано ${c.copyCount} раз` : "одна копия"}${isTruncated ? ` · ${c.contentLength} симв.` : ""}</span>
+        <span>· ${relativeTime(c.lastCopiedAt)}</span>
+      </div>
+    </button>
+    <div class="clip-actions">
+      ${detailsButton}
+      ${pinIcon}
+      <button class="iconbtn" data-action="assign-cat" aria-label="Категория" title="Категория"><i data-lucide="tag"></i></button>
+      <button class="iconbtn" data-action="delete" aria-label="Удалить"><i data-lucide="trash-2"></i></button>
+    </div>
+  </article>`;
 }
 
 function groups(): [string, ClipSummary[]][] {
@@ -260,20 +329,23 @@ function renderCards() {
   const root = document.querySelector<HTMLElement>("#cards");
   if (!root) return;
   if (!state.clips.length) {
-    root.innerHTML = `<div class="empty"><div class="empty-paper"><i data-lucide="clipboard"></i></div><h3>${
-      state.search ? "Ничего не найдено" : "История пока пуста"
-    }</h3><p>${state.search ? "Попробуйте другой запрос или сбросьте фильтры." : "Скопируйте текст через Ctrl+C — он появится здесь."}</p></div>`;
-    hydrateIcons(root);
+    root.innerHTML = `<div class="empty">
+      <svg class="fox" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M4 5.5 8.2 8 12 6.5 15.8 8 20 5.5l-1.2 8.2C18.3 17.4 15.5 20 12 21c-3.5-1-6.3-3.6-6.8-7.3L4 5.5Z"/></svg>
+      <h2>${state.search ? "Лиса ничего не нашла" : "История пока пуста"}</h2>
+      <p>${state.search ? "Попробуйте другой запрос или сбросьте фильтры." : "Скопируйте текст через Ctrl+C — он появится здесь."}</p>
+    </div>`;
     return;
   }
   if (popup) {
-    root.innerHTML = state.clips.map(clipCard).join("");
+    root.innerHTML = state.clips.map((c, i) => clipCard(c, i)).join("");
   } else {
-    root.innerHTML =
-      groups()
-        .filter(([, clips]) => clips.length)
-        .map(([name, clips]) => `<section class="clip-group">${name ? `<h3>${esc(name)}</h3>` : ""}<div class="clip-grid">${clips.map((c, i) => clipCard(c, i)).join("")}</div></section>`)
-        .join("") + `${state.hasMore ? '<button class="load-more" data-load-more>Показать ещё</button>' : ""}`;
+    const grouped = groups().filter(([, clips]) => clips.length);
+    root.innerHTML = grouped
+      .map(([name, clips]) => [
+        name ? `<div class="sectionhead">${esc(name)}</div>` : "",
+        clips.map((c, i) => clipCard(c, i)).join(""),
+      ].join(""))
+      .join("") + (state.hasMore ? '<button class="load-more" data-load-more>Показать ещё</button>' : "");
   }
   bindCards(root);
   root.querySelector("[data-load-more]")?.addEventListener("click", loadMore);
@@ -291,29 +363,24 @@ function bindCards(root: HTMLElement) {
   root.querySelectorAll<HTMLElement>("[data-clip]").forEach((card) => {
     const clip = state.clips.find((c) => c.id === card.dataset.clip)!;
 
-    card.onclick = async (e) => {
-      // 6.2: ignore clicks on interactive child elements.
-      if (isInteractiveTarget(e.target)) return;
+    // Main action: copy on click on clip-main button or on popitem
+    const mainBtn = card.classList.contains("popitem") ? card : card.querySelector<HTMLElement>(".clip-main");
+    mainBtn?.addEventListener("click", async () => {
       try {
         let content: string | undefined;
-        if (!isTauri) {
-          content = await api.getClipContent(clip.id);
-        }
+        if (!isTauri) content = await api.getClipContent(clip.id);
         await api.copy(clip.id, popup, content);
       } catch {
         showToast("Не удалось скопировать");
       }
-    };
+    });
 
     card.onkeydown = async (e) => {
       if (e.key === "Enter") {
-        // 6.2: ignore Enter when focus is on an interactive element within the card.
         if (isInteractiveTarget(e.target)) return;
         try {
           let content: string | undefined;
-          if (!isTauri) {
-            content = await api.getClipContent(clip.id);
-          }
+          if (!isTauri) content = await api.getClipContent(clip.id);
           await api.copy(clip.id, popup, content);
         } catch {
           showToast("Не удалось скопировать");
@@ -323,11 +390,13 @@ function bindCards(root: HTMLElement) {
 
     card.ondragstart = (e) => e.dataTransfer?.setData("text/kitsupin", clip.id);
 
-    card.querySelector<HTMLElement>("[data-action=details]")?.addEventListener("click", () =>
-      showClipDetailsModal(clip.id)
-    );
+    card.querySelector<HTMLElement>("[data-action=details]")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      showClipDetailsModal(clip.id);
+    });
 
-    card.querySelector<HTMLElement>("[data-action=pin]")?.addEventListener("click", async () => {
+    card.querySelector<HTMLElement>("[data-action=pin]")?.addEventListener("click", async (e) => {
+      e.stopPropagation();
       try {
         await api.pin(clip.id, !clip.pinned);
         await reload();
@@ -336,12 +405,18 @@ function bindCards(root: HTMLElement) {
       }
     });
 
+    card.querySelector<HTMLElement>("[data-action=assign-cat]")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      showCategoryModal();
+    });
+
     // 6.7: confirm before deleting a pinned clip.
-    card.querySelector<HTMLElement>("[data-action=delete]")?.addEventListener("click", async () => {
+    card.querySelector<HTMLElement>("[data-action=delete]")?.addEventListener("click", async (e) => {
+      e.stopPropagation();
       if (clip.pinned) {
         const confirmed = await confirmModal(
-          "Удалить закреплённую карточку?",
-          "Карточка закреплена. Удалить её из истории?"
+          "Удалить закреплённый фрагмент?",
+          "Фрагмент закреплён. Удалить его из истории?"
         );
         if (!confirmed) return;
       }
@@ -355,7 +430,8 @@ function bindCards(root: HTMLElement) {
 
     card.querySelectorAll<HTMLElement>("[data-unassign]").forEach(
       (x) =>
-        (x.onclick = async () => {
+        (x.onclick = async (e) => {
+          e.stopPropagation();
           try {
             await api.unassign(clip.id, x.dataset.unassign!);
             await reload();
@@ -396,10 +472,16 @@ async function showClipDetailsModal(clipId: string) {
   if (!clip) return;
   const content = await api.getClipContent(clipId);
   const root = modal(
-    "Детали фрагмента",
-    `<div class="clip-details-view"><div class="clip-details-meta"><span>Тип: <b>${clip.contentType}</b></span><span>Длина: <b>${clip.contentLength} символов</b></span>${
-      clip.domain ? `<span>Источник: <b>${esc(clip.domain)}</b></span>` : ""
-    }</div><pre class="clip-details-content">${esc(content)}</pre><div class="modal-actions" style="margin-top:16px;display:flex;justify-content:flex-end;"><button class="primary" data-action="copy-details">Скопировать в буфер</button></div></div>`
+    "Полный текст",
+    `<div style="padding:16px"><div style="display:flex;gap:16px;font-size:12px;color:var(--muted);margin-bottom:12px">
+      <span>Тип: <b>${clip.contentType}</b></span>
+      <span>Длина: <b>${clip.contentLength} символов</b></span>
+      ${clip.domain ? `<span>Источник: <b>${esc(clip.domain)}</b></span>` : ""}
+    </div>
+    <div class="fulltext">${esc(content)}</div>
+    <div class="modal-actions">
+      <button class="btn primary" data-action="copy-details">Скопировать в буфер</button>
+    </div></div>`
   );
   if (!root) return;
   root.querySelector("[data-action=copy-details]")?.addEventListener("click", async () => {
@@ -409,6 +491,29 @@ async function showClipDetailsModal(clipId: string) {
     } catch {
       showToast("Не удалось скопировать");
     }
+  });
+}
+
+// ── Categories screen ─────────────────────────────────────────────────────────
+
+function renderCategoriesScreen() {
+  const list = document.querySelector<HTMLElement>("#category-list");
+  if (!list) return;
+  if (!state.categories.length) {
+    list.innerHTML = `<div class="empty" style="padding:32px"><p>Категорий пока нет.</p></div>`;
+    return;
+  }
+  list.innerHTML = state.categories
+    .map(
+      (c) => `<div class="cat-row">
+        <i class="swatch" style="--cat-color:${c.color}"></i>
+        <strong>${esc(c.name)}</strong>
+        <button class="iconbtn" data-edit-cat="${c.id}" aria-label="Изменить категорию ${esc(c.name)}">•••</button>
+      </div>`
+    )
+    .join("");
+  list.querySelectorAll<HTMLElement>("[data-edit-cat]").forEach((btn) => {
+    btn.addEventListener("click", () => showCategoryModal());
   });
 }
 
@@ -425,9 +530,9 @@ function showCategoryModal() {
     .join("");
   const root = modal(
     "Категории",
-    `<div class="category-list">${
-      existing || "<p class=notice>Пользовательских категорий пока нет.</p>"
-    }</div><form id="category-form"><label>Новая категория<input name="name" maxlength="60" required placeholder="Например, Japanese"/></label><label>Цвет<input name="color" type="color" value="#f2a65a"/></label><button class="primary" type="submit">Создать категорию</button></form>`
+    `<div class="modal-category-list" style="padding:0 16px">${
+      existing || `<p class="notice" style="margin:12px 0">Пользовательских категорий пока нет.</p>`
+    }</div><form id="category-form" style="padding:16px;border-top:1px solid var(--border);display:grid;gap:12px"><label style="display:grid;gap:6px;font-size:12px;font-weight:600">Новая категория<input name="name" maxlength="60" required placeholder="Например, Japanese" style="height:38px;border:1px solid var(--border);border-radius:8px;background:var(--bg);padding:0 10px"/></label><label style="display:grid;gap:6px;font-size:12px;font-weight:600">Цвет<input name="color" type="color" value="#f2a65a" style="width:48px;height:32px;border:1px solid var(--border);border-radius:6px;padding:2px;cursor:pointer"/></label><button class="primary" type="submit" style="justify-self:start">Создать категорию</button></form>`
   );
   if (!root) return;
   root.querySelector<HTMLFormElement>("#category-form")?.addEventListener("submit", async (e) => {
@@ -569,60 +674,98 @@ async function renderIntegrationView(container: HTMLElement) {
 }
 
 function showSettings() {
+  // In the new layout, settings is a screen — just navigate to it
+  showScreen("settings");
+}
+
+function renderSettingsScreen() {
   const s = state.settings;
-  if (!s) return;
-  const root = modal(
-    "Настройки",
-    `<div class="settings-tabs">
-      <button type="button" class="tab-btn active" data-tab="general">Основные</button>
-      <button type="button" class="tab-btn" data-tab="integration">Интеграция</button>
-    </div>
-    <div id="tab-content-general">
-      <form id="settings-form">
-        <label class="switch-row"><span><b>Запись истории</b><small>Отслеживать обычный X11 Clipboard</small></span><input name="recording" type="checkbox" ${
-          s.paused ? "" : "checked"
-        }/></label>
-        <label class="switch-row"><span><b>Автозапуск</b><small>Запускать после входа в KDE</small></span><input name="autostart" type="checkbox" ${
-          s.autostart ? "checked" : ""
-        }/></label>
-        <label>Горячая клавиша<input name="shortcut" value="${esc(
-          s.shortcut
-        )}"/></label>
-        <label>Хранить незакреплённые карточки, дней<input name="retention" type="number" min="1" max="3650" value="${
-          s.retentionDays
-        }"/></label>
-        <div class="notice">Исключение приложений подготовлено архитектурно, но отключено в MVP: X11 не сообщает надёжно источник Clipboard во всех случаях.</div>
-        <button class="primary" type="submit">Сохранить</button>
-        <button class="danger" type="button" data-clear>Очистить незакреплённую историю</button>
-      </form>
-    </div>
-    <div id="tab-content-integration" style="display:none;"></div>`
-  );
-  if (!root) return;
+  const body = document.querySelector<HTMLElement>("#settings-body");
+  if (!body || !s) return;
 
-  const tabGeneralBtn = root.querySelector<HTMLElement>('[data-tab="general"]');
-  const tabIntegrationBtn = root.querySelector<HTMLElement>('[data-tab="integration"]');
-  const contentGeneral = root.querySelector<HTMLElement>('#tab-content-general');
-  const contentIntegration = root.querySelector<HTMLElement>('#tab-content-integration');
-
-  tabGeneralBtn?.addEventListener('click', () => {
-    tabGeneralBtn.classList.add('active');
-    tabIntegrationBtn?.classList.remove('active');
-    if (contentGeneral) contentGeneral.style.display = 'block';
-    if (contentIntegration) contentIntegration.style.display = 'none';
+  // Settings nav tabs
+  document.querySelectorAll<HTMLElement>(".settings-nav .navbtn[data-tab]").forEach((btn) => {
+    btn.onclick = () => {
+      document.querySelectorAll<HTMLElement>(".settings-nav .navbtn").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      if (btn.dataset.tab === "general") renderGeneralTab(body, s);
+      else if (btn.dataset.tab === "integration") renderIntegrationView(body);
+    };
   });
 
-  tabIntegrationBtn?.addEventListener('click', () => {
-    tabIntegrationBtn.classList.add('active');
-    tabGeneralBtn?.classList.remove('active');
-    if (contentGeneral) contentGeneral.style.display = 'none';
-    if (contentIntegration) {
-      contentIntegration.style.display = 'block';
-      renderIntegrationView(contentIntegration);
+  // Default: show general tab
+  renderGeneralTab(body, s);
+}
+
+function renderGeneralTab(body: HTMLElement, s: NonNullable<typeof state.settings>) {
+  if (!s) return;
+  body.innerHTML = `
+    <div class="panel">
+      <h2>Основные</h2>
+      <div class="setting-row">
+        <div><strong>Запись истории</strong><p>Отслеживать обычный X11 Clipboard</p></div>
+        <button class="switch ${s.paused ? "" : "on"}" id="sw-recording" aria-label="Запись" aria-checked="${!s.paused}"></button>
+      </div>
+      <div class="setting-row">
+        <div><strong>Автозапуск</strong><p>Запускать после входа в KDE</p></div>
+        <button class="switch ${s.autostart ? "on" : ""}" id="sw-autostart" aria-label="Автозапуск" aria-checked="${s.autostart}"></button>
+      </div>
+      <div class="setting-row">
+        <div><strong>Горячая клавиша</strong><p>Открывает компактную историю поверх окон.</p></div>
+        <input id="input-shortcut" style="width:120px;height:32px;border:1px solid var(--border);border-radius:7px;background:var(--bg);padding:0 8px;font-size:12px" value="${esc(s.shortcut)}"/>
+      </div>
+      <div class="setting-row">
+        <div><strong>Автоочистка (дней)</strong><p>Закреплённые фрагменты сохраняются.</p></div>
+        <input id="input-retention" type="number" min="1" max="3650" style="width:80px;height:32px;border:1px solid var(--border);border-radius:7px;background:var(--bg);padding:0 8px;font-size:12px" value="${s.retentionDays}"/>
+      </div>
+      <div class="notice" style="margin-top:16px">Исключение приложений подготовлено архитектурно, но отключено в MVP: X11 не сообщает надёжно источник Clipboard во всех случаях.</div>
+      <div style="display:flex;gap:8px;margin-top:20px">
+        <button class="btn primary" id="btn-save-settings">Сохранить</button>
+        <button class="btn danger" id="btn-clear-history">Очистить историю</button>
+      </div>
+
+      <h2 style="margin-top:28px">Chrome Extension</h2>
+      <div class="statusbox" id="ext-statusbox">
+        <i class="dot" id="ext-dot"></i>
+        <div>
+          <strong id="ext-status-label">Проверка…</strong>
+          <span>Передаются только домен и заголовок вкладки. Полный URL не сохраняется.</span>
+        </div>
+        <button class="btn" style="margin-left:auto" id="btn-check-ext">Проверить</button>
+      </div>
+    </div>
+  `;
+  hydrateIcons(body);
+
+  // Toggle switches
+  const swRecording = body.querySelector<HTMLButtonElement>("#sw-recording");
+  const swAutostart = body.querySelector<HTMLButtonElement>("#sw-autostart");
+  swRecording?.addEventListener("click", () => swRecording.classList.toggle("on"));
+  swAutostart?.addEventListener("click", () => swAutostart.classList.toggle("on"));
+
+  // Save
+  body.querySelector("#btn-save-settings")?.addEventListener("click", async () => {
+    const next = {
+      ...s,
+      paused: !swRecording?.classList.contains("on"),
+      autostart: swAutostart?.classList.contains("on") ?? s.autostart,
+      shortcut: (body.querySelector<HTMLInputElement>("#input-shortcut")?.value ?? s.shortcut),
+      retentionDays: Number(body.querySelector<HTMLInputElement>("#input-retention")?.value ?? s.retentionDays),
+    };
+    try {
+      await api.saveSettings(next);
+      state.settings = next;
+      updateRecordingStatus(next.paused);
+      const pauseBtn = document.querySelector<HTMLButtonElement>("#btn-pause");
+      if (pauseBtn) pauseBtn.querySelector("span")!.textContent = next.paused ? "Продолжить" : "Пауза";
+      showToast("Настройки сохранены", "info");
+    } catch (err) {
+      showToast(typeof err === "string" ? err : "Не удалось сохранить настройки");
     }
   });
 
-  root.querySelector("[data-clear]")?.addEventListener("click", async () => {
+  // Clear history
+  body.querySelector("#btn-clear-history")?.addEventListener("click", async () => {
     const confirmed = await confirmModal(
       "Очистить историю?",
       "Удалить всю незакреплённую историю? Это действие нельзя отменить."
@@ -631,29 +774,24 @@ function showSettings() {
       try {
         await api.clear();
         await reload();
-        root.innerHTML = "";
+        showToast("История очищена", "info");
       } catch {
         showToast("Не удалось очистить историю");
       }
     }
   });
 
-  root.querySelector("form")?.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const fd = new FormData(e.target as HTMLFormElement);
-    const next = {
-      ...s,
-      paused: fd.get("recording") !== "on",
-      autostart: fd.get("autostart") === "on",
-      shortcut: String(fd.get("shortcut")),
-      retentionDays: Number(fd.get("retention")),
-    };
+  // Check extension
+  body.querySelector("#btn-check-ext")?.addEventListener("click", async () => {
     try {
-      await api.saveSettings(next);
-      state.settings = next;
-      root.innerHTML = "";
-    } catch (err) {
-      showToast(typeof err === "string" ? err : "Не удалось сохранить настройки");
+      const status = await api.getIntegrationStatus();
+      const label = body.querySelector<HTMLElement>("#ext-status-label");
+      const dot = body.querySelector<HTMLElement>("#ext-dot");
+      if (label) label.textContent = status.nativeMessagingConnected ? "Подключено" : "Не подключено";
+      if (dot) dot.classList.toggle("paused", !status.nativeMessagingConnected);
+      showToast("Статус расширения обновлён", "info");
+    } catch {
+      showToast("Не удалось проверить расширение");
     }
   });
 }
@@ -669,8 +807,10 @@ async function reload() {
   renderFilters();
   renderCards();
 
+  // Update recording status indicator
+  if (!popup && state.settings) updateRecordingStatus(state.settings.paused);
+
   // 6.4: show invalid-settings warning only once per session (not on each reload).
-  // Use consume_invalid_settings_warning to clear the flag on the backend.
   if (!invalidWarningConsumed && !popup) {
     const shouldWarn = await api.consumeInvalidSettingsWarning();
     if (shouldWarn) {
@@ -678,7 +818,7 @@ async function reload() {
       setTimeout(() => {
         modal(
           "Предупреждение",
-          `<div class="notice" style="border-left-color:var(--coral);background:#fae2dc;color:#92463a;padding:12px;font-size:12px;line-height:1.5;">Файл настроек (settings.json) был повреждён или содержал недопустимые значения. Настройки были сброшены до безопасных значений (90 дней), а исходный файл сохранён как <b>settings.invalid.json</b>.</div>`
+          `<div class="notice" style="border-left-color:var(--danger);background:color-mix(in oklch,var(--danger) 10%,transparent);color:oklch(30% 0.15 25);padding:12px;font-size:12px;line-height:1.5;">Файл настроек (settings.json) был повреждён или содержал недопустимые значения. Настройки были сброшены до безопасных значений (90 дней), а исходный файл сохранён как <b>settings.invalid.json</b>.</div>`
         );
       }, 100);
     }
