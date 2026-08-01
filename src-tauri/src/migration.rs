@@ -64,7 +64,9 @@ pub fn migrate_pastily_to_kitsupin_at(
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
             if !acquired {
-                log::warn!("Migration lock held by another process; aborting migration after timeout");
+                log::warn!(
+                    "Migration lock held by another process; aborting migration after timeout"
+                );
                 return LegacyMigrationResult::ConflictPreserved;
             }
             file
@@ -150,11 +152,17 @@ fn migrate_data_dir_at(data_home: &Path) -> LegacyMigrationResult {
 
     match (&new_state, &old_state) {
         (DatabaseDataState::Unreadable(e), _) => {
-            log::error!("New database {:?} is unreadable: {e}; aborting migration", new_db);
+            log::error!(
+                "New database {:?} is unreadable: {e}; aborting migration",
+                new_db
+            );
             LegacyMigrationResult::ConflictPreserved
         }
         (_, DatabaseDataState::Unreadable(e)) => {
-            log::error!("Old database {:?} is unreadable: {e}; aborting migration", old_db_path);
+            log::error!(
+                "Old database {:?} is unreadable: {e}; aborting migration",
+                old_db_path
+            );
             LegacyMigrationResult::ConflictPreserved
         }
         (DatabaseDataState::Empty, _) => {
@@ -183,23 +191,7 @@ fn migrate_data_dir_at(data_home: &Path) -> LegacyMigrationResult {
         (DatabaseDataState::Missing, _) | (_, DatabaseDataState::Missing) => {
             LegacyMigrationResult::NothingToMigrate
         }
-<<<<<<< HEAD
     }
-=======
-        let res = restore_legacy_db(&old_db_path, &new_db);
-        return res;
-    }
-
-    if old_clip_count == 0 {
-        // Old database is empty, nothing useful to import
-        let backup_old = old_dir.join("pastily.sqlite3.empty.bak");
-        let _ = backup_database_file(&old_db_path, &backup_old);
-        return LegacyMigrationResult::NothingToMigrate;
-    }
-
-    // Scenario D: both databases contain user data
-    merge_legacy_db_into_new(&old_db_path, &new_db)
->>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
 }
 
 fn find_legacy_db(dir: &Path) -> Option<PathBuf> {
@@ -371,28 +363,13 @@ fn backup_database_file(src_db_path: &Path, dst_backup_path: &Path) -> anyhow::R
 
     std::fs::rename(&temp_backup, dst_backup_path)?;
 
-<<<<<<< HEAD
     remove_db_and_sidecars(src_db_path);
-=======
-    let _ = std::fs::remove_file(src_db_path);
-    let src_str = src_db_path.to_string_lossy();
-    let wal = PathBuf::from(format!("{src_str}-wal"));
-    if wal.exists() {
-        let _ = std::fs::remove_file(&wal);
-    }
-    let shm = PathBuf::from(format!("{src_str}-shm"));
-    if shm.exists() {
-        let _ = std::fs::remove_file(&shm);
-    }
->>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
 
     Ok(())
 }
 
 fn compute_db_fingerprint(db_path: &Path) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
-<<<<<<< HEAD
-
     let temp_dir = std::env::temp_dir();
     let temp_snapshot = temp_dir.join(format!("kitsupin_fp_{}.tmp", uuid::Uuid::new_v4()));
 
@@ -419,8 +396,6 @@ fn compute_db_fingerprint(db_path: &Path) -> anyhow::Result<String> {
     }
 
     let _ = std::fs::remove_file(&temp_snapshot);
-=======
->>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
     let bytes = std::fs::read(db_path)?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
@@ -543,12 +518,8 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
     let old_backup = old_db_path.with_extension("sqlite3.migrated.bak");
     if let Err(e) = backup_database_file(old_db_path, &old_backup) {
         log::error!("Failed to backup old DB: {e}");
-<<<<<<< HEAD
         // Even if old DB backup fails, target database is successfully restored with ledger record
         return LegacyMigrationResult::LegacyDatabaseRestored;
-=======
-        return LegacyMigrationResult::ConflictPreserved;
->>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
     }
 
     LegacyMigrationResult::LegacyDatabaseRestored
@@ -661,7 +632,6 @@ struct LegacyMergeReport {
     links_imported: usize,
     duplicate_clips_merged: usize,
     already_imported: bool,
-<<<<<<< HEAD
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -684,8 +654,6 @@ fn perform_legacy_merge(
         source_path,
         None::<fn(MergeHookStage) -> anyhow::Result<()>>,
     )
-=======
->>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
 }
 
 fn merge_legacy_db_into_new(old_db_path: &Path, new_db_path: &Path) -> LegacyMigrationResult {
@@ -698,7 +666,10 @@ fn merge_legacy_db_into_new(old_db_path: &Path, new_db_path: &Path) -> LegacyMig
     let fingerprint = match compute_db_fingerprint(old_db_path) {
         Ok(fp) => fp,
         Err(e) => {
-            log::error!("Failed to compute fingerprint of old DB {:?}: {e}", old_db_path);
+            log::error!(
+                "Failed to compute fingerprint of old DB {:?}: {e}",
+                old_db_path
+            );
             return LegacyMigrationResult::ConflictPreserved;
         }
     };
@@ -782,15 +753,11 @@ fn perform_legacy_merge_with_hook<F>(
     dst_conn: &mut Connection,
     fingerprint: &str,
     source_path: &Path,
-<<<<<<< HEAD
     hook: Option<F>,
 ) -> anyhow::Result<LegacyMergeReport>
 where
     F: Fn(MergeHookStage) -> anyhow::Result<()>,
 {
-=======
-) -> anyhow::Result<LegacyMergeReport> {
->>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
     let now_ms = chrono::Utc::now().timestamp_millis();
     ensure_legacy_imports_table(dst_conn)?;
 
@@ -946,7 +913,10 @@ where
             let safe_color = if crate::persistence::is_valid_hex_color(&color) {
                 color
             } else {
-                log::warn!("Invalid legacy category color '{}'; using fallback #6b7280", color);
+                log::warn!(
+                    "Invalid legacy category color '{}'; using fallback #6b7280",
+                    color
+                );
                 "#6b7280".to_string()
             };
             imported_categories.push(ImportedCategory {
@@ -1126,13 +1096,9 @@ where
         }
     }
 
-<<<<<<< HEAD
     if let Some(h) = &hook {
         h(MergeHookStage::BeforeCommit)?;
     }
-
-=======
->>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
     tx.commit()?;
 
     Ok(LegacyMergeReport {
@@ -1466,7 +1432,6 @@ mod tests {
         let old_db = old_dir.join("pastily.sqlite3");
         std::fs::create_dir_all(&old_dir).unwrap();
 
-<<<<<<< HEAD
         // Create old_db with clips table having bad column structure causing perform_legacy_merge to fail
         {
             let conn = Connection::open(&old_db).unwrap();
@@ -1482,12 +1447,6 @@ mod tests {
                 VALUES('c1', 'corrupt', '', '2023-01-01T00:00:00Z', '2023-01-01T00:00:00Z');",
             )
             .unwrap();
-=======
-        // Create corrupt old_db missing required clips table
-        {
-            let conn = Connection::open(&old_db).unwrap();
-            conn.execute_batch("CREATE TABLE invalid_table (id INT);").unwrap();
->>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
         }
 
         let new_db = new_dir.join("kitsupin.sqlite3");
@@ -1578,8 +1537,13 @@ mod tests {
         assert_eq!(res1, LegacyMigrationResult::DatabasesMerged);
 
         let repo = crate::persistence::Repository::open(&new_db).unwrap();
-        let clips1 = repo.list_clips(&crate::domain::ClipQuery::default()).unwrap();
-        let shared1 = clips1.iter().find(|c| c.preview.contains("shared content")).unwrap();
+        let clips1 = repo
+            .list_clips(&crate::domain::ClipQuery::default())
+            .unwrap();
+        let shared1 = clips1
+            .iter()
+            .find(|c| c.preview.contains("shared content"))
+            .unwrap();
         let copy_count_after_first_merge = shared1.copy_count;
         assert_eq!(copy_count_after_first_merge, 8); // 5 + 3 = 8
 
@@ -1600,8 +1564,13 @@ mod tests {
         let res2 = migrate_pastily_to_kitsupin_at(data_home, None);
         assert_eq!(res2, LegacyMigrationResult::DatabasesMerged);
 
-        let clips2 = repo.list_clips(&crate::domain::ClipQuery::default()).unwrap();
-        let shared2 = clips2.iter().find(|c| c.preview.contains("shared content")).unwrap();
+        let clips2 = repo
+            .list_clips(&crate::domain::ClipQuery::default())
+            .unwrap();
+        let shared2 = clips2
+            .iter()
+            .find(|c| c.preview.contains("shared content"))
+            .unwrap();
         assert_eq!(shared2.copy_count, 8); // Must stay 8, NOT increment to 11
     }
 
@@ -1666,7 +1635,15 @@ mod tests {
         let old_db = old_dir.join("pastily.sqlite3");
         create_real_pastily_v1_db(
             &old_db,
-            &[("c1", "test", "", "2023-01-01T00:00:00Z", "2023-01-01T00:00:00Z", 1, 0)],
+            &[(
+                "c1",
+                "test",
+                "",
+                "2023-01-01T00:00:00Z",
+                "2023-01-01T00:00:00Z",
+                1,
+                0,
+            )],
         );
 
         let new_db = new_dir.join("kitsupin.sqlite3");
@@ -1709,7 +1686,10 @@ mod tests {
         }
 
         let fp2 = compute_db_fingerprint(&db_path).unwrap();
-        assert_ne!(fp1, fp2, "Fingerprint must reflect uncheckpointed WAL changes");
+        assert_ne!(
+            fp1, fp2,
+            "Fingerprint must reflect uncheckpointed WAL changes"
+        );
     }
 
     #[test]
@@ -1724,7 +1704,15 @@ mod tests {
         let old_db = old_dir.join("pastily.sqlite3");
         create_real_pastily_v1_db(
             &old_db,
-            &[("c1", "legacy clip", "", "2023-01-01T00:00:00Z", "2023-01-01T00:00:00Z", 1, 0)],
+            &[(
+                "c1",
+                "legacy clip",
+                "",
+                "2023-01-01T00:00:00Z",
+                "2023-01-01T00:00:00Z",
+                1,
+                0,
+            )],
         );
 
         let new_db = new_dir.join("kitsupin.sqlite3");
@@ -1734,7 +1722,8 @@ mod tests {
         // Create empty new_db with dummy sidecar WAL/SHM files
         {
             let conn = Connection::open(&new_db).unwrap();
-            conn.execute_batch("CREATE TABLE clips (id TEXT PRIMARY KEY);").unwrap();
+            conn.execute_batch("CREATE TABLE clips (id TEXT PRIMARY KEY);")
+                .unwrap();
         }
         std::fs::write(&new_wal, b"old_wal_content").unwrap();
         std::fs::write(&new_shm, b"old_shm_content").unwrap();
@@ -1752,7 +1741,10 @@ mod tests {
         assert!(new_db.exists());
         if new_wal.exists() {
             let content = std::fs::read(&new_wal).unwrap();
-            assert_ne!(content, b"old_wal_content", "Old sidecar WAL file must not linger next to restored DB");
+            assert_ne!(
+                content, b"old_wal_content",
+                "Old sidecar WAL file must not linger next to restored DB"
+            );
         }
     }
 
@@ -1765,8 +1757,24 @@ mod tests {
         create_real_pastily_v1_db(
             &old_db,
             &[
-                ("c1", "clip 1", "", "2023-01-01T00:00:00Z", "2023-01-01T00:00:00Z", 1, 0),
-                ("c2", "clip 2", "", "2023-01-01T00:00:00Z", "2023-01-01T00:00:00Z", 1, 0),
+                (
+                    "c1",
+                    "clip 1",
+                    "",
+                    "2023-01-01T00:00:00Z",
+                    "2023-01-01T00:00:00Z",
+                    1,
+                    0,
+                ),
+                (
+                    "c2",
+                    "clip 2",
+                    "",
+                    "2023-01-01T00:00:00Z",
+                    "2023-01-01T00:00:00Z",
+                    1,
+                    0,
+                ),
             ],
         );
 
@@ -1788,7 +1796,8 @@ mod tests {
         assert_eq!(initial_count, 1);
 
         let fp = compute_db_fingerprint(&old_db).unwrap();
-        let src_conn = Connection::open_with_flags(&old_db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let src_conn =
+            Connection::open_with_flags(&old_db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let mut dst_conn = Connection::open(&new_db).unwrap();
 
         // Perform legacy merge with hook that bails after inserting first clip (inside transaction)
@@ -1813,7 +1822,11 @@ mod tests {
 
         // 2. No new category inserted
         let cat_count: usize = dst_conn
-            .query_row("SELECT COUNT(*) FROM user_categories WHERE name='Work'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM user_categories WHERE name='Work'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap_or(0);
         assert_eq!(cat_count, 0, "Category insertion must be rolled back");
 
@@ -1825,6 +1838,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap_or(false);
-        assert!(!ledger_exists, "Ledger marker must not exist after rolled-back transaction");
+        assert!(
+            !ledger_exists,
+            "Ledger marker must not exist after rolled-back transaction"
+        );
     }
 }

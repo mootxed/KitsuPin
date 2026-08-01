@@ -554,7 +554,9 @@ pub fn run() {
     let project = settings::project_dirs().expect("XDG directories");
     let data_dir = project.data_dir().to_path_buf();
     // ── Legacy migration (BEFORE creating target directory or locking single-instance) ──
-    if migration::migrate_pastily_to_kitsupin() == migration::LegacyMigrationResult::ConflictPreserved {
+    if migration::migrate_pastily_to_kitsupin()
+        == migration::LegacyMigrationResult::ConflictPreserved
+    {
         log::error!("KitsuPin startup aborted: migration lock active or migration conflict.");
         return;
     }

@@ -1119,9 +1119,7 @@ fn format_fts_query(search: &str) -> String {
 }
 
 pub fn is_valid_hex_color(value: &str) -> bool {
-    value.len() == 7
-        && value.starts_with('#')
-        && value[1..].chars().all(|c| c.is_ascii_hexdigit())
+    value.len() == 7 && value.starts_with('#') && value[1..].chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn validate_color(value: &str) -> Result<()> {

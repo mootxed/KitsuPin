@@ -85,11 +85,7 @@ pub struct BufferedEvent {
 
 #[derive(Default)]
 pub struct MetadataBuffer {
-<<<<<<< HEAD
     events: Mutex<VecDeque<BufferedEvent>>,
-=======
-    events: Mutex<VecDeque<(DateTime<Utc>, BrowserCopyEvent)>>,
->>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
     receipts: Mutex<VecDeque<(String, usize, ClipUpsertReceipt, bool)>>,
 }
 
@@ -118,7 +114,9 @@ impl MetadataBuffer {
         now: DateTime<Utc>,
     ) -> Option<BrowserCopyEvent> {
         let mut events = self.events.lock();
-        events.retain(|e| e.reserved || now.signed_duration_since(e.at).num_milliseconds().abs() <= 10_000);
+        events.retain(|e| {
+            e.reserved || now.signed_duration_since(e.at).num_milliseconds().abs() <= 10_000
+        });
         let pos = events.iter().rposition(|e| {
             !e.reserved
                 && e.event.content_hash.eq_ignore_ascii_case(hash)
@@ -144,7 +142,10 @@ impl MetadataBuffer {
 
     pub fn remove_receipt(&self, receipt_id: Uuid) {
         let mut receipts = self.receipts.lock();
-        if let Some(pos) = receipts.iter().position(|(_, _, r, _)| r.receipt_id == receipt_id) {
+        if let Some(pos) = receipts
+            .iter()
+            .position(|(_, _, r, _)| r.receipt_id == receipt_id)
+        {
             receipts.remove(pos);
         }
     }
@@ -163,7 +164,6 @@ impl MetadataBuffer {
         &self,
         allowed_delta_ms: i64,
     ) -> Option<(BrowserCopyEvent, ClipUpsertReceipt)> {
-<<<<<<< HEAD
         let mut events = self.events.lock();
         let mut receipts = self.receipts.lock();
 
@@ -179,43 +179,24 @@ impl MetadataBuffer {
                     continue;
                 }
                 let event = &buffered.event;
-=======
-        let events = self.events.lock();
-        let mut receipts = self.receipts.lock();
-
-        let mut best_pair = None;
-        let mut min_diff = i64::MAX;
-
-        for (receipt_idx, (r_hash, r_len, receipt, reserved)) in receipts.iter().enumerate() {
-            if *reserved {
-                continue;
-            }
-            for (_at, event) in events.iter() {
->>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
-                if r_hash.eq_ignore_ascii_case(&event.content_hash) && *r_len == event.content_length {
+                if r_hash.eq_ignore_ascii_case(&event.content_hash)
+                    && *r_len == event.content_length
+                {
                     if let Ok(event_ts_ms) = event.timestamp_millis() {
                         let diff = (receipt.copy_timestamp - event_ts_ms).abs();
                         if diff <= allowed_delta_ms && diff < min_diff {
                             min_diff = diff;
-<<<<<<< HEAD
-                            best_pair = Some((event_idx, receipt_idx, event.clone(), receipt.clone()));
-=======
-                            best_pair = Some((receipt_idx, event.clone(), receipt.clone()));
->>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
+                            best_pair =
+                                Some((event_idx, receipt_idx, event.clone(), receipt.clone()));
                         }
                     }
                 }
             }
         }
 
-<<<<<<< HEAD
         if let Some((e_idx, r_idx, event, receipt)) = best_pair {
             events[e_idx].reserved = true;
             receipts[r_idx].3 = true;
-=======
-        if let Some((idx, event, receipt)) = best_pair {
-            receipts[idx].3 = true;
->>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
             Some((event, receipt))
         } else {
             None
@@ -223,21 +204,8 @@ impl MetadataBuffer {
     }
 
     pub fn acknowledge_pair(&self, event_id: Uuid, receipt_id: Uuid) {
-<<<<<<< HEAD
         self.remove_event(event_id);
         self.remove_receipt(receipt_id);
-=======
-        let mut events = self.events.lock();
-        if let Some(pos) = events.iter().position(|(_, e)| e.event_id == event_id) {
-            events.remove(pos);
-        }
-        drop(events);
-
-        let mut receipts = self.receipts.lock();
-        if let Some(pos) = receipts.iter().position(|(_, _, r, _)| r.receipt_id == receipt_id) {
-            receipts.remove(pos);
-        }
->>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
     }
 
     pub fn discard_pair(&self, event_id: Uuid, receipt_id: Uuid) {
@@ -246,8 +214,9 @@ impl MetadataBuffer {
 
     pub fn release_receipt(&self, receipt_id: Uuid) {
         let mut receipts = self.receipts.lock();
-        if let Some((_, _, _, reserved)) =
-            receipts.iter_mut().find(|(_, _, r, _)| r.receipt_id == receipt_id)
+        if let Some((_, _, _, reserved)) = receipts
+            .iter_mut()
+            .find(|(_, _, r, _)| r.receipt_id == receipt_id)
         {
             *reserved = false;
         }
@@ -272,7 +241,6 @@ impl MetadataBuffer {
                 }
                 Ok(None) => {
                     log::debug!(
-<<<<<<< HEAD
                         "Late reconciliation: receipt no longer valid for hash {hash}; removing receipt and unreserving event"
                     );
                     self.remove_receipt(receipt_id);
@@ -284,17 +252,6 @@ impl MetadataBuffer {
                     );
                     self.release_receipt(receipt_id);
                     self.release_event(event_id);
-=======
-                        "Late reconciliation: receipt/event pair no longer valid for hash {hash}; discarding pair"
-                    );
-                    self.discard_pair(event_id, receipt_id);
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Late reconciliation error for hash {hash}: {e}; releasing receipt reservation"
-                    );
-                    self.release_receipt(receipt_id);
->>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
                     break;
                 }
             }
@@ -333,10 +290,13 @@ impl MetadataBuffer {
         let now_ms = now.timestamp_millis();
 
         let mut events = self.events.lock();
-        events.retain(|e| e.reserved || (now_ms - e.event.timestamp_millis().unwrap_or(0)).abs() <= 10_000);
+        events.retain(|e| {
+            e.reserved || (now_ms - e.event.timestamp_millis().unwrap_or(0)).abs() <= 10_000
+        });
 
         let mut receipts = self.receipts.lock();
-        receipts.retain(|(_, _, r, reserved)| *reserved || (now_ms - r.copy_timestamp).abs() <= 10_000);
+        receipts
+            .retain(|(_, _, r, reserved)| *reserved || (now_ms - r.copy_timestamp).abs() <= 10_000);
     }
 }
 
@@ -552,7 +512,9 @@ mod tests {
 
         // Releasing event reservation makes it available for take_match again
         b.release_event(e.event_id);
-        let matched = b.take_match(&hash, 5, now).expect("should take match after release");
+        let matched = b
+            .take_match(&hash, 5, now)
+            .expect("should take match after release");
         assert_eq!(matched.event_id, e.event_id);
     }
 
@@ -591,9 +553,8 @@ mod tests {
         b.push(e.clone()).unwrap();
         b.push_receipt(&hash, 5, r_stale.clone());
 
-        let (reserved_event, reserved_receipt) = b
-            .reserve_matching_pair(RECEIPT_MATCH_WINDOW_MS)
-            .unwrap();
+        let (reserved_event, reserved_receipt) =
+            b.reserve_matching_pair(RECEIPT_MATCH_WINDOW_MS).unwrap();
 
         // Simulate stale receipt handling (Ok(None)): remove receipt, release event reservation
         b.remove_receipt(reserved_receipt.receipt_id);
