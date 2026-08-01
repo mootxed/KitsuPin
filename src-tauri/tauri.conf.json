@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "KitsuPin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "io.github.mootxed.kitsupin",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -35,15 +35,12 @@
         "files": {
           "/usr/lib/kitsupin/kitsupin-native-host": "target/release/kitsupin-native-host",
           "/etc/xdg/autostart/kitsupin.desktop": "../packaging/kitsupin-autostart.desktop",
-          "/usr/lib/kitsupin/resources/chrome-extension": "../chrome-extension"
-        }
+          "/usr/lib/kitsupin/resources/chrome-extension": "../chrome-extension",
+          "/usr/lib/kitsupin/resources/scripts/uninstall-user-data.sh": "../scripts/uninstall-user-data.sh"
+        },
+        "preInstallScript": "../packaging/preinst"
       }
     },
-    "resources": {
-      "../chrome-extension/": "chrome-extension/",
-      "../scripts/install-native-host.sh": "scripts/install-native-host.sh",
-      "../scripts/native-host-manifest.template.json": "scripts/native-host-manifest.template.json",
-      "../scripts/uninstall-user-data.sh": "scripts/uninstall-user-data.sh"
-    }
+    "resources": {}
   }
 }

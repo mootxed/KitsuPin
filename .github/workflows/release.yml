@@ -129,60 +129,42 @@ jobs:
           echo "=== dpkg-deb --contents ==="
           dpkg-deb --contents "$FINAL_DEB"
 
-          # Store contents once; dpkg-deb may print paths as either
-          # "usr/bin/kitsupin" or "./usr/bin/kitsupin" depending on version.
-          CONTENTS=$(dpkg-deb --contents "$FINAL_DEB")
+          ./scripts/verify-deb-layout.sh "$FINAL_DEB"
 
-          # Matches both "usr/bin/..." and "./usr/bin/..." formats.
-          # Anchors the end of the path to prevent false positives
-          # (e.g. kitsupin-native-host must not match kitsupin).
-          require_deb_path() {
-            local pattern="$1"
-            local description="$2"
-            if ! printf '%s\n' "$CONTENTS" | grep -Eq "$pattern"; then
-              echo "::error::$description"
-              exit 1
-            fi
-          }
-
-          require_deb_path \
-            '(^|[[:space:]])\./usr/bin/kitsupin$|(^|[[:space:]])usr/bin/kitsupin$' \
-            'Основной бинарник /usr/bin/kitsupin отсутствует в пакете!'
-
-          require_deb_path \
-            '(^|[[:space:]])\./usr/lib/kitsupin/kitsupin-native-host$|(^|[[:space:]])usr/lib/kitsupin/kitsupin-native-host$' \
-            'Native host /usr/lib/kitsupin/kitsupin-native-host отсутствует в пакете!'
-
-          require_deb_path \
-            '(^|[[:space:]])\./etc/xdg/autostart/kitsupin\.desktop$|(^|[[:space:]])etc/xdg/autostart/kitsupin\.desktop$' \
-            'Autostart-файл /etc/xdg/autostart/kitsupin.desktop отсутствует в пакете!'
-
-          require_deb_path \
-            '(^|[[:space:]])\./usr/lib/kitsupin/resources/chrome-extension/|(^|[[:space:]])usr/lib/kitsupin/resources/chrome-extension/' \
-            'Каталог Chrome-расширения /usr/lib/kitsupin/resources/chrome-extension/ отсутствует в пакете!'
-
-          echo "Все обязательные пути найдены в пакете."
           sha256sum "$FINAL_DEB" > "${FINAL_DEB}.sha256"
 
-      - name: Test .deb installation and binary smoke test
+      - name: Test .deb installation, upgrade cleanup, and uninstall
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           FINAL_DEB="KitsuPin_${VERSION}_amd64.deb"
+
+          # Simulate legacy /usr/lib/KitsuPin directory to verify preinst cleanup
+          sudo mkdir -p /usr/lib/KitsuPin/chrome-extension /usr/lib/KitsuPin/scripts
+          sudo touch /usr/lib/KitsuPin/legacy-file.txt
+
           sudo dpkg -i "$FINAL_DEB"
 
           echo "=== Расположение бинарников ==="
           command -v kitsupin
-          command -v kitsupin-native-host
 
           echo "=== Проверка прав и наличия файлов ==="
-          test -x /usr/bin/kitsupin                              && echo "OK: /usr/bin/kitsupin исполняемый"
-          test -x /usr/lib/kitsupin/kitsupin-native-host        && echo "OK: /usr/lib/kitsupin/kitsupin-native-host исполняемый"
-          test -f /etc/xdg/autostart/kitsupin.desktop           && echo "OK: /etc/xdg/autostart/kitsupin.desktop присутствует"
-          test -d /usr/lib/kitsupin/resources/chrome-extension  && echo "OK: chrome-extension каталог присутствует"
+          test -x /usr/bin/kitsupin                                  && echo "OK: /usr/bin/kitsupin исполняемый"
+          test -x /usr/lib/kitsupin/kitsupin-native-host            && echo "OK: /usr/lib/kitsupin/kitsupin-native-host исполняемый"
+          test -f /etc/xdg/autostart/kitsupin.desktop               && echo "OK: /etc/xdg/autostart/kitsupin.desktop присутствует"
+          test -d /usr/lib/kitsupin/resources/chrome-extension      && echo "OK: chrome-extension каталог присутствует"
+          test -f /usr/lib/kitsupin/resources/scripts/uninstall-user-data.sh && echo "OK: uninstall-user-data.sh присутствует"
+
+          echo "=== Проверка отсутствия /usr/lib/KitsuPin ==="
+          test ! -e /usr/lib/KitsuPin && echo "OK: /usr/lib/KitsuPin отсутствует"
 
           echo "=== CLI smoke tests ==="
           kitsupin --version
           kitsupin --help
+
+          echo "=== Проверка удаления (sudo apt remove) ==="
+          sudo apt remove -y kitsu-pin
+          test ! -e /usr/lib/kitsupin && echo "OK: /usr/lib/kitsupin удалён"
+          test ! -e /usr/lib/KitsuPin && echo "OK: /usr/lib/KitsuPin не появился"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

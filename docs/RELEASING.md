@@ -89,8 +89,9 @@ cargo test --manifest-path src-tauri/core-tests/Cargo.toml
 cargo build --release --manifest-path src-tauri/Cargo.toml --bin kitsupin-native-host
 ./scripts/prepare-release-packaging.sh dev
 
-# 4. Пробная сборка deb пакета
+# 4. Пробная сборка deb пакета и проверка layout
 npm run tauri build -- --bundles deb -c staging/tauri.conf.json
+./scripts/verify-deb-layout.sh src-tauri/target/release/bundle/deb/*.deb
 ```
 
 ---
@@ -101,11 +102,12 @@ npm run tauri build -- --bundles deb -c staging/tauri.conf.json
 
 ```bash
 # Проверка состава пакета
-dpkg-deb --info KitsuPin_0.1.0_amd64.deb
-dpkg-deb --contents KitsuPin_0.1.0_amd64.deb
+dpkg-deb --info KitsuPin_0.1.1_amd64.deb
+dpkg-deb --contents KitsuPin_0.1.1_amd64.deb
+./scripts/verify-deb-layout.sh KitsuPin_0.1.1_amd64.deb
 
 # Пробная установка
-sudo apt install ./KitsuPin_0.1.0_amd64.deb
+sudo apt install ./KitsuPin_0.1.1_amd64.deb
 
 # Проверка CLI диагностических флагов
 kitsupin --version

@@ -34,7 +34,11 @@ pub struct IntegrationProblem {
 }
 
 pub const NATIVE_HOST_NAME: &str = "io.github.mootxed.kitsupin.native";
+pub const SYSTEM_LIB_DIR: &str = "/usr/lib/kitsupin";
 pub const SYSTEM_NATIVE_HOST_PATH: &str = "/usr/lib/kitsupin/kitsupin-native-host";
+pub const SYSTEM_CHROME_EXTENSION_DIR: &str = "/usr/lib/kitsupin/resources/chrome-extension";
+pub const SYSTEM_UNINSTALL_SCRIPT_PATH: &str =
+    "/usr/lib/kitsupin/resources/scripts/uninstall-user-data.sh";
 pub const SYSTEM_MANIFEST_PATH: &str =
     "/etc/opt/chrome/native-messaging-hosts/io.github.mootxed.kitsupin.native.json";
 pub const USER_MANIFEST_DIR: &str = "google-chrome/NativeMessagingHosts";

@@ -137,11 +137,22 @@ jobs:
       - name: Run main crate tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
+      - name: Build native host binary
+        run: cargo build --release --manifest-path src-tauri/Cargo.toml --bin kitsupin-native-host
+
+      - name: Prepare packaging files
+        run: ./scripts/prepare-release-packaging.sh dev
+
       - name: Tauri build
-        run: npm run tauri build -- --bundles deb
+        run: npm run tauri build -- --bundles deb -c staging/tauri.conf.json
         env:
           TAURI_SIGNING_PRIVATE_KEY: ""
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+
+      - name: Verify .deb package layout
+        run: |
+          DEB=$(ls src-tauri/target/release/bundle/deb/*.deb | head -n1)
+          ./scripts/verify-deb-layout.sh "$DEB"
 
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4

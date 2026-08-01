@@ -391,7 +391,7 @@ fn configure_extension_id(
 #[tauri::command]
 fn open_extension_dir() -> CommandResult<String> {
     let candidates = [
-        PathBuf::from("/usr/lib/kitsupin/resources/chrome-extension"),
+        PathBuf::from(diagnostics::SYSTEM_CHROME_EXTENSION_DIR),
         PathBuf::from("chrome-extension"),
         PathBuf::from("../chrome-extension"),
     ];

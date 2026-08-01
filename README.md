@@ -55,7 +55,7 @@ KitsuPin — локальный менеджер текстовой истори
 ### Удаление пакета
 
 ```bash
-sudo apt remove kitsupin
+sudo apt remove kitsu-pin
 ```
 
 При стандартном удалении системные файлы приложения удаляются, а ваша личная база данных истории и категории сохраняются в `~/.local/share/kitsupin/`.
@@ -65,7 +65,7 @@ sudo apt remove kitsupin
 Если вы хотите полностью очистить пользовательские данные KitsuPin:
 
 ```bash
-/usr/lib/kitsupin/scripts/uninstall-user-data.sh
+/usr/lib/kitsupin/resources/scripts/uninstall-user-data.sh
 rm -rf ~/.local/share/kitsupin
 ```
 

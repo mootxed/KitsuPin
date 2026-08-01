@@ -1,6 +1,6 @@
 [package]
 name = "kitsupin"
-version = "0.1.0"
+version = "0.1.1"
 description = "Локальная история буфера обмена для KDE X11"
 authors = ["KitsuPin contributors"]
 edition = "2021"

@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+# Debian maintainer pre-installation script for kitsu-pin
+# Safely clean up legacy uppercase directory /usr/lib/KitsuPin from v0.1.0 releases.
+
+OLD_DIR="/usr/lib/KitsuPin"
+
+if [ -d "$OLD_DIR" ] && [ ! -L "$OLD_DIR" ]; then
+    echo "Cleaning legacy directory $OLD_DIR from previous installation..."
+    rm -rf "$OLD_DIR/chrome-extension"
+    rm -rf "$OLD_DIR/scripts"
+    rmdir "$OLD_DIR" 2>/dev/null || rm -rf "$OLD_DIR"
+fi
+
+exit 0
