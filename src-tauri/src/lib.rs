@@ -491,6 +491,7 @@ fn try_acquire_instance_lock(data_dir: &Path) -> std::io::Result<Option<File>> {
     let lock_path = instance_lock_path(data_dir);
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .mode(0o600)
@@ -532,15 +533,13 @@ fn start_single_instance_listener(data_dir: &Path, app: AppHandle) {
                 std::os::unix::fs::PermissionsExt::from_mode(0o600),
             );
             std::thread::spawn(move || {
-                for stream in listener.incoming() {
-                    if let Ok(stream) = stream {
-                        let mut reader = BufReader::new(stream);
-                        let mut line = String::new();
-                        if reader.read_line(&mut line).is_ok() && line.trim() == "show_main" {
-                            show_main(&app);
-                        }
-                        // Unknown commands are silently ignored for security.
+                for stream in listener.incoming().flatten() {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_ok() && line.trim() == "show_main" {
+                        show_main(&app);
                     }
+                    // Unknown commands are silently ignored for security.
                 }
             });
         }
@@ -678,32 +677,28 @@ pub fn run() {
                     event_ts_ms,
                     browser_metadata::RECEIPT_MATCH_WINDOW_MS,
                 );
-                match repo_reconcile.attach_metadata(
-                    &event.content_hash,
-                    event.content_length,
-                    &event.domain,
-                    if event.page_title.is_empty() {
-                        None
-                    } else {
-                        Some(&event.page_title)
-                    },
-                    event_ts_ms,
-                    receipt,
-                ) {
-                    Ok(Some(id)) => {
-                        metadata_reconcile.remove_event(event.event_id);
-                        log::info!("Late reconciliation: metadata attached to clip {id}");
-                        let _ = app_reconcile.emit("clips-changed", ());
+                if let Some(receipt) = receipt {
+                    match repo_reconcile.attach_metadata_with_receipt(&event, receipt) {
+                        Ok(Some(id)) => {
+                            metadata_reconcile.remove_event(event.event_id);
+                            log::info!("Late reconciliation: metadata attached to clip {id}");
+                            let _ = app_reconcile.emit("clips-changed", ());
+                        }
+                        Ok(None) => {
+                            log::debug!(
+                                "Late reconciliation: receipt no longer matches DB for hash {}",
+                                event.content_hash
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!("Late reconciliation error: {e}");
+                        }
                     }
-                    Ok(None) => {
-                        log::debug!(
-                            "Late reconciliation: no matching clip for hash {}",
-                            event.content_hash
-                        );
-                    }
-                    Err(e) => {
-                        log::warn!("Late reconciliation error: {e}");
-                    }
+                } else {
+                    log::debug!(
+                        "Late reconciliation: no receipt found for hash {}; retaining event in buffer",
+                        event.content_hash
+                    );
                 }
             });
 

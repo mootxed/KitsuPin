@@ -1,8 +1,6 @@
 # Архитектура KitsuPin
 
-KitsuPin состоит из одного долгоживущего Tauri-процесса, двух webview-окон и
-минимального native messaging binary. Все пользовательские данные остаются в
-`$XDG_DATA_HOME/kitsupin` (по умолчанию `~/.local/share/kitsupin`).
+KitsuPin состоит из одного долгоживущего Tauri-процесса, двух webview-окон и минимального native messaging binary. Все пользовательские данные остаются в `$XDG_DATA_HOME/kitsupin` (по умолчанию `~/.local/share/kitsupin`).
 
 ---
 
@@ -11,12 +9,12 @@ KitsuPin состоит из одного долгоживущего Tauri-пр�
 | Путь | Назначение |
 |---|---|
 | `src-tauri/src/domain` | Нормализация, классификация, модели, дедупликация |
-| `src-tauri/src/persistence` | SQLite, миграции 1–8, trigram FTS5, short-query page_title fallback, reconciliation |
+| `src-tauri/src/persistence` | SQLite, миграции 1–8, trigram FTS5, short-query fallback, attach_metadata_with_receipt |
 | `src-tauri/src/clipboard` | XFixes-события только для `CLIPBOARD`, чтение и подавление собственных событий; polling 350 мс — аварийный fallback |
 | `src-tauri/src/browser_metadata` | Unix socket, буфер событий Chrome с `event_id: Uuid`, `ClipUpsertReceipt`, `take_matching_receipt`, cleanup по времени |
 | `src-tauri/src/jobs` | Очистка устаревшей незакреплённой истории |
 | `src-tauri/src/settings` | Настройки (write-fsync-rename), XDG Autostart, consume_invalid_warning |
-| `src-tauri/src/migration.rs` | Миграция Pastily → KitsuPin, lock 0600, SQLite Backup API, обработка 4 сценариев (A, B, C, D) |
+| `src-tauri/src/migration.rs` | Миграция Pastily v1 → KitsuPin, schema introspection, parse_legacy_timestamp, canonical ID maps, Backup API, 4 сценария (A, B, C, D) |
 | `src-tauri/src/lib.rs` | Команды Tauri, окна, tray, регистрация горячих клавиш с обработкой `registered_shortcut = None`, single-instance lock |
 | `src/` | TypeScript UI; режим выбирается по query `?mode=popup` |
 | `chrome-extension/` | Manifest V3 content script, service worker, status page |
@@ -41,20 +39,36 @@ KitsuPin состоит из одного долгоживущего Tauri-пр�
 
 ---
 
-## Миграция данных Pastily → KitsuPin
+## Миграция данных Pastily v1 → KitsuPin
 
-Миграция выполняется до запуска базы данных KitsuPin. Использует эксклюзивный lock-файл `$XDG_DATA_HOME/.kitsupin-migration.lock` с правами `0600`.
+Миграция выполняется до запуска основной базы данных KitsuPin. Использует эксклюзивный lock-файл `$XDG_DATA_HOME/.kitsupin-migration.lock` с правами `0600`.
+
+### Схема и импорт
+- **Schema Introspection**: проверка наличия колонок (`domain_key`, `normalized_content`, `normalized_name`, `sort_order`) через `PRAGMA table_info` без генерации несуществующих имён в SQL.
+- **Внутренние модели**: преобразование legacy-таблиц в `ImportedClip`, `ImportedCategory`, `ImportedCategoryLink`.
+- **Парсинг меток времени**: `parse_legacy_timestamp` поддерживает RFC3339, SQLite datetime (`YYYY-MM-DD HH:MM:SS`), Unix seconds, Unix milliseconds и REAL с ведением непубличных логов.
+- **Нормализация данных**: заново выполняются `normalize_content`, SHA-256 `content_hash`, классификация типа (`Text`/`Links`/`Email`/`Numbers`), нормализация домена `domain_key` и ограничение `page_title` 500 символами.
+- **Каноническое отображение**:
+  - Категории объединяются по `normalized_name`, формируя `legacy_category_id -> canonical_category_id`.
+  - Карточки объединяются по `(content_hash, domain_key)`, формируя `legacy_clip_id -> canonical_clip_id`.
+  - Правила объединения: `created_at` = MIN, `last_copied_at` = MAX, `copy_count` = saturating SUM, `pinned` = OR, `sort_key` = MAX, `page_title` берется от наиболее свежей записи по `last_copied_at`.
+  - Связи `clip_user_categories` вставляются по каноническим ID через `INSERT OR IGNORE`.
+- **Транзакционность и ошибки**: любые ошибки при чтении или вставке откатывают транзакцию, оставляя исходную и целевую базы нетронутыми и возвращая `ConflictPreserved`.
+- **Валидация и бэкап**:
+  - После восстановления или слияния выполняются `PRAGMA integrity_check` (проверка ответа `"ok"`) и `PRAGMA foreign_key_check` (проверка `stmt.exists([])?`).
+  - Файл `.empty.bak` сохраняется в качестве диагностического бэкапа.
+  - Старая база переименовывается в `.sqlite3.migrated.bak` только после полного успеха транзакции, проверок и повторного открывающего теста целевой базы через `Repository::open`.
 
 ### Поддерживаемые сценарии
 
 1. **Сценарий A (Только старый каталог)**:
    Атомарно переименовывает `~/.local/share/pastily` в `~/.local/share/kitsupin` и переименовывает файлы базы данных.
 2. **Сценарий B (Существует каталог kitsupin без kitsupin.sqlite3)**:
-   Переносит старую базу через SQLite Backup API, сбрасывает WAL (`PRAGMA wal_checkpoint(TRUNCATE)`), проверяет `integrity_check` и `foreign_key_check`, после чего создает backup старой базы.
+   Переносит старую базу через SQLite Backup API, синхронизирует временный файл (`sync_all`), проверяет `integrity_check` и `foreign_key_check`, после чего переименовывает старую базу в backup.
 3. **Сценарий C (kitsupin.sqlite3 существует, но фактически пуст)**:
-   Перемещает пустую новую базу в `kitsupin.sqlite3.empty.bak`, переносит старую базу через SQLite Backup API с проверкой целостности, удаляет временную пустую базу только после успешного переноса.
+   Перемещает пустую новую базу в `kitsupin.sqlite3.empty.bak`, переносит старую базу через SQLite Backup API с проверкой целостности, сохраняя `.empty.bak`.
 4. **Сценарий D (Обе базы содержат пользовательские данные)**:
-   Выполняет транзакционный импорт legacy-карточек и категорий из Pastily в KitsuPin. Объединяет дубликаты по `(content_hash, domain_key)`, сохраняя закрепления (`pinned`), категории, наиболшие `copy_count` и свежие метки времени `last_copied_at`. Не перезаписывает более свежие данные старыми.
+   Открывает и мигрирует новую базу до актуальной схемы v1–8 via `Repository::open`, затем выполняет транзакционный merge legacy Pastily v1 с подсчетом отчета `LegacyMergeReport`.
 
 ---
 
@@ -78,12 +92,10 @@ KitsuPin состоит из одного долгоживущего Tauri-пр�
 
 ### Прикрепление метаданных (reconciliation)
 
-- Socket callback вызывает `take_matching_receipt(hash, length, timestamp_ms, RECEIPT_MATCH_WINDOW_MS = 2000)`.
-- Выбирается receipt с минимальной разницей метки времени в пределах допустимого окна.
-- `attach_metadata` проверяет наличие карточки по `receipt.clip_id`, совпадение `content_hash`, `domain_key == ''`, и соответствие текущего состояния DB данным receipt (`copy_count`, `last_copied_at`).
-- Если состояние карточки изменилось (было повторное копирование), receipt считается устаревшим и не применяется.
-- **Без receipt reconciliation для ранее существовавших карточек с copy_count > 1 ЗАПРЕЩЁН**: partial rollback `copy_count - 1` удалён. Без receipt домен прикрепляется только в однозначном случае для впервые созданной карточки (`copy_count == 1`).
-- После успешной синхронизации удаляется строго обработанное событие по `event_id` (`remove_event`).
+- Callback Chrome socket строго требует наличия `ClipUpsertReceipt` via `take_matching_receipt(hash, length, timestamp_ms, RECEIPT_MATCH_WINDOW_MS = 2000)`.
+- Без `receipt` функция `attach_metadata_with_receipt` НЕ вызывается, а `BrowserCopyEvent` остается в `MetadataBuffer` для дальнейшего подхвата Clipboard watcher.
+- Метод `attach_metadata_with_receipt` атомарно проверяет наличие карточки по `receipt.clip_id`, совпадение `content_hash`, `domain_key == ''`, и совпадение текущего состояния DB данным receipt (`copy_count`, `last_copied_at`).
+- Вызов `remove_event(event_id)` выполняется только после успешного возврата `Ok(Some(canonical_id))`.
 - Устаревшие events и receipts старше 10 000 мс автоматически очищаются (`cleanup_stale`).
 
 ---
@@ -144,5 +156,14 @@ Workflow: `.github/workflows/ci.yml`
    - `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check`
    - `cargo clippy --manifest-path src-tauri/core-tests/Cargo.toml --all-targets -- -D warnings`
    - `cargo test --manifest-path src-tauri/core-tests/Cargo.toml`
+3. `tauri-check`:
+   - Установка системных зависимостей (GTK 3, WebKit2GTK 4.1, AppIndicator3, X11 libraries)
+   - `npm ci` · `npm run build`
+   - `cargo check --manifest-path src-tauri/Cargo.toml`
+   - `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings`
    - `cargo test --manifest-path src-tauri/Cargo.toml`
-3. `tauri-check`: `cargo check --manifest-path src-tauri/Cargo.toml` · `npm run tauri build -- --bundles deb`
+   - `npm run tauri build -- --bundles deb`
+
+---
+
+Статус: ранний MVP, требуется системное тестирование на Ubuntu 24.04 KDE X11.

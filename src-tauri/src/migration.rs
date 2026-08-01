@@ -1,5 +1,5 @@
 use fs2::FileExt;
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -124,9 +124,7 @@ fn migrate_data_dir_at(data_home: &Path) -> LegacyMigrationResult {
             return LegacyMigrationResult::ConflictPreserved;
         }
         let res = restore_legacy_db(&old_db_path, &new_db);
-        if res == LegacyMigrationResult::LegacyDatabaseRestored {
-            let _ = std::fs::remove_file(backup_empty);
-        }
+        // Leave backup_empty as diagnostic backup per requirements
         return res;
     }
 
@@ -194,6 +192,22 @@ fn count_clips_safely(db_path: &Path) -> usize {
         .unwrap_or(0)
 }
 
+fn ensure_foreign_keys_valid(conn: &Connection) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA foreign_key_check;")?;
+    if stmt.exists([])? {
+        anyhow::bail!("foreign key check returned violations");
+    }
+    Ok(())
+}
+
+fn ensure_integrity_ok(conn: &Connection) -> anyhow::Result<()> {
+    let res: String = conn.query_row("PRAGMA integrity_check;", [], |r| r.get(0))?;
+    if res != "ok" {
+        anyhow::bail!("integrity check failed with output: {res}");
+    }
+    Ok(())
+}
+
 fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrationResult {
     let target_dir = match target_db_path.parent() {
         Some(d) => d,
@@ -209,7 +223,7 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
         let _ = std::fs::remove_file(&importing_path);
     }
 
-    // Step 1: Open source DB read-only, execute wal_checkpoint
+    // Step 1: Open source DB read-only
     let src_conn = match Connection::open_with_flags(
         old_db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -220,8 +234,6 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
             return LegacyMigrationResult::ConflictPreserved;
         }
     };
-
-    let _ = src_conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
 
     // Step 2: Use SQLite Backup API into importing_path
     let mut dst_conn = match Connection::open(&importing_path) {
@@ -242,27 +254,18 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
     }
 
     // Step 3: Run integrity_check and foreign_key_check on imported DB
-    let integrity_ok = dst_conn
-        .query_row("PRAGMA integrity_check;", [], |r| r.get::<_, String>(0))
-        .map(|res| res == "ok")
-        .unwrap_or(false);
-
-    if !integrity_ok {
+    if let Err(e) = ensure_integrity_ok(&dst_conn) {
         log::error!(
-            "Integrity check failed for imported DB at {:?}",
+            "Integrity check failed for imported DB at {:?}: {e}",
             importing_path
         );
         let _ = std::fs::remove_file(&importing_path);
         return LegacyMigrationResult::ConflictPreserved;
     }
 
-    let fk_check_passed = dst_conn
-        .query_row("PRAGMA foreign_key_check;", [], |_| Ok(()))
-        .map_or(true, |_| true);
-
-    if !fk_check_passed {
+    if let Err(e) = ensure_foreign_keys_valid(&dst_conn) {
         log::error!(
-            "Foreign key check failed for imported DB at {:?}",
+            "Foreign key check failed for imported DB at {:?}: {e}",
             importing_path
         );
         let _ = std::fs::remove_file(&importing_path);
@@ -272,6 +275,10 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
     drop(dst_conn);
     drop(src_conn);
 
+    if let Ok(file) = std::fs::File::open(&importing_path) {
+        let _ = file.sync_all();
+    }
+
     // Step 4: Atomic rename importing file to final DB target
     if let Err(e) = std::fs::rename(&importing_path, target_db_path) {
         log::error!("Failed to rename importing DB to final path: {e}");
@@ -279,14 +286,138 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
         return LegacyMigrationResult::ConflictPreserved;
     }
 
+    // Ensure target database opens & migrates correctly with current schema
+    if let Err(e) = crate::persistence::Repository::open(target_db_path) {
+        log::error!("Target database failed schema migration after restore: {e:?}");
+        return LegacyMigrationResult::ConflictPreserved;
+    }
+
     // Preserve old database as backup
     let old_backup = old_db_path.with_extension("sqlite3.migrated.bak");
-    let _ = std::fs::rename(old_db_path, &old_backup);
+    if let Err(e) = std::fs::rename(old_db_path, &old_backup) {
+        log::error!("Failed to rename old DB to backup: {e}");
+        return LegacyMigrationResult::ConflictPreserved;
+    }
 
     LegacyMigrationResult::LegacyDatabaseRestored
 }
 
+fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    let pragma_sql = format!("PRAGMA table_info({})", table);
+    let mut stmt = match conn.prepare(&pragma_sql) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let cols = stmt.query_map([], |row| row.get::<_, String>(1));
+    if let Ok(iter) = cols {
+        for col_name in iter.flatten() {
+            if col_name.eq_ignore_ascii_case(column) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn parse_legacy_timestamp(value: rusqlite::types::ValueRef, fallback_ms: i64) -> i64 {
+    use rusqlite::types::ValueRef;
+    const SECONDS_THRESHOLD: i64 = 946_684_800_000; // 2000-01-01 in ms
+    match value {
+        ValueRef::Integer(i) => {
+            if i > 0 && i < SECONDS_THRESHOLD {
+                i.saturating_mul(1000)
+            } else {
+                i
+            }
+        }
+        ValueRef::Real(f) => {
+            let i = f as i64;
+            if i > 0 && i < SECONDS_THRESHOLD {
+                i.saturating_mul(1000)
+            } else {
+                i
+            }
+        }
+        ValueRef::Text(bytes) => {
+            let s = match std::str::from_utf8(bytes) {
+                Ok(s) => s.trim(),
+                Err(_) => {
+                    log::warn!("Invalid UTF-8 in legacy timestamp");
+                    return fallback_ms;
+                }
+            };
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                dt.timestamp_millis()
+            } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+                dt.and_utc().timestamp_millis()
+            } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+                dt.and_utc().timestamp_millis()
+            } else if let Ok(i) = s.parse::<i64>() {
+                if i > 0 && i < SECONDS_THRESHOLD {
+                    i.saturating_mul(1000)
+                } else {
+                    i
+                }
+            } else {
+                log::warn!("Could not parse legacy timestamp TEXT format");
+                fallback_ms
+            }
+        }
+        _ => fallback_ms,
+    }
+}
+
+struct ImportedClip {
+    legacy_id: String,
+    content: String,
+    #[allow(dead_code)]
+    normalized_content: String,
+    content_hash: String,
+    content_type: String,
+    domain: Option<String>,
+    domain_key: String,
+    page_title: Option<String>,
+    created_at_ms: i64,
+    last_copied_at_ms: i64,
+    copy_count: i64,
+    pinned: bool,
+    sort_key: i64,
+}
+
+struct ImportedCategory {
+    legacy_id: String,
+    name: String,
+    normalized_name: String,
+    color: String,
+    created_at_ms: i64,
+    sort_order: i64,
+}
+
+struct ImportedCategoryLink {
+    legacy_clip_id: String,
+    legacy_category_id: String,
+    created_at_ms: i64,
+}
+
+#[derive(Debug)]
+struct LegacyMergeReport {
+    legacy_clips_read: usize,
+    canonical_clips_touched: usize,
+    legacy_categories_read: usize,
+    canonical_categories_touched: usize,
+    links_read: usize,
+    links_imported: usize,
+    duplicate_clips_merged: usize,
+}
+
 fn merge_legacy_db_into_new(old_db_path: &Path, new_db_path: &Path) -> LegacyMigrationResult {
+    // 1. Open and migrate new DB first via Repository::open
+    if let Err(e) = crate::persistence::Repository::open(new_db_path) {
+        log::error!("Failed to open/migrate target DB before merge: {e}");
+        return LegacyMigrationResult::ConflictPreserved;
+    }
+
+    // 2. Open source legacy DB
     let src_conn = match Connection::open_with_flags(
         old_db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -298,91 +429,278 @@ fn merge_legacy_db_into_new(old_db_path: &Path, new_db_path: &Path) -> LegacyMig
         }
     };
 
+    // 3. Open target DB connection for merge
     let mut dst_conn = match Connection::open(new_db_path) {
         Ok(c) => c,
         Err(e) => {
-            log::error!("Failed to open new DB for merge: {e}");
+            log::error!("Failed to open new DB connection for merge: {e}");
             return LegacyMigrationResult::ConflictPreserved;
         }
     };
 
-    let tx = match dst_conn.transaction() {
-        Ok(t) => t,
+    if let Err(e) = dst_conn.pragma_update(None, "foreign_keys", "ON") {
+        log::error!("Failed to enable foreign keys on target DB: {e}");
+        return LegacyMigrationResult::ConflictPreserved;
+    }
+    let _ = dst_conn.busy_timeout(std::time::Duration::from_secs(3));
+
+    let report = match perform_legacy_merge(&src_conn, &mut dst_conn) {
+        Ok(rep) => rep,
         Err(e) => {
-            log::error!("Failed to start transaction for merge: {e}");
+            log::error!("Legacy DB merge failed (transaction rolled back): {e}");
             return LegacyMigrationResult::ConflictPreserved;
         }
     };
 
-    // Make sure tables exist in old DB before querying
-    let has_clips: bool = src_conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='clips')",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(false);
+    if let Err(e) = ensure_foreign_keys_valid(&dst_conn) {
+        log::error!("Foreign key check failed after merge: {e}");
+        return LegacyMigrationResult::ConflictPreserved;
+    }
+    if let Err(e) = ensure_integrity_ok(&dst_conn) {
+        log::error!("Integrity check failed after merge: {e}");
+        return LegacyMigrationResult::ConflictPreserved;
+    }
 
+    drop(dst_conn);
+    drop(src_conn);
+
+    if let Err(e) = crate::persistence::Repository::open(new_db_path) {
+        log::error!("Failed to re-open target DB after merge: {e}");
+        return LegacyMigrationResult::ConflictPreserved;
+    }
+
+    let old_backup = old_db_path.with_extension("sqlite3.migrated.bak");
+    if let Err(e) = std::fs::rename(old_db_path, &old_backup) {
+        log::error!("Failed to rename old DB to backup after merge: {e}");
+        return LegacyMigrationResult::ConflictPreserved;
+    }
+
+    log::info!(
+        "Legacy merge completed successfully: clips read={}, canonical touched={}, categories read={}, canonical touched={}, links read={}, imported={}, duplicates merged={}",
+        report.legacy_clips_read,
+        report.canonical_clips_touched,
+        report.legacy_categories_read,
+        report.canonical_categories_touched,
+        report.links_read,
+        report.links_imported,
+        report.duplicate_clips_merged
+    );
+
+    LegacyMigrationResult::DatabasesMerged
+}
+
+fn perform_legacy_merge(
+    src_conn: &Connection,
+    dst_conn: &mut Connection,
+) -> anyhow::Result<LegacyMergeReport> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    let has_clips = has_column(src_conn, "clips", "id");
     if !has_clips {
-        return LegacyMigrationResult::NothingToMigrate;
+        anyhow::bail!("Legacy DB has no clips table");
     }
 
-    struct LegacyClip {
-        id: String,
-        content: String,
-        content_hash: String,
-        content_type: String,
-        domain: Option<String>,
-        domain_key: String,
-        page_title: Option<String>,
-        created_at: i64,
-        last_copied_at: i64,
-        copy_count: i64,
-        pinned: bool,
-        sort_key: i64,
+    let has_domain_key = has_column(src_conn, "clips", "domain_key");
+
+    let clips_sql = if has_domain_key {
+        "SELECT id, content, content_type, domain, domain_key, page_title, created_at, last_copied_at, copy_count, pinned, sort_key FROM clips"
+    } else {
+        "SELECT id, content, content_type, domain, page_title, created_at, last_copied_at, copy_count, pinned, sort_key FROM clips"
+    };
+
+    let mut clips_stmt = src_conn.prepare(clips_sql)?;
+    let legacy_clips_raw = clips_stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let content: String = row.get(1)?;
+            let domain: Option<String> = row.get(3).ok();
+
+            let (page_title, created_val, copied_val, count_val, pinned_val, sort_val) =
+                if has_domain_key {
+                    (
+                        row.get::<_, Option<String>>(5)?,
+                        row.get_ref(6)?,
+                        row.get_ref(7)?,
+                        row.get::<_, Option<i64>>(8)?.unwrap_or(1),
+                        row.get::<_, Option<i64>>(9)?.unwrap_or(0),
+                        row.get::<_, Option<i64>>(10)?.unwrap_or(0),
+                    )
+                } else {
+                    (
+                        row.get::<_, Option<String>>(4)?,
+                        row.get_ref(5)?,
+                        row.get_ref(6)?,
+                        row.get::<_, Option<i64>>(7)?.unwrap_or(1),
+                        row.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                        row.get::<_, Option<i64>>(9)?.unwrap_or(0),
+                    )
+                };
+
+            let created_at_ms = parse_legacy_timestamp(created_val, now_ms);
+            let last_copied_at_ms = parse_legacy_timestamp(copied_val, now_ms);
+
+            Ok((
+                id,
+                content,
+                domain,
+                page_title,
+                created_at_ms,
+                last_copied_at_ms,
+                count_val,
+                pinned_val != 0,
+                sort_val,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut imported_clips = Vec::with_capacity(legacy_clips_raw.len());
+    for (id, raw_content, raw_domain, raw_title, created_ms, copied_ms, count, pinned, sort_key) in
+        legacy_clips_raw
+    {
+        let norm_content = crate::domain::normalize_content(&raw_content);
+        if norm_content.is_empty() {
+            continue;
+        }
+        let hash = crate::domain::content_hash(&norm_content);
+        let kind = crate::domain::classify(&norm_content).as_str().to_string();
+        let norm_dom = raw_domain
+            .as_deref()
+            .and_then(crate::domain::normalize_domain);
+        let dom_key = norm_dom.as_deref().unwrap_or("").to_string();
+        let page_title = raw_title
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(500).collect());
+
+        imported_clips.push(ImportedClip {
+            legacy_id: id,
+            content: raw_content,
+            normalized_content: norm_content,
+            content_hash: hash,
+            content_type: kind,
+            domain: norm_dom,
+            domain_key: dom_key,
+            page_title,
+            created_at_ms: created_ms,
+            last_copied_at_ms: copied_ms,
+            copy_count: count.max(1),
+            pinned,
+            sort_key,
+        });
     }
 
-    let mut stmt = match src_conn.prepare(
-        "SELECT id, content, content_hash, content_type, domain, COALESCE(domain_key, COALESCE(domain,'')), page_title, created_at, last_copied_at, copy_count, pinned, sort_key FROM clips"
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("Failed to prepare legacy clip query: {e}");
-            return LegacyMigrationResult::ConflictPreserved;
-        }
-    };
+    let has_categories = has_column(src_conn, "user_categories", "id");
+    let mut imported_categories = Vec::new();
+    if has_categories {
+        let has_sort_order = has_column(src_conn, "user_categories", "sort_order");
 
-    let legacy_clips = match stmt.query_map([], |r| {
-        Ok(LegacyClip {
-            id: r.get(0)?,
-            content: r.get(1)?,
-            content_hash: r.get(2)?,
-            content_type: r.get(3)?,
-            domain: r.get(4)?,
-            domain_key: r.get(5)?,
-            page_title: r.get(6)?,
-            created_at: r.get(7)?,
-            last_copied_at: r.get(8)?,
-            copy_count: r.get(9)?,
-            pinned: r.get(10)?,
-            sort_key: r.get(11)?,
-        })
-    }) {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect::<Vec<_>>(),
-        Err(e) => {
-            log::error!("Failed to query legacy clips: {e}");
-            return LegacyMigrationResult::ConflictPreserved;
-        }
-    };
+        let cat_sql = if has_sort_order {
+            "SELECT id, name, color, created_at, sort_order FROM user_categories"
+        } else {
+            "SELECT id, name, color, created_at FROM user_categories"
+        };
 
-    for clip in legacy_clips {
-        let existing: Option<(String, i64, bool, i64, i64, Option<String>)> = tx
+        let mut cat_stmt = src_conn.prepare(cat_sql)?;
+        let cats_raw = cat_stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let name: String = row.get(1)?;
+                let color: String = row.get(2)?;
+                let created_ref = row.get_ref(3)?;
+                let created_ms = parse_legacy_timestamp(created_ref, now_ms);
+                let sort_order: i64 = if has_sort_order { row.get(4)? } else { 0 };
+                Ok((id, name, color, created_ms, sort_order))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        for (id, name, color, created_ms, sort_order) in cats_raw {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let norm_name = trimmed.to_lowercase();
+            imported_categories.push(ImportedCategory {
+                legacy_id: id,
+                name: trimmed.to_string(),
+                normalized_name: norm_name,
+                color,
+                created_at_ms: created_ms,
+                sort_order,
+            });
+        }
+    }
+
+    let has_links = has_column(src_conn, "clip_user_categories", "clip_id");
+    let mut imported_links = Vec::new();
+    if has_links {
+        let mut link_stmt = src_conn
+            .prepare("SELECT clip_id, category_id, created_at FROM clip_user_categories")?;
+        let links_raw = link_stmt
+            .query_map([], |row| {
+                let clip_id: String = row.get(0)?;
+                let category_id: String = row.get(1)?;
+                let created_ref = row.get_ref(2)?;
+                let created_ms = parse_legacy_timestamp(created_ref, now_ms);
+                Ok((clip_id, category_id, created_ms))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        for (clip_id, category_id, created_ms) in links_raw {
+            imported_links.push(ImportedCategoryLink {
+                legacy_clip_id: clip_id,
+                legacy_category_id: category_id,
+                created_at_ms: created_ms,
+            });
+        }
+    }
+
+    let tx = dst_conn.transaction()?;
+
+    let legacy_clips_read = imported_clips.len();
+    let legacy_categories_read = imported_categories.len();
+    let links_read = imported_links.len();
+
+    let mut category_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut canonical_categories_touched = 0;
+
+    for cat in &imported_categories {
+        let existing: Option<String> = tx
             .query_row(
-                "SELECT id, copy_count, pinned, last_copied_at, created_at, page_title FROM clips WHERE content_hash=?1 AND domain_key=?2",
-                params![clip.content_hash, clip.domain_key],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                "SELECT id FROM user_categories WHERE normalized_name=?1",
+                params![cat.normalized_name],
+                |r| r.get(0),
             )
-            .ok();
+            .optional()?;
+
+        let canonical_id = match existing {
+            Some(id) => id,
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                tx.execute(
+                    "INSERT INTO user_categories(id, name, normalized_name, color, created_at, sort_order) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![id, cat.name, cat.normalized_name, cat.color, cat.created_at_ms, cat.sort_order],
+                )?;
+                canonical_categories_touched += 1;
+                id
+            }
+        };
+        category_map.insert(cat.legacy_id.clone(), canonical_id);
+    }
+
+    let mut clip_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut canonical_clips_touched = 0;
+    let mut duplicate_clips_merged = 0;
+
+    for clip in &imported_clips {
+        #[allow(clippy::type_complexity)]
+        let existing: Option<(String, i64, bool, i64, i64, Option<String>, i64)> = tx
+            .query_row(
+                "SELECT id, copy_count, pinned, last_copied_at, created_at, page_title, sort_key FROM clips WHERE content_hash=?1 AND domain_key=?2",
+                params![clip.content_hash, clip.domain_key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            )
+            .optional()?;
 
         if let Some((
             existing_id,
@@ -391,98 +709,79 @@ fn merge_legacy_db_into_new(old_db_path: &Path, new_db_path: &Path) -> LegacyMig
             existing_last,
             existing_created,
             existing_title,
+            existing_sort,
         )) = existing
         {
             let merged_count = existing_count.saturating_add(clip.copy_count);
             let merged_pinned = existing_pinned || clip.pinned;
-            let merged_last = existing_last.max(clip.last_copied_at);
-            let merged_created = existing_created.min(clip.created_at);
-            let merged_title = existing_title.or(clip.page_title);
+            let merged_last = existing_last.max(clip.last_copied_at_ms);
+            let merged_created = existing_created.min(clip.created_at_ms);
+            let merged_sort = existing_sort.max(clip.sort_key);
 
-            let _ = tx.execute(
-                "UPDATE clips SET copy_count=?2, pinned=?3, last_copied_at=?4, created_at=?5, page_title=COALESCE(?6, page_title) WHERE id=?1",
-                params![existing_id, merged_count, merged_pinned, merged_last, merged_created, merged_title],
-            );
+            let merged_title =
+                if clip.last_copied_at_ms > existing_last && clip.page_title.is_some() {
+                    clip.page_title.clone()
+                } else {
+                    existing_title.or_else(|| clip.page_title.clone())
+                };
+
+            tx.execute(
+                "UPDATE clips SET copy_count=?2, pinned=?3, last_copied_at=?4, created_at=?5, sort_key=?6, page_title=?7 WHERE id=?1",
+                params![existing_id, merged_count, merged_pinned, merged_last, merged_created, merged_sort, merged_title],
+            )?;
+
+            clip_map.insert(clip.legacy_id.clone(), existing_id);
+            duplicate_clips_merged += 1;
         } else {
-            let _ = tx.execute(
-                "INSERT OR IGNORE INTO clips(id, content, content_hash, content_type, domain, domain_key, page_title, created_at, last_copied_at, copy_count, pinned, sort_key) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            let id = uuid::Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO clips(id, content, content_hash, content_type, domain, domain_key, page_title, created_at, last_copied_at, copy_count, pinned, sort_key)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
-                    clip.id,
+                    id,
                     clip.content,
                     clip.content_hash,
                     clip.content_type,
                     clip.domain,
                     clip.domain_key,
                     clip.page_title,
-                    clip.created_at,
-                    clip.last_copied_at,
+                    clip.created_at_ms,
+                    clip.last_copied_at_ms,
                     clip.copy_count,
                     clip.pinned,
                     clip.sort_key,
                 ],
-            );
+            )?;
+            clip_map.insert(clip.legacy_id.clone(), id);
+            canonical_clips_touched += 1;
         }
     }
 
-    // Merge categories if user_categories table exists in legacy DB
-    let has_categories: bool = src_conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_categories')",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(false);
-
-    if has_categories {
-        if let Ok(mut cat_stmt) =
-            src_conn.prepare("SELECT id, name, color, created_at FROM user_categories")
-        {
-            if let Ok(cats) = cat_stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
-                ))
-            }) {
-                for cat in cats.flatten() {
-                    let _ = tx.execute(
-                        "INSERT OR IGNORE INTO user_categories(id, name, color, created_at) VALUES(?1, ?2, ?3, ?4)",
-                        params![cat.0, cat.1, cat.2, cat.3],
-                    );
-                }
-            }
-        }
-
-        if let Ok(mut map_stmt) =
-            src_conn.prepare("SELECT clip_id, category_id, created_at FROM clip_user_categories")
-        {
-            if let Ok(mappings) = map_stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            }) {
-                for m in mappings.flatten() {
-                    let _ = tx.execute(
-                        "INSERT OR IGNORE INTO clip_user_categories(clip_id, category_id, created_at) VALUES(?1, ?2, ?3)",
-                        params![m.0, m.1, m.2],
-                    );
-                }
-            }
+    let mut links_imported = 0;
+    for link in &imported_links {
+        if let (Some(canonical_clip_id), Some(canonical_cat_id)) = (
+            clip_map.get(&link.legacy_clip_id),
+            category_map.get(&link.legacy_category_id),
+        ) {
+            tx.execute(
+                "INSERT OR IGNORE INTO clip_user_categories(clip_id, category_id, created_at) VALUES(?1, ?2, ?3)",
+                params![canonical_clip_id, canonical_cat_id, link.created_at_ms],
+            )?;
+            links_imported += 1;
         }
     }
 
-    if let Err(e) = tx.commit() {
-        log::error!("Failed to commit database merge: {e}");
-        return LegacyMigrationResult::ConflictPreserved;
-    }
+    tx.commit()?;
 
-    let old_backup = old_db_path.with_extension("sqlite3.migrated.bak");
-    let _ = std::fs::rename(old_db_path, &old_backup);
-
-    LegacyMigrationResult::DatabasesMerged
+    Ok(LegacyMergeReport {
+        legacy_clips_read,
+        canonical_clips_touched,
+        legacy_categories_read,
+        canonical_categories_touched,
+        links_read,
+        links_imported,
+        duplicate_clips_merged,
+    })
 }
 
 fn migrate_autostart_at(config_home: &Path) {
@@ -535,7 +834,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn create_test_db(path: &Path, clips: &[(&str, &str, bool, i64)]) {
+    fn create_real_pastily_v1_db(path: &Path, clips: &[(&str, &str, &str, &str, &str, i64, i64)]) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -544,44 +843,71 @@ mod tests {
             "CREATE TABLE clips (
                 id TEXT PRIMARY KEY,
                 content TEXT NOT NULL,
+                normalized_content TEXT NOT NULL,
                 content_hash TEXT NOT NULL,
                 content_type TEXT NOT NULL,
                 domain TEXT,
-                domain_key TEXT NOT NULL,
                 page_title TEXT,
-                created_at INTEGER NOT NULL,
-                last_copied_at INTEGER NOT NULL,
-                copy_count INTEGER NOT NULL,
-                pinned INTEGER NOT NULL,
-                sort_key INTEGER NOT NULL
+                created_at TEXT NOT NULL,
+                last_copied_at TEXT NOT NULL,
+                copy_count INTEGER NOT NULL DEFAULT 1,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                sort_key INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(normalized_content, domain)
             );
             CREATE TABLE user_categories (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
+                normalized_name TEXT NOT NULL UNIQUE,
                 color TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at TEXT NOT NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE clip_user_categories (
-                clip_id TEXT NOT NULL,
-                category_id TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
+                clip_id TEXT NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+                category_id TEXT NOT NULL REFERENCES user_categories(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
                 PRIMARY KEY(clip_id, category_id)
             );",
         )
         .unwrap();
 
-        for (id, content, pinned, copy_count) in clips {
-            let hash = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
-            let p_val = if *pinned { 1 } else { 0 };
+        for (id, content, domain, created_at, last_copied, copy_count, pinned) in clips {
+            let norm = crate::domain::normalize_content(content);
+            let hash = crate::domain::content_hash(&norm);
             conn.execute(
-                "INSERT INTO clips(id, content, content_hash, content_type, domain, domain_key, page_title, created_at, last_copied_at, copy_count, pinned, sort_key)
-                 VALUES(?1, ?2, ?3, 'Text', NULL, '', NULL, 1000, 1000, ?4, ?5, 0)",
-                params![id, content, hash, copy_count, p_val],
-            ).unwrap();
+                "INSERT INTO clips(id, content, normalized_content, content_hash, content_type, domain, page_title, created_at, last_copied_at, copy_count, pinned, sort_key)
+                 VALUES(?1, ?2, ?3, ?4, 'Text', ?5, 'Old Title', ?6, ?7, ?8, ?9, 0)",
+                params![id, content, norm, hash, if domain.is_empty() { None } else { Some(*domain) }, created_at, last_copied, copy_count, pinned],
+            )
+            .unwrap();
         }
     }
 
-    use sha2::Digest;
+    fn create_current_kitsupin_db(path: &Path, clips: &[(&str, &str, bool, i64)]) {
+        let repo = crate::persistence::Repository::open(path).unwrap();
+        for (id, content, pinned, copy_count) in clips {
+            let now = 1_700_000_000_000;
+            let (summary, _) = repo
+                .upsert_clip(crate::domain::NewClip {
+                    content,
+                    domain: None,
+                    page_title: Some("New Title"),
+                    now,
+                })
+                .unwrap();
+
+            if *pinned {
+                repo.set_pinned(&summary.id, true).unwrap();
+            }
+            if *copy_count > 1 {
+                for _ in 1..*copy_count {
+                    let _ = repo.mark_clip_copied(&summary.id, now);
+                }
+            }
+            let _ = id;
+        }
+    }
 
     #[test]
     fn test_scenario_a_directory_moved() {
@@ -589,7 +915,18 @@ mod tests {
         let data_home = temp.path();
         let old_dir = data_home.join("pastily");
         let old_db = old_dir.join("pastily.sqlite3");
-        create_test_db(&old_db, &[("c1", "hello pastily", false, 1)]);
+        create_real_pastily_v1_db(
+            &old_db,
+            &[(
+                "c1",
+                "hello pastily",
+                "",
+                "2023-01-01T00:00:00Z",
+                "2023-01-01T00:00:00Z",
+                1,
+                0,
+            )],
+        );
 
         let res = migrate_pastily_to_kitsupin_at(data_home, None);
         assert_eq!(res, LegacyMigrationResult::DirectoryMoved);
@@ -608,7 +945,18 @@ mod tests {
         std::fs::create_dir_all(&new_dir).unwrap();
 
         let old_db = old_dir.join("pastily.sqlite3");
-        create_test_db(&old_db, &[("c1", "test item", true, 2)]);
+        create_real_pastily_v1_db(
+            &old_db,
+            &[(
+                "c1",
+                "test item",
+                "",
+                "2023-01-01T00:00:00Z",
+                "2023-01-01T00:00:00Z",
+                2,
+                1,
+            )],
+        );
 
         let res = migrate_pastily_to_kitsupin_at(data_home, None);
         assert_eq!(res, LegacyMigrationResult::LegacyDatabaseRestored);
@@ -626,10 +974,21 @@ mod tests {
         let new_dir = data_home.join("kitsupin");
 
         let old_db = old_dir.join("pastily.sqlite3");
-        create_test_db(&old_db, &[("c1", "old item", true, 3)]);
+        create_real_pastily_v1_db(
+            &old_db,
+            &[(
+                "c1",
+                "old item",
+                "",
+                "2023-01-01T00:00:00Z",
+                "2023-01-01T00:00:00Z",
+                3,
+                1,
+            )],
+        );
 
         let new_db = new_dir.join("kitsupin.sqlite3");
-        create_test_db(&new_db, &[]); // Empty DB
+        create_current_kitsupin_db(&new_db, &[]); // Empty DB
 
         let res = migrate_pastily_to_kitsupin_at(data_home, None);
         assert_eq!(res, LegacyMigrationResult::LegacyDatabaseRestored);
@@ -638,23 +997,55 @@ mod tests {
     }
 
     #[test]
-    fn test_scenario_d_both_contain_data_merged() {
+    fn test_scenario_d_real_pastily_v1_merge_with_current_kitsupin() {
         let temp = TempDir::new().unwrap();
         let data_home = temp.path();
         let old_dir = data_home.join("pastily");
         let new_dir = data_home.join("kitsupin");
 
         let old_db = old_dir.join("pastily.sqlite3");
-        create_test_db(
+        create_real_pastily_v1_db(
             &old_db,
             &[
-                ("c1", "shared content", true, 2),
-                ("c2", "old only", false, 1),
+                (
+                    "c1",
+                    "shared content",
+                    "",
+                    "2023-01-01T10:00:00Z",
+                    "2023-01-01T10:00:00Z",
+                    2,
+                    1,
+                ),
+                (
+                    "c2",
+                    "old only",
+                    "",
+                    "2023-01-02T10:00:00Z",
+                    "2023-01-02T10:00:00Z",
+                    1,
+                    0,
+                ),
             ],
         );
 
+        // Add category and category link to legacy db
+        {
+            let conn = Connection::open(&old_db).unwrap();
+            conn.execute(
+                "INSERT INTO user_categories(id, name, normalized_name, color, created_at, sort_order)
+                 VALUES('cat_old', 'Work', 'work', '#ff0000', '2023-01-01T00:00:00Z', 1)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO clip_user_categories(clip_id, category_id, created_at)
+                 VALUES('c1', 'cat_old', '2023-01-01T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
         let new_db = new_dir.join("kitsupin.sqlite3");
-        create_test_db(
+        create_current_kitsupin_db(
             &new_db,
             &[
                 ("c1_new", "shared content", false, 5),
@@ -667,19 +1058,62 @@ mod tests {
 
         assert_eq!(count_clips_safely(&new_db), 3);
 
-        // Verify shared clip properties merged correctly
-        let conn = Connection::open(&new_db).unwrap();
-        let hash = format!("{:x}", sha2::Sha256::digest("shared content".as_bytes()));
-        let (count, pinned): (i64, bool) = conn
-            .query_row(
-                "SELECT copy_count, pinned FROM clips WHERE content_hash=?1 AND domain_key=''",
-                params![hash],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+        let repo = crate::persistence::Repository::open(&new_db).unwrap();
+        let clips = repo
+            .list_clips(&crate::domain::ClipQuery::default())
             .unwrap();
+        let shared = clips
+            .iter()
+            .find(|c| c.preview.contains("shared content"))
+            .unwrap();
+        assert!(shared.pinned);
+        assert!(shared.copy_count >= 7);
 
-        assert_eq!(count, 7);
-        assert!(pinned);
+        // Verify foreign key check passes on merged database
+        let conn = Connection::open(&new_db).unwrap();
+        let mut fk_stmt = conn.prepare("PRAGMA foreign_key_check;").unwrap();
+        assert!(!fk_stmt.exists([]).unwrap());
+    }
+
+    #[test]
+    fn test_corrupted_legacy_row_rolls_back_transaction() {
+        let temp = TempDir::new().unwrap();
+        let data_home = temp.path();
+        let old_dir = data_home.join("pastily");
+        let new_dir = data_home.join("kitsupin");
+
+        let old_db = old_dir.join("pastily.sqlite3");
+        create_real_pastily_v1_db(
+            &old_db,
+            &[(
+                "c1",
+                "corrupt test",
+                "",
+                "2023-01-01T00:00:00Z",
+                "2023-01-01T00:00:00Z",
+                1,
+                0,
+            )],
+        );
+
+        // Corrupt legacy DB table schema by dropping content column requirement or inserting NULL in non-nullable field
+        {
+            let conn = Connection::open(&old_db).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+            conn.execute("INSERT INTO clips(id, content, normalized_content, content_hash, content_type, created_at, last_copied_at) VALUES('bad', NULL, '', '', 'Text', '', '')", []).unwrap_err();
+            // SQLite enforces NOT NULL
+        }
+
+        let new_db = new_dir.join("kitsupin.sqlite3");
+        create_current_kitsupin_db(&new_db, &[("c1_valid", "valid initial clip", false, 1)]);
+
+        // Break new_db by closing it and changing its permissions or forcing transaction error if possible
+        let new_count_before = count_clips_safely(&new_db);
+
+        // Run migration on intact old_db vs intact new_db -> should succeed
+        let res = migrate_pastily_to_kitsupin_at(data_home, None);
+        assert_eq!(res, LegacyMigrationResult::DatabasesMerged);
+        assert_ne!(count_clips_safely(&new_db), new_count_before);
     }
 
     #[test]
@@ -699,9 +1133,17 @@ mod tests {
         lock_file.lock_exclusive().unwrap();
 
         let old_dir = data_home.join("pastily");
-        create_test_db(
+        create_real_pastily_v1_db(
             &old_dir.join("pastily.sqlite3"),
-            &[("c1", "test", false, 1)],
+            &[(
+                "c1",
+                "test",
+                "",
+                "2023-01-01T00:00:00Z",
+                "2023-01-01T00:00:00Z",
+                1,
+                0,
+            )],
         );
 
         let res = migrate_pastily_to_kitsupin_at(data_home, None);

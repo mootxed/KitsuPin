@@ -77,12 +77,9 @@ jobs:
       - name: Run core tests
         run: cargo test --manifest-path src-tauri/core-tests/Cargo.toml
 
-      - name: Run main crate tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
-
   # ── Tauri system check / build ─────────────────────────────────────────────
   tauri-check:
-    name: Tauri (check · build)
+    name: Tauri (check · clippy · test · build)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -106,6 +103,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -131,6 +130,12 @@ jobs:
 
       - name: Cargo check (Tauri)
         run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Clippy (Tauri main crate)
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Run main crate tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: Tauri build
         run: npm run tauri build -- --bundles deb

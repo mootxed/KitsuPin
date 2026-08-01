@@ -72,7 +72,7 @@ pub fn set_clipboard(
         }
         Err(error) => {
             guard.cancel(token);
-            Err(error.into())
+            Err(error)
         }
     }
 }

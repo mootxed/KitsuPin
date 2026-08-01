@@ -11,6 +11,7 @@ use uuid::Uuid;
 const MIGRATION_1: &str = include_str!("../../migrations/001_initial.sql");
 
 /// Window within which Chrome metadata can be reconciled to a clip (milliseconds).
+#[allow(dead_code)]
 pub const METADATA_RECONCILE_WINDOW_MS: i64 = 5_000;
 
 pub struct Repository {
@@ -25,9 +26,8 @@ impl Repository {
         let connection = Connection::open(path).context("не удалось открыть SQLite")?;
         configure_connection(&connection)?;
         connection.busy_timeout(std::time::Duration::from_secs(3))?;
-        connection.execute_batch(
-            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
-        )?;
+        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
+        let _: String = connection.query_row("PRAGMA journal_mode=WAL;", [], |r| r.get(0))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -67,6 +67,12 @@ impl Repository {
     fn migrate(&self) -> Result<()> {
         let mut db = self.connection.lock();
         let tx = db.transaction()?;
+        self.run_migrations(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn run_migrations(&self, tx: &rusqlite::Transaction) -> Result<()> {
         tx.execute_batch("CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);")?;
 
         // ── Migration 1: initial schema ───────────────────────────────────
@@ -76,7 +82,16 @@ impl Repository {
             |r| r.get(0),
         )?;
         if !exists {
-            tx.execute_batch(MIGRATION_1)?;
+            let clips_exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='clips')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if !clips_exists {
+                tx.execute_batch(MIGRATION_1)?;
+            }
             tx.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES(1, datetime('now'))",
                 [],
@@ -510,7 +525,6 @@ impl Repository {
             )?;
         }
 
-        tx.commit()?;
         Ok(())
     }
 
@@ -609,88 +623,82 @@ impl Repository {
         Ok((clip, receipt))
     }
 
-    /// Attach browser metadata to a recently saved clip whose source was not yet known.
-    pub fn attach_metadata(
+    /// Attach browser metadata to a recently saved clip using its upsert receipt.
+    pub fn attach_metadata_with_receipt(
         &self,
-        content_hash_val: &str,
-        content_length_bytes: usize,
-        domain: &str,
-        page_title: Option<&str>,
-        event_ts_ms: i64,
-        receipt: Option<crate::browser_metadata::ClipUpsertReceipt>,
+        event: &crate::browser_metadata::BrowserCopyEvent,
+        receipt: crate::browser_metadata::ClipUpsertReceipt,
     ) -> Result<Option<String>> {
-        let domain_key = domain;
-        let title = page_title
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.chars().take(500).collect::<String>());
+        let event_ts_ms = match event.timestamp_millis() {
+            Ok(ts) => ts,
+            Err(_) => chrono::Utc::now().timestamp_millis(),
+        };
+        let domain_key = &event.domain;
+        let title = if event.page_title.is_empty() {
+            None
+        } else {
+            Some(event.page_title.chars().take(500).collect::<String>())
+        };
 
         let mut db = self.connection.lock();
         let tx = db.transaction()?;
 
         #[allow(clippy::type_complexity)]
-        let candidate: Option<(String, i64, i64, i64, bool, String, String, i64)> = if let Some(r) =
-            &receipt
-        {
-            match tx.query_row(
-                "SELECT id, copy_count, sort_key, created_at, pinned, content, content_type, last_copied_at
-                 FROM clips
-                 WHERE id=?1 AND content_hash=?2 AND domain_key=''
-                   AND copy_count=?3 AND last_copied_at=?4",
-                params![r.clip_id, content_hash_val, r.resulting_copy_count, r.resulting_last_copied_at],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
-            ) {
-                Ok(c) => Some(c),
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    log::info!("Receipt for clip_id {} no longer matches DB state; skipping receipt", r.clip_id);
-                    return Ok(None);
-                }
-                Err(e) => return Err(e.into()),
+        let candidate: Option<(String, i64, i64, i64, bool, String, String, i64)> = match tx.query_row(
+            "SELECT id, copy_count, sort_key, created_at, pinned, content, content_type, last_copied_at
+             FROM clips
+             WHERE id=?1 AND content_hash=?2 AND domain_key=''
+               AND copy_count=?3 AND last_copied_at=?4",
+            params![
+                receipt.clip_id,
+                event.content_hash,
+                receipt.resulting_copy_count,
+                receipt.resulting_last_copied_at
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        ) {
+            Ok(c) => Some(c),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                log::info!(
+                    "Receipt for clip_id {} no longer matches DB state; skipping receipt",
+                    receipt.clip_id
+                );
+                return Ok(None);
             }
-        } else {
-            match tx.query_row(
-                "SELECT id, copy_count, sort_key, created_at, pinned, content, content_type, last_copied_at
-                 FROM clips
-                 WHERE content_hash=?1 AND domain_key='' AND abs(last_copied_at - ?2) <= ?3
-                 ORDER BY abs(last_copied_at - ?2) ASC
-                 LIMIT 1",
-                params![content_hash_val, event_ts_ms, METADATA_RECONCILE_WINDOW_MS],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
-            ) {
-                Ok(c) => Some(c),
-                Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                Err(e) => return Err(e.into()),
-            }
+            Err(e) => return Err(e.into()),
         };
 
         let Some((
             temp_id,
-            temp_count,
+            _temp_count,
             temp_sort,
             temp_created,
             temp_pinned,
             temp_content,
             temp_kind,
-            temp_last_copied_at,
+            _temp_last_copied_at,
         )) = candidate
         else {
             return Ok(None);
         };
 
-        if receipt.is_none() {
-            // Section 3: Do NOT perform late reconciliation if clip already existed prior to copying without receipt!
-            if temp_count > 1 || temp_created != temp_last_copied_at {
-                log::info!("No receipt provided and clip {} was not single-copy created; skipping reconciliation", temp_id);
-                return Ok(None);
-            }
-        }
-
         let normalized_len = normalize_content(&temp_content).len();
-        if normalized_len != content_length_bytes {
+        if normalized_len != event.content_length {
             log::warn!(
-                "attach_metadata: hash match but normalized length mismatch ({} vs {}), skipping",
+                "attach_metadata_with_receipt: hash match but normalized length mismatch ({} vs {}), skipping",
                 normalized_len,
-                content_length_bytes
+                event.content_length
             );
             return Ok(None);
         }
@@ -698,7 +706,7 @@ impl Repository {
         let existing: Option<(String, i64, i64, i64, bool)> = match tx.query_row(
             "SELECT id, copy_count, sort_key, created_at, pinned
              FROM clips WHERE content_hash=?1 AND domain_key=?2",
-            params![content_hash_val, domain_key],
+            params![event.content_hash, domain_key],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -714,9 +722,7 @@ impl Repository {
             Err(e) => return Err(e.into()),
         };
 
-        let is_new_copy = receipt
-            .as_ref()
-            .map_or(temp_count == 1, |r| r.previous_copy_count == 0);
+        let is_new_copy = receipt.previous_copy_count == 0;
 
         let canonical_id = if is_new_copy {
             if let Some((
@@ -759,14 +765,11 @@ impl Repository {
             } else {
                 tx.execute(
                     "UPDATE clips SET domain=?2, domain_key=?3, page_title=COALESCE(?4, page_title) WHERE id=?1",
-                    params![temp_id, domain, domain_key, title],
+                    params![temp_id, event.domain, domain_key, title],
                 )?;
                 temp_id
             }
         } else {
-            let r = receipt
-                .as_ref()
-                .expect("receipt required for prior copy rollback");
             tx.execute(
                 "UPDATE clips SET
                     copy_count = ?2,
@@ -775,9 +778,9 @@ impl Repository {
                  WHERE id = ?1",
                 params![
                     temp_id,
-                    r.previous_copy_count,
-                    r.previous_sort_key,
-                    r.previous_last_copied_at
+                    receipt.previous_copy_count,
+                    receipt.previous_sort_key,
+                    receipt.previous_last_copied_at
                 ],
             )?;
 
@@ -800,9 +803,9 @@ impl Repository {
                     params![
                         new_id,
                         temp_content,
-                        content_hash_val,
+                        event.content_hash,
                         temp_kind,
-                        domain,
+                        event.domain,
                         domain_key,
                         title,
                         temp_created,
@@ -981,6 +984,7 @@ impl Repository {
 
     /// Legacy: update clip stats and return content in one call.
     /// Kept for compatibility; prefer get_clip_content + mark_clip_copied.
+    #[allow(dead_code)]
     pub fn touch_clip(&self, id: &str, now: i64) -> Result<String> {
         let db = self.connection.lock();
         let changed = db.execute(
@@ -1371,28 +1375,45 @@ mod tests {
         assert_eq!(long_s.content_length, 400);
     }
 
+    fn make_browser_event(
+        hash: &str,
+        length: usize,
+        domain: &str,
+        title: Option<&str>,
+        timestamp_ms: i64,
+    ) -> crate::browser_metadata::BrowserCopyEvent {
+        let dt = chrono::DateTime::from_timestamp_millis(timestamp_ms).unwrap();
+        crate::browser_metadata::BrowserCopyEvent {
+            event_id: uuid::Uuid::new_v4(),
+            version: 1,
+            event: "copy".into(),
+            content_hash: hash.into(),
+            content_length: length,
+            domain: domain.into(),
+            page_title: title.unwrap_or("").into(),
+            timestamp: dt.to_rfc3339(),
+        }
+    }
+
     #[test]
     fn attach_metadata_reconciles_after_clipboard_save() {
         let r = Repository::open_in_memory().unwrap();
         let now = 1_700_000_000_000i64;
-        // Save clip without domain (as clipboard watcher would).
         let text = "hello reconcile";
         let normalized = normalize_content(text);
         let hash = content_hash(&normalized);
         let byte_len = normalized.len();
-        let clip = add(&r, text, None, None, now);
-        assert_eq!(clip.domain, None);
+        let (_clip, receipt) = add_with_receipt(&r, text, None, None, now);
 
-        // Attach metadata arriving 200ms later.
+        let event = make_browser_event(
+            &hash,
+            byte_len,
+            "example.com",
+            Some("Example Page"),
+            now + 200,
+        );
         let result = r
-            .attach_metadata(
-                &hash,
-                byte_len,
-                "example.com",
-                Some("Example Page"),
-                now + 200,
-                None,
-            )
+            .attach_metadata_with_receipt(&event, receipt.unwrap())
             .unwrap();
         assert!(result.is_some());
 
@@ -1411,7 +1432,6 @@ mod tests {
         let hash = content_hash(&normalized);
         let byte_len = normalized.len();
 
-        // Existing clip with domain (e.g., previously saved with metadata).
         let existing = add(
             &r,
             text,
@@ -1419,31 +1439,22 @@ mod tests {
             Some("Old Title"),
             now - 10_000,
         );
-        // New unattributed clip (no domain).
-        let _temp = add(&r, text, None, None, now);
+        let (_temp, receipt) = add_with_receipt(&r, text, None, None, now);
 
         let cat = r.create_category("Test", "#aabbcc", now).unwrap();
         r.assign_category(&_temp.id, &cat.id, now).unwrap();
 
+        let event =
+            make_browser_event(&hash, byte_len, "example.com", Some("New Title"), now + 100);
         let result = r
-            .attach_metadata(
-                &hash,
-                byte_len,
-                "example.com",
-                Some("New Title"),
-                now + 100,
-                None,
-            )
+            .attach_metadata_with_receipt(&event, receipt.unwrap())
             .unwrap();
         assert_eq!(result.as_deref(), Some(existing.id.as_str()));
 
         let clips = r.list_clips(&ClipQuery::default()).unwrap();
-        // Should be merged into one clip.
         assert_eq!(clips.len(), 1);
         assert_eq!(clips[0].id, existing.id);
-        // copy_count merged: existing had 1, temp had 1 → 2.
         assert_eq!(clips[0].copy_count, 2);
-        // Category from temp transferred to canonical.
         assert_eq!(clips[0].categories.len(), 1);
     }
 
@@ -1454,17 +1465,11 @@ mod tests {
         let text = "some content";
         let normalized = normalize_content(text);
         let byte_len = normalized.len();
-        add(&r, text, None, None, now);
-        // Wrong hash.
+        let (_clip, receipt) = add_with_receipt(&r, text, None, None, now);
+
+        let event = make_browser_event(&"a".repeat(64), byte_len, "example.com", None, now + 100);
         let result = r
-            .attach_metadata(
-                "a".repeat(64).as_str(),
-                byte_len,
-                "example.com",
-                None,
-                now + 100,
-                None,
-            )
+            .attach_metadata_with_receipt(&event, receipt.unwrap())
             .unwrap();
         assert!(result.is_none());
     }
@@ -1476,35 +1481,164 @@ mod tests {
         let text = "length mismatch test";
         let normalized = normalize_content(text);
         let hash = content_hash(&normalized);
-        add(&r, text, None, None, now);
-        // Correct hash but wrong length.
+        let (_clip, receipt) = add_with_receipt(&r, text, None, None, now);
+
+        let event = make_browser_event(&hash, 9999, "example.com", None, now + 100);
         let result = r
-            .attach_metadata(&hash, 9999, "example.com", None, now + 100, None)
+            .attach_metadata_with_receipt(&event, receipt.unwrap())
             .unwrap();
         assert!(result.is_none());
     }
 
     #[test]
-    fn attach_metadata_rejects_too_late() {
-        let r = Repository::open_in_memory().unwrap();
-        let now = 1_700_000_000_000i64;
-        let text = "late metadata test";
-        let normalized = normalize_content(text);
-        let hash = content_hash(&normalized);
-        let byte_len = normalized.len();
-        add(&r, text, None, None, now);
-        // Arrives beyond the reconcile window.
-        let result = r
-            .attach_metadata(
-                &hash,
-                byte_len,
-                "example.com",
-                None,
-                now + METADATA_RECONCILE_WINDOW_MS + 1000,
-                None,
-            )
+    fn test_scenario_a_metadata_before_clipboard() {
+        use crate::browser_metadata::MetadataBuffer;
+        use chrono::Utc;
+        let buffer = MetadataBuffer::default();
+        let repo = Repository::open_in_memory().unwrap();
+
+        let text = "metadata before clipboard content";
+        let norm = normalize_content(text);
+        let hash = content_hash(&norm);
+        let len = norm.len();
+        let now = Utc::now();
+        let now_ms = now.timestamp_millis();
+
+        let event = make_browser_event(
+            &hash,
+            len,
+            "chrome.example.com",
+            Some("Chrome Title"),
+            now_ms,
+        );
+        buffer.push(event).unwrap();
+
+        let receipt = buffer.take_matching_receipt(&hash, len, now_ms, 2000);
+        assert!(receipt.is_none(), "No receipt should exist yet");
+
+        let matched_event = buffer.take_match(&hash, len, now).unwrap();
+        let (clip, _) = repo
+            .upsert_clip(NewClip {
+                content: text,
+                domain: Some(&matched_event.domain),
+                page_title: Some(&matched_event.page_title),
+                now: now_ms,
+            })
             .unwrap();
-        assert!(result.is_none());
+
+        assert_eq!(clip.domain.as_deref(), Some("chrome.example.com"));
+        assert_eq!(clip.page_title.as_deref(), Some("Chrome Title"));
+        assert!(buffer.take_match(&hash, len, now).is_none());
+    }
+
+    #[test]
+    fn test_scenario_b_metadata_after_clipboard() {
+        use crate::browser_metadata::MetadataBuffer;
+        let buffer = MetadataBuffer::default();
+        let repo = Repository::open_in_memory().unwrap();
+
+        let text = "metadata after clipboard content";
+        let norm = normalize_content(text);
+        let hash = content_hash(&norm);
+        let len = norm.len();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        let (_clip, receipt) = repo
+            .upsert_clip(NewClip {
+                content: text,
+                domain: None,
+                page_title: None,
+                now: now_ms,
+            })
+            .unwrap();
+
+        let receipt = receipt.unwrap();
+        buffer.push_receipt(&hash, len, receipt.clone());
+
+        let event = make_browser_event(
+            &hash,
+            len,
+            "after.example.com",
+            Some("After Title"),
+            now_ms + 100,
+        );
+        let matched_receipt = buffer
+            .take_matching_receipt(&hash, len, now_ms + 100, 2000)
+            .unwrap();
+
+        let attached_id = repo
+            .attach_metadata_with_receipt(&event, matched_receipt)
+            .unwrap();
+        assert_eq!(attached_id.as_deref(), Some(receipt.clip_id.as_str()));
+
+        let clips = repo.list_clips(&ClipQuery::default()).unwrap();
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].domain.as_deref(), Some("after.example.com"));
+    }
+
+    #[test]
+    fn test_scenario_c_terminal_then_chrome_same_text() {
+        use crate::browser_metadata::MetadataBuffer;
+        let buffer = MetadataBuffer::default();
+        let repo = Repository::open_in_memory().unwrap();
+
+        let text = "terminal vs chrome content";
+        let norm = normalize_content(text);
+        let hash = content_hash(&norm);
+        let len = norm.len();
+        let t_terminal = 1_700_000_000_000i64;
+
+        let (_clip_term, receipt_term) = repo
+            .upsert_clip(NewClip {
+                content: text,
+                domain: None,
+                page_title: None,
+                now: t_terminal,
+            })
+            .unwrap();
+        let r_term = receipt_term.unwrap();
+        buffer.push_receipt(&hash, len, r_term);
+
+        let t_chrome = t_terminal + 10_000;
+        let receipt_match = buffer.take_matching_receipt(&hash, len, t_chrome, 2000);
+        assert!(
+            receipt_match.is_none(),
+            "Old terminal receipt must not match distant Chrome event"
+        );
+
+        let clips = repo.list_clips(&ClipQuery::default()).unwrap();
+        assert_eq!(clips[0].domain, None);
+    }
+
+    #[test]
+    fn test_scenario_d_stale_receipt_rejected() {
+        let repo = Repository::open_in_memory().unwrap();
+        let now = 1_700_000_000_000i64;
+        let text = "stale receipt content";
+        let norm = normalize_content(text);
+        let hash = content_hash(&norm);
+        let len = norm.len();
+
+        let (_clip, receipt) = repo
+            .upsert_clip(NewClip {
+                content: text,
+                domain: None,
+                page_title: None,
+                now,
+            })
+            .unwrap();
+        let stale_receipt = receipt.unwrap();
+
+        let _ = repo.mark_clip_copied(&stale_receipt.clip_id, now + 5000);
+
+        let event = make_browser_event(&hash, len, "example.com", None, now + 100);
+        let res = repo
+            .attach_metadata_with_receipt(&event, stale_receipt)
+            .unwrap();
+        assert!(
+            res.is_none(),
+            "Stale receipt must be rejected if DB state changed"
+        );
     }
 
     #[test]
@@ -1517,18 +1651,12 @@ mod tests {
         for text in test_cases {
             let normalized = normalize_content(text);
             let hash = content_hash(&normalized);
-            let byte_len = normalized.len(); // Chrome sends normalized byte length!
+            let byte_len = normalized.len();
 
             let (_clip, receipt) = add_with_receipt(&r, text, None, None, now);
+            let event = make_browser_event(&hash, byte_len, "example.org", Some("Title"), now + 50);
             let res = r
-                .attach_metadata(
-                    &hash,
-                    byte_len,
-                    "example.org",
-                    Some("Title"),
-                    now + 50,
-                    receipt,
-                )
+                .attach_metadata_with_receipt(&event, receipt.unwrap())
                 .unwrap();
             assert!(
                 res.is_some(),
@@ -1543,7 +1671,6 @@ mod tests {
         let r = Repository::open_in_memory().unwrap();
         let t_old = 1_700_000_000_000i64;
 
-        // Save clip without domain initially, copy_count = 5.
         let text = "multi copy clip";
         let normalized = normalize_content(text);
         let hash = content_hash(&normalized);
@@ -1553,24 +1680,21 @@ mod tests {
         }
 
         let t_new = 1_700_000_100_000i64;
-        // User copies it again in Chrome, raising copy_count to 6 temporarily.
         let (_, receipt) = add_with_receipt(&r, text, None, None, t_new);
 
-        // Late reconciliation arrives with domain github.com.
+        let event = make_browser_event(
+            &hash,
+            normalized.len(),
+            "github.com",
+            Some("GitHub Page"),
+            t_new,
+        );
         let canon = r
-            .attach_metadata(
-                &hash,
-                normalized.len(),
-                "github.com",
-                Some("GitHub Page"),
-                t_new,
-                receipt,
-            )
+            .attach_metadata_with_receipt(&event, receipt.unwrap())
             .unwrap();
         assert!(canon.is_some());
 
         let clips = r.list_clips(&ClipQuery::default()).unwrap();
-        // There should be 2 clips: 1 with github.com domain (copy_count = 1), 1 without domain (copy_count = 5, restored to t_old + 4000).
         assert_eq!(clips.len(), 2);
 
         let github_clip = clips
@@ -1578,6 +1702,12 @@ mod tests {
             .find(|c| c.domain.as_deref() == Some("github.com"))
             .unwrap();
         let domainless_clip = clips.iter().find(|c| c.domain.is_none()).unwrap();
+
+        assert_eq!(github_clip.copy_count, 1);
+        assert_eq!(github_clip.last_copied_at, t_new);
+
+        assert_eq!(domainless_clip.copy_count, 5);
+        assert_eq!(domainless_clip.last_copied_at, t_old + 4000);
 
         assert_eq!(github_clip.copy_count, 1);
         assert_eq!(github_clip.last_copied_at, t_new);
