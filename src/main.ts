@@ -39,7 +39,6 @@ let invalidWarningConsumed = false;
 const app = document.querySelector<HTMLElement>("#app")!;
 const esc = (value: string) =>
   value.replace(/[&<>'"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[c]!));
-const tag = (text: string, className = "", style = "") => `<span class="tag ${className}" ${style}>${esc(text)}</span>`;
 
 // ── Toast notifications ───────────────────────────────────────────────────────
 
@@ -279,7 +278,7 @@ function clipCard(c: ClipSummary, index: number) {
     ? `<button class="iconbtn" data-action="pin" aria-label="Открепить"><i data-lucide="pin-off"></i></button>`
     : `<button class="iconbtn" data-action="pin" aria-label="Закрепить"><i data-lucide="pin"></i></button>`;
 
-  return `<article class="clip ${c.pinned ? "pinned" : ""}" tabindex="0" data-clip="${c.id}" draggable="true" aria-label="Скопировать фрагмент">
+  return `<article class="clip ${c.pinned ? "pinned" : ""}" role="button" tabindex="0" data-clip="${c.id}" draggable="true" aria-label="Скопировать фрагмент">
     <div class="clip-main">
       <div class="clip-top">
         <strong>${esc(typeLabel)}</strong>
@@ -383,7 +382,7 @@ function bindCards(root: HTMLElement) {
 
     card.onkeydown = async (e) => {
       if (e.key === "Enter" || e.key === " ") {
-        if (isInteractiveTarget(e.target)) return;
+        if (e.target !== card && isInteractiveTarget(e.target)) return;
         if (e.key === " ") e.preventDefault();
         try {
           let content: string | undefined;
@@ -573,7 +572,10 @@ function showCategoryModal() {
           "Удалить категорию?",
           "Категория будет удалена из всех фрагментов. Продолжить?"
         );
-        if (!confirmed) return;
+        if (!confirmed) {
+          showCategoryModal();
+          return;
+        }
         try {
           await api.deleteCategory(button.dataset.delete!);
           root.innerHTML = "";
@@ -774,6 +776,8 @@ function renderSettingsScreen() {
   });
 
   // Default: show general tab
+  document.querySelectorAll<HTMLElement>(".settings-nav .navbtn").forEach((b) => b.classList.remove("active"));
+  document.querySelector<HTMLElement>(".settings-nav .navbtn[data-tab='general']")?.classList.add("active");
   renderGeneralTab(body, s);
 }
 

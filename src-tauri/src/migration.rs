@@ -124,7 +124,10 @@ fn migrate_data_dir_at(data_home: &Path) -> LegacyMigrationResult {
     }
 
     if !old_dir.exists() && new_dir.exists() {
-        normalize_db_names_in(&new_dir);
+        if let Err(e) = normalize_db_names_in(&new_dir) {
+            log::error!("Failed to normalize legacy database name in new directory: {e}");
+            return LegacyMigrationResult::ConflictPreserved;
+        }
         return LegacyMigrationResult::NothingToMigrate;
     }
 
@@ -167,20 +170,23 @@ fn migrate_data_dir_at(data_home: &Path) -> LegacyMigrationResult {
         }
         (DatabaseDataState::Empty, _) => {
             // Scenario C: kitsupin.sqlite3 is empty
-            let backup_empty = new_dir.join("kitsupin.sqlite3.empty.bak");
+            let backup_empty = new_dir.join(format!("kitsupin.sqlite3.empty.{}.bak", uuid::Uuid::new_v4()));
             if let Err(e) = rename_db_and_sidecars(&new_db, &backup_empty) {
                 log::error!("Failed to backup empty kitsupin DB: {e}");
                 return LegacyMigrationResult::ConflictPreserved;
             }
             let res = restore_legacy_db(&old_db_path, &new_db);
             if res == LegacyMigrationResult::ConflictPreserved {
-                let _ = rename_db_and_sidecars(&backup_empty, &new_db);
+                if let Err(rb_e) = rename_db_and_sidecars(&backup_empty, &new_db) {
+                    log::error!("CRITICAL: Failed to restore backup_empty to new_db: {rb_e}");
+                    return LegacyMigrationResult::ConflictPreserved;
+                }
             }
             res
         }
         (_, DatabaseDataState::Empty) => {
             // Old database is empty, nothing useful to import
-            let backup_old = old_dir.join("pastily.sqlite3.empty.bak");
+            let backup_old = old_dir.join(format!("pastily.sqlite3.empty.{}.bak", uuid::Uuid::new_v4()));
             let _ = backup_database_file(&old_db_path, &backup_old);
             LegacyMigrationResult::NothingToMigrate
         }
@@ -206,12 +212,13 @@ fn find_legacy_db(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-fn normalize_db_names_in(dir: &Path) {
+fn normalize_db_names_in(dir: &Path) -> std::io::Result<()> {
     let old_db = dir.join("pastily.sqlite3");
     let new_db = dir.join("kitsupin.sqlite3");
     if old_db.exists() && !new_db.exists() {
-        let _ = rename_db_and_sidecars(&old_db, &new_db);
+        rename_db_and_sidecars(&old_db, &new_db)?;
     }
+    Ok(())
 }
 
 fn rename_db_and_sidecars(src_db: &Path, dst_db: &Path) -> std::io::Result<()> {
@@ -224,12 +231,31 @@ fn rename_db_and_sidecars(src_db: &Path, dst_db: &Path) -> std::io::Result<()> {
         (PathBuf::from(format!("{src_str}-shm")), PathBuf::from(format!("{dst_str}-shm"))),
     ];
 
-    let mut moved = Vec::new();
+    for (src, dst) in &pairs {
+        if src.exists() && dst.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("Destination file already exists: {}", dst.display()),
+            ));
+        }
+    }
+
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     for (src, dst) in pairs {
         if src.exists() {
             if let Err(e) = std::fs::rename(&src, &dst) {
+                let mut rollback_err = None;
                 for (m_src, m_dst) in moved.into_iter().rev() {
-                    let _ = std::fs::rename(&m_dst, &m_src);
+                    if let Err(rb_e) = std::fs::rename(&m_dst, &m_src) {
+                        log::error!("CRITICAL: Failed to rollback rename from {} to {}: {}", m_dst.display(), m_src.display(), rb_e);
+                        rollback_err = Some(rb_e);
+                    }
+                }
+                if let Some(rb_e) = rollback_err {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Rename failed ({e}) and rollback also failed: {rb_e}"),
+                    ));
                 }
                 return Err(e);
             }
@@ -364,6 +390,8 @@ fn backup_database_file(src_db_path: &Path, dst_backup_path: &Path) -> anyhow::R
 
 fn compute_db_fingerprint(db_path: &Path) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
+    use std::io::{BufReader, Read};
+
     let temp_dir = tempfile::tempdir()?;
     let temp_snapshot = temp_dir.path().join(format!("kitsupin_fp_{}.tmp", uuid::Uuid::new_v4()));
 
@@ -377,9 +405,18 @@ fn compute_db_fingerprint(db_path: &Path) -> anyhow::Result<String> {
     drop(dst_conn);
     drop(src_conn);
 
-    let bytes = std::fs::read(&temp_snapshot)?;
+    let file = std::fs::File::open(&temp_snapshot)?;
+    let mut reader = BufReader::new(file);
+    let mut buffer = [0u8; 64 * 1024];
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -1725,10 +1762,13 @@ mod tests {
         assert_eq!(res, LegacyMigrationResult::LegacyDatabaseRestored);
 
         // Backup empty file and its sidecars should be moved
-        let backup_empty = new_dir.join("kitsupin.sqlite3.empty.bak");
-        let backup_wal = new_dir.join("kitsupin.sqlite3.empty.bak-wal");
-        assert!(backup_empty.exists());
-        assert!(backup_wal.exists());
+        let entries: Vec<String> = std::fs::read_dir(&new_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(entries.iter().any(|n| n.starts_with("kitsupin.sqlite3.empty.") && n.ends_with(".bak")));
+        assert!(entries.iter().any(|n| n.starts_with("kitsupin.sqlite3.empty.") && n.ends_with(".bak-wal")));
 
         // Restored kitsupin.sqlite3 should exist and not have old leftover WAL
         assert!(new_db.exists());
@@ -1836,4 +1876,37 @@ mod tests {
             "Ledger marker must not exist after rolled-back transaction"
         );
     }
+
+    #[test]
+    fn test_rename_db_and_sidecars_destination_exists_error() {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("src.sqlite3");
+        let dst = temp.path().join("dst.sqlite3");
+        std::fs::write(&src, b"src_content").unwrap();
+        std::fs::write(&dst, b"existing_dst_content").unwrap();
+
+        let err = rename_db_and_sidecars(&src, &dst).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn test_normalize_db_names_returns_conflict_preserved_on_rename_failure() {
+        let temp = TempDir::new().unwrap();
+        let data_home = temp.path();
+        let new_dir = data_home.join("kitsupin");
+        std::fs::create_dir_all(&new_dir).unwrap();
+
+        let pastily_db = new_dir.join("pastily.sqlite3");
+        let pastily_wal = new_dir.join("pastily.sqlite3-wal");
+        let kitsupin_wal = new_dir.join("kitsupin.sqlite3-wal");
+
+        std::fs::write(&pastily_db, b"old_data").unwrap();
+        std::fs::write(&pastily_wal, b"old_wal").unwrap();
+        std::fs::write(&kitsupin_wal, b"colliding_wal").unwrap();
+
+        // normalize_db_names_in should fail because kitsupin.sqlite3-wal already exists
+        let res = migrate_pastily_to_kitsupin_at(data_home, None);
+        assert_eq!(res, LegacyMigrationResult::ConflictPreserved);
+    }
 }
+
