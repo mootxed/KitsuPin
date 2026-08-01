@@ -395,11 +395,11 @@ mod tests {
 
     #[test]
     fn test_generate_native_manifest() {
-        let path = Path::new("/usr/lib/kitsupin/kitsupin-native-host");
+        let path = Path::new(SYSTEM_NATIVE_HOST_PATH);
         let id = "abcdefghijklmnopabcdefghijklmnop";
         let res = generate_native_manifest(path, id).unwrap();
         assert!(res.contains(NATIVE_HOST_NAME));
-        assert!(res.contains("/usr/lib/kitsupin/kitsupin-native-host"));
+        assert!(res.contains(SYSTEM_NATIVE_HOST_PATH));
         assert!(res.contains("chrome-extension://abcdefghijklmnopabcdefghijklmnop/"));
 
         let err = generate_native_manifest(path, "invalid-id");
@@ -413,7 +413,7 @@ mod tests {
             r#"{{
             "name": "io.github.mootxed.kitsupin.native",
             "description": "test",
-            "path": "/usr/lib/kitsupin/kitsupin-native-host",
+            "path": "{SYSTEM_NATIVE_HOST_PATH}",
             "type": "stdio",
             "allowed_origins": ["chrome-extension://{id}/"]
         }}"#
