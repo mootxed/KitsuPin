@@ -278,8 +278,8 @@ function clipCard(c: ClipSummary, index: number) {
     ? `<button class="iconbtn" data-action="pin" aria-label="Открепить"><i data-lucide="pin-off"></i></button>`
     : `<button class="iconbtn" data-action="pin" aria-label="Закрепить"><i data-lucide="pin"></i></button>`;
 
-  return `<article class="clip ${c.pinned ? "pinned" : ""}" role="button" tabindex="0" data-clip="${c.id}" draggable="true" aria-label="Скопировать фрагмент">
-    <div class="clip-main">
+  return `<article class="clip ${c.pinned ? "pinned" : ""}" data-clip="${c.id}" draggable="true">
+    <button class="clip-main" tabindex="0" aria-label="Скопировать фрагмент">
       <div class="clip-top">
         <strong>${esc(typeLabel)}</strong>
         ${c.domain ? `<span>${esc(c.domain)}</span>` : ""}
@@ -291,7 +291,7 @@ function clipCard(c: ClipSummary, index: number) {
         <span>${c.copyCount > 1 ? `скопировано ${c.copyCount} раз` : "одна копия"}${isTruncated ? ` · ${c.contentLength} симв.` : ""}</span>
         <span>· ${relativeTime(c.lastCopiedAt)}</span>
       </div>
-    </div>
+    </button>
     <div class="clip-actions">
       ${detailsButton}
       ${pinIcon}
@@ -355,6 +355,9 @@ function renderCards() {
   bindCards(root);
   root.querySelector("[data-load-more]")?.addEventListener("click", loadMore);
   hydrateIcons(root);
+  if (popup) {
+    root.querySelector(".popitem.selected")?.scrollIntoView({ block: "nearest" });
+  }
 }
 
 async function loadMore() {
@@ -379,20 +382,6 @@ function bindCards(root: HTMLElement) {
         showToast("Не удалось скопировать");
       }
     });
-
-    card.onkeydown = async (e) => {
-      if (e.key === "Enter" || e.key === " ") {
-        if (e.target !== card && isInteractiveTarget(e.target)) return;
-        if (e.key === " ") e.preventDefault();
-        try {
-          let content: string | undefined;
-          if (!isTauri) content = await api.getClipContent(clip.id);
-          await api.copy(clip.id, popup, content);
-        } catch {
-          showToast("Не удалось скопировать");
-        }
-      }
-    };
 
     card.ondragstart = (e) => e.dataTransfer?.setData("text/kitsupin", clip.id);
 
@@ -805,11 +794,11 @@ function renderGeneralTab(body: HTMLElement, s: NonNullable<typeof state.setting
       <h2>Основные</h2>
       <div class="setting-row">
         <div><strong>Запись истории</strong><p>Отслеживать обычный X11 Clipboard</p></div>
-        <button class="switch ${s.paused ? "" : "on"}" id="sw-recording" aria-label="Запись" aria-checked="${!s.paused}"></button>
+        <button class="switch ${s.paused ? "" : "on"}" role="switch" id="sw-recording" aria-label="Запись" aria-checked="${!s.paused}"></button>
       </div>
       <div class="setting-row">
         <div><strong>Автозапуск</strong><p>Запускать после входа в KDE</p></div>
-        <button class="switch ${s.autostart ? "on" : ""}" id="sw-autostart" aria-label="Автозапуск" aria-checked="${s.autostart}"></button>
+        <button class="switch ${s.autostart ? "on" : ""}" role="switch" id="sw-autostart" aria-label="Автозапуск" aria-checked="${s.autostart}"></button>
       </div>
       <div class="setting-row">
         <div><strong>Горячая клавиша</strong><p>Открывает компактную историю поверх окон.</p></div>
@@ -841,8 +830,14 @@ function renderGeneralTab(body: HTMLElement, s: NonNullable<typeof state.setting
   // Toggle switches
   const swRecording = body.querySelector<HTMLButtonElement>("#sw-recording");
   const swAutostart = body.querySelector<HTMLButtonElement>("#sw-autostart");
-  swRecording?.addEventListener("click", () => swRecording.classList.toggle("on"));
-  swAutostart?.addEventListener("click", () => swAutostart.classList.toggle("on"));
+  swRecording?.addEventListener("click", () => {
+    const enabled = swRecording.classList.toggle("on");
+    swRecording.setAttribute("aria-checked", String(enabled));
+  });
+  swAutostart?.addEventListener("click", () => {
+    const enabled = swAutostart.classList.toggle("on");
+    swAutostart.setAttribute("aria-checked", String(enabled));
+  });
 
   // Save
   body.querySelector("#btn-save-settings")?.addEventListener("click", async () => {

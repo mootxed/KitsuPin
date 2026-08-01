@@ -231,8 +231,8 @@ fn rename_db_and_sidecars(src_db: &Path, dst_db: &Path) -> std::io::Result<()> {
         (PathBuf::from(format!("{src_str}-shm")), PathBuf::from(format!("{dst_str}-shm"))),
     ];
 
-    for (src, dst) in &pairs {
-        if src.exists() && dst.exists() {
+    for (_, dst) in &pairs {
+        if dst.exists() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 format!("Destination file already exists: {}", dst.display()),
@@ -252,10 +252,9 @@ fn rename_db_and_sidecars(src_db: &Path, dst_db: &Path) -> std::io::Result<()> {
                     }
                 }
                 if let Some(rb_e) = rollback_err {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Rename failed ({e}) and rollback also failed: {rb_e}"),
-                    ));
+                    return Err(std::io::Error::other(format!(
+                        "Rename failed ({e}) and rollback also failed: {rb_e}"
+                    )));
                 }
                 return Err(e);
             }
@@ -365,6 +364,11 @@ fn backup_database_file(src_db_path: &Path, dst_backup_path: &Path) -> anyhow::R
     )?;
 
     let mut dst_conn = Connection::open(&temp_backup)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&temp_backup, std::fs::Permissions::from_mode(0o600));
+    }
     let backup_res =
         rusqlite::backup::Backup::new(&src_conn, &mut dst_conn).and_then(|b| b.step(-1));
 
@@ -382,6 +386,11 @@ fn backup_database_file(src_db_path: &Path, dst_backup_path: &Path) -> anyhow::R
     }
 
     std::fs::rename(&temp_backup, dst_backup_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dst_backup_path, std::fs::Permissions::from_mode(0o600));
+    }
 
     remove_db_and_sidecars(src_db_path);
 
@@ -477,6 +486,11 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
             return LegacyMigrationResult::ConflictPreserved;
         }
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&importing_path, std::fs::Permissions::from_mode(0o600));
+    }
 
     let backup_res =
         rusqlite::backup::Backup::new(&src_conn, &mut dst_conn).and_then(|b| b.step(-1));
@@ -537,10 +551,16 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
         let _ = std::fs::remove_file(&importing_path);
         return LegacyMigrationResult::ConflictPreserved;
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(target_db_path, std::fs::Permissions::from_mode(0o600));
+    }
 
     // Ensure target database opens & migrates correctly with current schema
     if let Err(e) = crate::persistence::Repository::open(target_db_path) {
         log::error!("Target database failed schema migration after restore: {e:?}");
+        remove_db_and_sidecars(target_db_path);
         return LegacyMigrationResult::ConflictPreserved;
     }
 
@@ -724,6 +744,11 @@ fn merge_legacy_db_into_new(old_db_path: &Path, new_db_path: &Path) -> LegacyMig
             return LegacyMigrationResult::ConflictPreserved;
         }
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(new_db_path, std::fs::Permissions::from_mode(0o600));
+    }
 
     if let Err(e) = dst_conn.pragma_update(None, "foreign_keys", "ON") {
         log::error!("Failed to enable foreign keys on target DB: {e}");
@@ -1890,6 +1915,22 @@ mod tests {
     }
 
     #[test]
+    fn test_sidecar_dst_exists_without_src_sidecar_conflict() {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("pastily.sqlite3");
+        let dst_wal = temp.path().join("kitsupin.sqlite3-wal");
+        let dst = temp.path().join("kitsupin.sqlite3");
+
+        std::fs::write(&src, b"pastily_data").unwrap();
+        // pastily.sqlite3-wal does NOT exist
+        // dst (kitsupin.sqlite3) does NOT exist, but dst_wal DOES exist!
+        std::fs::write(&dst_wal, b"stale_wal_data").unwrap();
+
+        let err = rename_db_and_sidecars(&src, &dst).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
     fn test_normalize_db_names_returns_conflict_preserved_on_rename_failure() {
         let temp = TempDir::new().unwrap();
         let data_home = temp.path();
@@ -1907,6 +1948,48 @@ mod tests {
         // normalize_db_names_in should fail because kitsupin.sqlite3-wal already exists
         let res = migrate_pastily_to_kitsupin_at(data_home, None);
         assert_eq!(res, LegacyMigrationResult::ConflictPreserved);
+    }
+
+    #[test]
+    fn test_scenario_c_rollback_after_repository_open_failure() {
+        let temp = TempDir::new().unwrap();
+        let data_home = temp.path();
+        let old_dir = data_home.join("pastily");
+        let new_dir = data_home.join("kitsupin");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+
+        // Create corrupt old db so schema migration or restore opening will fail after rename
+        let old_db = old_dir.join("pastily.sqlite3");
+        let new_db = new_dir.join("kitsupin.sqlite3");
+
+        // pastily_db has 1 clip, but we will make restore_legacy_db fail at Repository::open stage by writing an invalid sqlite header
+        // First create a valid old_db with clips table so inspect_database_data_state sees ContainsData
+        {
+            let conn = Connection::open(&old_db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE clips (id TEXT PRIMARY KEY, content TEXT, content_type TEXT, created_at INTEGER, last_copied_at INTEGER, copy_count INTEGER);
+                 INSERT INTO clips VALUES ('1', 'hello', 'Text', 100, 100, 1);"
+            ).unwrap();
+        }
+
+        // Create empty new_db
+        {
+            let conn = Connection::open(&new_db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE clips (id TEXT PRIMARY KEY, content TEXT, content_type TEXT, created_at INTEGER, last_copied_at INTEGER, copy_count INTEGER);"
+            ).unwrap();
+        }
+
+        // Run scenario C: new_db is Empty, old_db ContainsData.
+        // It backs up empty new_db, calls restore_legacy_db, which copies old_db to importing and renames to new_db.
+        // Then Repository::open runs. Since old_db lacks required migrations table/columns for current Repository schema, Repository::open will fail!
+        let res = migrate_pastily_to_kitsupin_at(data_home, None);
+
+        // It should return ConflictPreserved, and the empty new_db must be restored back!
+        assert_eq!(res, LegacyMigrationResult::ConflictPreserved);
+        assert!(new_db.exists(), "new_db must exist after rollback");
+        assert_eq!(inspect_database_data_state(&new_db), DatabaseDataState::Empty);
     }
 }
 

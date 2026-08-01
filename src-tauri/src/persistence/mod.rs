@@ -860,7 +860,7 @@ impl Repository {
         let like = if search.is_empty() {
             String::new()
         } else {
-            format!("%{}%", search.replace('%', "\\%").replace('_', "\\_"))
+            format!("%{}%", search.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
         };
 
         let mut statement = db.prepare(
@@ -2029,5 +2029,21 @@ mod tests {
             count_before, count_after,
             "FTS should not be updated on copy_count change"
         );
+    }
+
+    #[test]
+    fn search_escapes_backslashes_properly() {
+        let r = Repository::open_in_memory().unwrap();
+        let clip1 = add(&r, "path\\to\\file", Some("example.com"), None, 1_700_000_000_000);
+        let clip2 = add(&r, "unrelated content", Some("example.com"), None, 1_700_000_001_000);
+
+        let res = r.list_clips(&ClipQuery {
+            search: Some("path\\to".into()),
+            ..Default::default()
+        }).unwrap();
+
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].id, clip1.id);
+        assert_ne!(res[0].id, clip2.id);
     }
 }
