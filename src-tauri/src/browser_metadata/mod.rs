@@ -77,6 +77,14 @@ impl MetadataBuffer {
         })?;
         events.remove(pos).map(|(_, e)| e)
     }
+    pub fn remove_matching(&self, hash: &str, length: usize) {
+        let mut events = self.events.lock();
+        if let Some(pos) = events.iter().rposition(|(_, e)| {
+            e.content_hash.eq_ignore_ascii_case(hash) && e.content_length == length
+        }) {
+            events.remove(pos);
+        }
+    }
 }
 
 pub fn socket_path(data_dir: &Path) -> PathBuf {
@@ -197,6 +205,7 @@ mod tests {
         // We can't fully test thread binding here without a live process,
         // so just verify the file-probe logic doesn't panic.
         // The actual server start is best-effort in this unit test.
-        let _ = start_socket_server(path.clone(), buffer, cb);
+        let res = start_socket_server(path.clone(), buffer, cb);
+        assert!(res.is_ok());
     }
 }

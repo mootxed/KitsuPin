@@ -54,11 +54,6 @@ fn migrate_data_dir() {
             let _ = std::fs::rename(&old_shm, &new_shm);
         }
 
-        // Clean up old socket if it exists
-        let old_sock = new_dir.join("native.sock");
-        if old_sock.exists() {
-            let _ = std::fs::remove_file(old_sock);
-        }
     }
 }
 

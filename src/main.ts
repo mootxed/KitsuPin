@@ -197,11 +197,10 @@ function bindShell() {
 
 function clipCard(c: ClipSummary, index: number) {
   const categories = c.categories
-    .map(
-      (x) =>
-        `<button class="tag user-tag" style="--tag:${x.color}" data-unassign="${x.id}" title="Убрать категорию">${esc(x.name)}${
-          popup ? "" : " ×"
-        }</button>`
+    .map((x) =>
+      popup
+        ? `<span class="tag user-tag" style="--tag:${x.color}">${esc(x.name)}</span>`
+        : `<button class="tag user-tag" style="--tag:${x.color}" data-unassign="${x.id}" title="Убрать категорию">${esc(x.name)} ×</button>`
     )
     .join("");
   // 6.3: use backend is_truncated flag (not JS string.length comparison).

@@ -103,14 +103,23 @@ impl Repository {
                 )?;
             }
             tx.execute_batch("UPDATE clips SET domain_key = COALESCE(domain, '');")?;
-            tx.execute_batch(
-                "DELETE FROM clips WHERE rowid NOT IN (
-                    SELECT min(rowid) FROM clips GROUP BY content_hash, domain_key
-                );",
-            )?;
-            tx.execute_batch(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_clips_hash_domain_key ON clips(content_hash, domain_key);",
-            )?;
+            let has_norm: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('clips') WHERE name='normalized_content')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if !has_norm {
+                tx.execute_batch(
+                    "DELETE FROM clips WHERE rowid NOT IN (
+                        SELECT min(rowid) FROM clips GROUP BY content_hash, domain_key
+                    );",
+                )?;
+                tx.execute_batch(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_clips_hash_domain_key ON clips(content_hash, domain_key);",
+                )?;
+            }
             tx.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES(2, datetime('now'))",
                 [],
@@ -157,7 +166,7 @@ impl Repository {
                     content,
                     page_title,
                     content='clips',
-                    tokenize='unicode61 remove_diacritics 2'
+                    tokenize='trigram'
                 );
                 INSERT OR IGNORE INTO clips_fts(rowid, content, page_title)
                 SELECT rowid, content, COALESCE(page_title, '') FROM clips;
@@ -189,12 +198,15 @@ impl Repository {
             |r| r.get(0),
         )?;
         if !exists_5 {
+            tx.execute_batch(&format!(
+                "UPDATE clips SET created_at = CASE WHEN typeof(created_at)='text' THEN COALESCE(unixepoch(created_at)*1000, {now}) ELSE created_at END,
+                                  last_copied_at = CASE WHEN typeof(last_copied_at)='text' THEN COALESCE(unixepoch(last_copied_at)*1000, {now}) ELSE last_copied_at END;
+                 UPDATE user_categories SET created_at = CASE WHEN typeof(created_at)='text' THEN COALESCE(unixepoch(created_at)*1000, {now}) ELSE created_at END;
+                 UPDATE clip_user_categories SET created_at = CASE WHEN typeof(created_at)='text' THEN COALESCE(unixepoch(created_at)*1000, {now}) ELSE created_at END;",
+                now = chrono::Utc::now().timestamp_millis()
+            ))?;
             tx.execute_batch(
-                "UPDATE clips SET created_at = CASE WHEN typeof(created_at)='text' THEN (unixepoch(created_at)*1000) ELSE created_at END,
-                                  last_copied_at = CASE WHEN typeof(last_copied_at)='text' THEN (unixepoch(last_copied_at)*1000) ELSE last_copied_at END;
-                 UPDATE user_categories SET created_at = CASE WHEN typeof(created_at)='text' THEN (unixepoch(created_at)*1000) ELSE created_at END;
-                 UPDATE clip_user_categories SET created_at = CASE WHEN typeof(created_at)='text' THEN (unixepoch(created_at)*1000) ELSE created_at END;
-                 DROP INDEX IF EXISTS idx_clips_recency;
+                "DROP INDEX IF EXISTS idx_clips_recency;
                  DROP INDEX IF EXISTS idx_clips_type_recency;
                  DROP INDEX IF EXISTS idx_clips_domain_recency;
                  CREATE INDEX IF NOT EXISTS idx_clips_recency ON clips(last_copied_at DESC, sort_key DESC);
@@ -241,7 +253,7 @@ impl Repository {
                 // are assumed to be in seconds and multiplied by 1000.
                 const SECONDS_THRESHOLD: i64 = 946_684_800_000; // 2000-01-01 in ms
 
-                // Create new clips table with current schema (no normalized_content).
+                // Create new clips table and new clip_user_categories table with current schema.
                 tx.execute_batch(
                     "CREATE TABLE clips_new (
                         id TEXT PRIMARY KEY NOT NULL,
@@ -257,23 +269,16 @@ impl Repository {
                         pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0,1)),
                         sort_key INTEGER NOT NULL DEFAULT 0,
                         UNIQUE(content_hash, domain_key)
+                    );
+                    CREATE TABLE clip_user_categories_new (
+                        clip_id TEXT NOT NULL REFERENCES clips_new(id) ON DELETE CASCADE,
+                        category_id TEXT NOT NULL REFERENCES user_categories(id) ON DELETE CASCADE,
+                        created_at INTEGER NOT NULL,
+                        PRIMARY KEY (clip_id, category_id)
                     );",
                 )?;
 
                 // Migrate and deduplicate rows.
-                // For each (content_hash, domain_key) group:
-                //   - id = id of the row with the smallest created_at (canonical)
-                //   - content = content of that canonical row
-                //   - created_at = MIN(normalized)
-                //   - last_copied_at = MAX(normalized)
-                //   - copy_count = MIN(SUM, 2147483647) to avoid overflow
-                //   - pinned = MAX (1 if any duplicate was pinned)
-                //   - sort_key = MAX
-                //   - page_title = title from the most recently copied row (if any)
-                //   - domain = normalized domain
-                //   - content_type = recomputed from content hash (stored as TEXT)
-                //
-                // We use SQLite window functions to identify the canonical row.
                 tx.execute_batch(&format!(
                     "INSERT INTO clips_new(
                         id, content, content_hash, content_type,
@@ -311,7 +316,6 @@ impl Repository {
                             MIN(created_at) AS min_created,
                             MAX(last_copied_at) AS max_last,
                             TOTAL(copy_count) AS total_count,
-                            -- canonical id: from row with lowest created_at
                             (SELECT id FROM clips c2
                              WHERE c2.content_hash = clips.content_hash
                                AND COALESCE(c2.domain, '') = COALESCE(clips.domain, '')
@@ -322,7 +326,6 @@ impl Repository {
                                AND COALESCE(c2.domain, '') = COALESCE(clips.domain, '')
                              ORDER BY c2.created_at ASC, c2.rowid ASC
                              LIMIT 1) AS canonical_content,
-                            -- page_title from most recently copied row that has a title
                             (SELECT page_title FROM clips c2
                              WHERE c2.content_hash = clips.content_hash
                                AND COALESCE(c2.domain, '') = COALESCE(clips.domain, '')
@@ -336,27 +339,25 @@ impl Repository {
                     fallback = chrono::Utc::now().timestamp_millis(),
                 ))?;
 
-                // Transfer category associations for all merged duplicates → canonical id.
+                // Transfer category associations into clip_user_categories_new.
                 tx.execute_batch(
-                    "INSERT OR IGNORE INTO clip_user_categories(clip_id, category_id, created_at)
+                    "INSERT OR IGNORE INTO clip_user_categories_new(clip_id, category_id, created_at)
                      SELECT
                          (SELECT id FROM clips_new WHERE clips_new.content_hash = clips.content_hash
                           AND clips_new.domain_key = COALESCE(clips.domain, '')
                           LIMIT 1),
-                         category_id,
-                         created_at
+                         clip_user_categories.category_id,
+                         clip_user_categories.created_at
                      FROM clip_user_categories
-                     JOIN clips ON clips.id = clip_user_categories.clip_id;",
+                     JOIN clips ON clips.id = clip_user_categories.clip_id
+                     WHERE (SELECT id FROM clips_new WHERE clips_new.content_hash = clips.content_hash
+                            AND clips_new.domain_key = COALESCE(clips.domain, '') LIMIT 1) IS NOT NULL;",
                 )?;
 
-                // Delete old FK refs before dropping the table.
-                tx.execute_batch(
-                    "DELETE FROM clip_user_categories
-                     WHERE clip_id NOT IN (SELECT id FROM clips_new);",
-                )?;
-
-                // Swap tables.
+                // Swap tables: drop old child table first, then old parent table.
+                tx.execute_batch("DROP TABLE clip_user_categories;")?;
                 tx.execute_batch("DROP TABLE clips;")?;
+                tx.execute_batch("ALTER TABLE clip_user_categories_new RENAME TO clip_user_categories;")?;
                 tx.execute_batch("ALTER TABLE clips_new RENAME TO clips;")?;
 
                 // Rebuild indices.
@@ -371,7 +372,7 @@ impl Repository {
                      CREATE INDEX idx_clips_domain_recency ON clips(domain, last_copied_at DESC, sort_key DESC);",
                 )?;
 
-                // Rebuild FTS if it exists (may have stale rowids after table swap).
+                // Rebuild FTS if it exists.
                 let has_fts: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='clips_fts')",
                     [],
@@ -384,7 +385,6 @@ impl Repository {
                          DROP TRIGGER IF EXISTS clips_au;
                          INSERT INTO clips_fts(clips_fts) VALUES('rebuild');",
                     )?;
-                    // Recreate triggers with correct column-specific UPDATE trigger (fixed in m7).
                     tx.execute_batch(
                         "CREATE TRIGGER clips_ai AFTER INSERT ON clips BEGIN
                            INSERT INTO clips_fts(rowid, content, page_title)
@@ -403,12 +403,9 @@ impl Repository {
                     )?;
                 }
 
-                // Re-enable FK and verify.
-                tx.execute_batch("PRAGMA foreign_keys=ON;")?;
-                let fk_issues: i64 = tx
-                    .query_row("PRAGMA foreign_key_check", [], |r| r.get(0))
-                    .unwrap_or(0);
-                if fk_issues != 0 {
+                // Verify foreign keys correctly using stmt.exists.
+                let mut fk_stmt = tx.prepare("PRAGMA foreign_key_check")?;
+                if fk_stmt.exists([])? {
                     anyhow::bail!("Migration 6: PRAGMA foreign_key_check failed after rebuild");
                 }
             } else {
@@ -536,8 +533,8 @@ impl Repository {
         let tx = db.transaction()?;
 
         // Find an unattributed clip (domain_key='') matching hash+length within window.
-        let candidate: Option<(String, usize, i64, i64, i64, bool)> = match tx.query_row(
-            "SELECT id, length(content), copy_count, sort_key, created_at, pinned
+        let candidate: Option<(String, usize, i64, i64, i64, bool, String, String)> = match tx.query_row(
+            "SELECT id, length(CAST(content AS BLOB)), copy_count, sort_key, created_at, pinned, content, content_type
              FROM clips
              WHERE content_hash=?1 AND domain_key='' AND last_copied_at >= ?2
              ORDER BY last_copied_at DESC
@@ -551,6 +548,8 @@ impl Repository {
                     r.get::<_, i64>(3)?,
                     r.get::<_, i64>(4)?,
                     r.get::<_, bool>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
                 ))
             },
         ) {
@@ -559,8 +558,16 @@ impl Repository {
             Err(e) => return Err(e.into()),
         };
 
-        let Some((temp_id, stored_len, temp_count, temp_sort, temp_created, temp_pinned)) =
-            candidate
+        let Some((
+            temp_id,
+            stored_len,
+            temp_count,
+            temp_sort,
+            temp_created,
+            temp_pinned,
+            temp_content,
+            temp_kind,
+        )) = candidate
         else {
             return Ok(None);
         };
@@ -595,54 +602,90 @@ impl Repository {
             Err(e) => return Err(e.into()),
         };
 
-        let canonical_id = if let Some((
-            existing_id,
-            existing_count,
-            existing_sort,
-            existing_created,
-            existing_pinned,
-        )) = existing
-        {
-            // Merge: combine temp clip into existing canonical clip.
-            let merged_count = existing_count.saturating_add(temp_count);
-            let merged_sort = existing_sort.max(temp_sort);
-            let merged_pinned = existing_pinned || temp_pinned;
-            let merged_created = existing_created.min(temp_created);
+        let canonical_id = if temp_count == 1 {
+            // Unattributed clip was created specifically by this single copy event.
+            if let Some((
+                existing_id,
+                existing_count,
+                existing_sort,
+                existing_created,
+                existing_pinned,
+            )) = existing
+            {
+                let merged_count = existing_count.saturating_add(1);
+                let merged_sort = existing_sort.max(temp_sort);
+                let merged_pinned = existing_pinned || temp_pinned;
+                let merged_created = existing_created.min(temp_created);
 
-            tx.execute(
-                "UPDATE clips SET
-                    copy_count=?2, sort_key=?3, pinned=?4, created_at=?5,
-                    page_title=COALESCE(?6, page_title), last_copied_at=MAX(last_copied_at,?7)
-                 WHERE id=?1",
-                params![
-                    existing_id,
-                    merged_count,
-                    merged_sort,
-                    merged_pinned,
-                    merged_created,
-                    title,
-                    now_ms
-                ],
-            )?;
+                tx.execute(
+                    "UPDATE clips SET
+                        copy_count=?2, sort_key=?3, pinned=?4, created_at=?5,
+                        page_title=COALESCE(?6, page_title), last_copied_at=MAX(last_copied_at,?7)
+                     WHERE id=?1",
+                    params![
+                        existing_id,
+                        merged_count,
+                        merged_sort,
+                        merged_pinned,
+                        merged_created,
+                        title,
+                        now_ms
+                    ],
+                )?;
 
-            // Transfer categories from temp clip → canonical (ignore duplicates).
-            tx.execute(
-                "INSERT OR IGNORE INTO clip_user_categories(clip_id, category_id, created_at)
-                 SELECT ?1, category_id, created_at FROM clip_user_categories WHERE clip_id=?2",
-                params![existing_id, temp_id],
-            )?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO clip_user_categories(clip_id, category_id, created_at)
+                     SELECT ?1, category_id, created_at FROM clip_user_categories WHERE clip_id=?2",
+                    params![existing_id, temp_id],
+                )?;
 
-            // Delete temporary unattributed clip.
-            tx.execute("DELETE FROM clips WHERE id=?1", [&temp_id])?;
-
-            existing_id
+                tx.execute("DELETE FROM clips WHERE id=?1", [&temp_id])?;
+                existing_id
+            } else {
+                tx.execute(
+                    "UPDATE clips SET domain=?2, domain_key=?3, page_title=COALESCE(?4, page_title) WHERE id=?1",
+                    params![temp_id, domain, domain_key, title],
+                )?;
+                temp_id
+            }
         } else {
-            // No existing clip with this domain — just update the temp clip in place.
+            // Unattributed clip has prior copies (temp_count > 1).
+            // Roll back 1 copy count from the old no-domain clip, keeping its categories & pinned intact.
             tx.execute(
-                "UPDATE clips SET domain=?2, domain_key=?3, page_title=COALESCE(?4, page_title) WHERE id=?1",
-                params![temp_id, domain, domain_key, title],
+                "UPDATE clips SET copy_count = copy_count - 1 WHERE id=?1",
+                params![temp_id],
             )?;
-            temp_id
+
+            if let Some((existing_id, _, _, _, _)) = existing {
+                tx.execute(
+                    "UPDATE clips SET
+                        copy_count = copy_count + 1,
+                        sort_key = MAX(sort_key, ?2),
+                        last_copied_at = MAX(last_copied_at, ?3),
+                        page_title = COALESCE(?4, page_title)
+                     WHERE id=?1",
+                    params![existing_id, temp_sort, now_ms, title],
+                )?;
+                existing_id
+            } else {
+                let new_id = Uuid::new_v4().to_string();
+                tx.execute(
+                    "INSERT INTO clips(id,content,content_hash,content_type,domain,domain_key,page_title,created_at,last_copied_at,copy_count,pinned,sort_key)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8,1,0,?9)",
+                    params![
+                        new_id,
+                        temp_content,
+                        content_hash_val,
+                        temp_kind,
+                        domain,
+                        domain_key,
+                        title,
+                        now_ms,
+                        temp_sort.saturating_add(1)
+                    ],
+                )?;
+                new_id
+            }
         };
 
         tx.commit()?;
@@ -1380,8 +1423,6 @@ mod tests {
             Some("Русская страница"),
             1_700_000_000_000,
         );
-        // For CJK content: FTS5 unicode61 tokenizer does not split CJK ideographs into
-        // individual tokens by default, so we test via the Latin page_title instead.
         add(
             &r,
             "日本語のテキスト",
@@ -1399,20 +1440,18 @@ mod tests {
             .unwrap();
         assert_eq!(ru.len(), 1, "Cyrillic search should find Russian clip");
 
-        // Search by Latin page_title instead of CJK content (unicode61 limitation with CJK).
-        let ja_by_title = r
+        let ja = r
             .list_clips(&ClipQuery {
-                search: Some("Japanese".into()),
+                search: Some("日本語".into()),
                 ..Default::default()
             })
             .unwrap();
         assert_eq!(
-            ja_by_title.len(),
+            ja.len(),
             1,
-            "Search by page_title should find Japanese clip"
+            "Japanese search by content should find Japanese clip"
         );
 
-        // Additionally, domain search should not return CJK clip.
         let en = r
             .list_clips(&ClipQuery {
                 search: Some("english".into()),
@@ -1420,6 +1459,98 @@ mod tests {
             })
             .unwrap();
         assert_eq!(en.len(), 1, "English search should find English clip");
+    }
+
+    #[test]
+    fn full_legacy_pastily_v1_migration_preserves_categories_and_pins() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_connection(&conn).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+             INSERT INTO schema_migrations VALUES(1, '2023-01-01T00:00:00Z');
+
+             CREATE TABLE clips (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 content TEXT NOT NULL,
+                 normalized_content TEXT NOT NULL,
+                 content_hash TEXT NOT NULL,
+                 content_type TEXT NOT NULL,
+                 domain TEXT,
+                 page_title TEXT,
+                 created_at TEXT NOT NULL,
+                 last_copied_at TEXT NOT NULL,
+                 copy_count INTEGER NOT NULL DEFAULT 1,
+                 pinned INTEGER NOT NULL DEFAULT 0,
+                 sort_key INTEGER NOT NULL DEFAULT 0,
+                 UNIQUE(normalized_content, domain)
+             );
+
+             CREATE TABLE user_categories (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 name TEXT NOT NULL,
+                 normalized_name TEXT NOT NULL UNIQUE,
+                 color TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 sort_order INTEGER NOT NULL DEFAULT 0
+             );
+
+             CREATE TABLE clip_user_categories (
+                 clip_id TEXT NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+                 category_id TEXT NOT NULL REFERENCES user_categories(id) ON DELETE CASCADE,
+                 created_at TEXT NOT NULL,
+                 PRIMARY KEY (clip_id, category_id)
+             );
+
+             INSERT INTO user_categories VALUES('cat1', 'Work', 'work', '#123456', '2023-05-01T10:00:00Z', 0);
+             INSERT INTO clips VALUES('id1', 'hello world', 'hello world', '5eb63bbbe01eeed093cb22bb8f5acdc3', 'Text', NULL, 'Title 1', '2023-05-01T12:00:00Z', '2023-05-01T12:00:00Z', 5, 1, 10);
+             INSERT INTO clips VALUES('id2', 'hello world', 'hello world', '5eb63bbbe01eeed093cb22bb8f5acdc3', 'Text', NULL, 'Title 2', '2023-05-02T12:00:00Z', '2023-05-02T14:00:00Z', 3, 0, 15);
+             INSERT INTO clip_user_categories VALUES('id2', 'cat1', '2023-05-02T12:00:00Z');",
+        ).unwrap();
+
+        let repo = Repository {
+            connection: Mutex::new(conn),
+        };
+        repo.migrate().unwrap();
+
+        let db = repo.connection.lock();
+
+        let mut fk_stmt = db.prepare("PRAGMA foreign_key_check").unwrap();
+        assert!(!fk_stmt.exists([]).unwrap(), "Foreign key check should pass with 0 errors");
+
+        let has_norm: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('clips') WHERE name='normalized_content')",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert!(!has_norm, "normalized_content column must be removed");
+
+        let clips: Vec<(String, i64, i64, bool, i64)> = db.prepare("SELECT id, copy_count, created_at, pinned, last_copied_at FROM clips")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+
+        assert_eq!(clips.len(), 1, "Duplicate clips should be merged into 1 canonical clip");
+        let (canonical_id, copy_count, created_at, pinned, last_copied) = &clips[0];
+        assert_eq!(canonical_id, "id1");
+        assert_eq!(*copy_count, 8, "copy_count should be summed (5 + 3 = 8)");
+        assert!(*pinned, "pinned status should be preserved (max(1, 0) = 1)");
+        assert!(*created_at > 1_600_000_000_000, "created_at TEXT must be converted to Unix ms");
+        assert!(*last_copied > 1_600_000_000_000, "last_copied_at TEXT must be converted to Unix ms");
+
+        let cats: Vec<(String, String)> = db.prepare("SELECT clip_id, category_id FROM clip_user_categories")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+
+        assert_eq!(cats.len(), 1, "Category link must be preserved during migration");
+        assert_eq!(cats[0].0, "id1", "Category link must point to canonical clip ID");
+        assert_eq!(cats[0].1, "cat1");
     }
 
     #[test]

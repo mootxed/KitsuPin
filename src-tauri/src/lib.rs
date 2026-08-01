@@ -417,12 +417,11 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
             }
             "pause" => {
                 let s = app.state::<AppState>();
-                let next = !s.paused.load(Ordering::Relaxed);
-                s.paused.store(next, Ordering::Relaxed);
                 let mut value = s.settings.get();
-                value.paused = next;
-                let _ = s.settings.save(value);
-                update_pause_indicators(app, next);
+                value.paused = !s.paused.load(Ordering::Relaxed);
+                if let Err(e) = save_settings(app.clone(), s, value) {
+                    log::error!("Не удалось изменить режим паузы из tray: {e}");
+                }
             }
             "clear" => {
                 let _ = app.state::<AppState>().repo.clear_unpinned();
@@ -521,8 +520,6 @@ fn start_single_instance_listener(data_dir: &Path, app: AppHandle) {
 }
 
 pub fn run() {
-    migration::migrate_pastily_to_kitsupin();
-
     let background = std::env::args().any(|value| value == "--background");
     let project = settings::project_dirs().expect("XDG directories");
     let data_dir = project.data_dir().to_path_buf();
@@ -533,7 +530,7 @@ pub fn run() {
         let _ = std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700));
     }
 
-    // ── Atomic single-instance check (BEFORE opening DB or starting threads) ──
+    // ── Atomic single-instance check (BEFORE pastily migration, DB open, or starting threads) ──
     let _lock_file = match try_acquire_instance_lock(&data_dir) {
         Ok(Some(file)) => file,
         Ok(None) => {
@@ -546,22 +543,12 @@ pub fn run() {
             return;
         }
         Err(e) => {
-            log::error!("Не удалось создать lock-файл: {e}. Запуск без single-instance защиты.");
-            // Safety: open a placeholder file so the type is consistent.
-            // We do not hold a real lock, but we proceed anyway.
-            // This is a degraded mode — better than refusing to start.
-            match File::create(instance_lock_path(&data_dir)) {
-                Ok(f) => f,
-                Err(_) => {
-                    // Cannot even create a file — proceed without lock.
-                    // In practice this should not happen after create_dir_all succeeded.
-                    eprintln!("WARNING: KitsuPin running without single-instance lock");
-                    // We need a File value; use /dev/null as a harmless placeholder.
-                    File::open("/dev/null").expect("/dev/null")
-                }
-            }
+            log::error!("Не удалось создать lock-файл single-instance: {e}. Завершение работы.");
+            return;
         }
     };
+
+    migration::migrate_pastily_to_kitsupin();
 
     // ── Open DB and start application (lock is held) ───────────────────────
     let repo = Arc::new(Repository::open(&data_dir.join("kitsupin.sqlite3")).expect("database"));
@@ -647,6 +634,7 @@ pub fn run() {
             // try to attach it to a recently saved clipboard entry.
             let repo_reconcile = repo.clone();
             let app_reconcile = app.handle().clone();
+            let metadata_reconcile = metadata.clone();
             let reconcile_callback = Arc::new(move |event: browser_metadata::BrowserCopyEvent| {
                 let now_ms = Utc::now().timestamp_millis();
                 match repo_reconcile.attach_metadata(
@@ -661,6 +649,7 @@ pub fn run() {
                     now_ms,
                 ) {
                     Ok(Some(id)) => {
+                        metadata_reconcile.remove_matching(&event.content_hash, event.content_length);
                         log::info!("Late reconciliation: metadata attached to clip {id}");
                         let _ = app_reconcile.emit("clips-changed", ());
                     }
