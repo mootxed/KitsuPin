@@ -170,7 +170,10 @@ pub fn start(
                 now: now.timestamp_millis(),
             };
             match repo.upsert_clip(input) {
-                Ok(_) => {
+                Ok((_, receipt)) => {
+                    if let Some(r) = receipt {
+                        metadata.push_receipt(&hash, normalized.len(), r);
+                    }
                     let _ = app.emit("clips-changed", ());
                 }
                 Err(error) => log::error!("Не удалось сохранить Clipboard: {error}"),

@@ -592,6 +592,20 @@ if (isTauri) {
   listen("settings-changed", reload);
   if (!popup) {
     listen("open-settings", showSettings);
+    listen("confirm-clear-history", async () => {
+      const confirmed = await confirmModal(
+        "Очистить историю?",
+        "Удалить всю незакреплённую историю? Это действие нельзя отменить."
+      );
+      if (confirmed) {
+        try {
+          await api.clear();
+          await reload();
+        } catch {
+          showToast("Не удалось очистить историю");
+        }
+      }
+    });
   } else {
     getCurrentWindow().onFocusChanged(({ payload }) => {
       if (!payload) {

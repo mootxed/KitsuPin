@@ -1,3 +1,4 @@
+use fs2::FileExt;
 use std::path::PathBuf;
 
 fn get_xdg_data_home() -> Option<PathBuf> {
@@ -12,30 +13,62 @@ fn get_xdg_config_home() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
 }
 
-pub fn migrate_pastily_to_kitsupin() {
-    migrate_data_dir();
-    migrate_autostart();
-    migrate_native_host_manifests();
-}
 
-fn migrate_data_dir() {
+pub fn migrate_pastily_to_kitsupin() {
     let data_home = match get_xdg_data_home() {
         Some(path) => path,
         None => return,
     };
 
+    let lock_path = data_home.join(".kitsupin-migration.lock");
+    let _migration_lock = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(file) => {
+            if file.lock_exclusive().is_err() {
+                return;
+            }
+            Some(file)
+        }
+        Err(_) => None,
+    };
+
+    migrate_data_dir_at(&data_home);
+
+    if let Some(config_home) = get_xdg_config_home() {
+        migrate_autostart_at(&config_home);
+        migrate_native_host_manifests_at(&config_home);
+    }
+}
+
+fn migrate_data_dir_at(data_home: &PathBuf) {
     let old_dir = data_home.join("pastily");
     let new_dir = data_home.join("kitsupin");
 
     if old_dir.exists() && !new_dir.exists() {
         if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
             log::warn!("Failed to rename pastily data dir to kitsupin: {e}");
-            return;
+        }
+    } else if old_dir.exists() && new_dir.exists() {
+        // If new_dir was created but doesn't have database, move from old_dir
+        let new_db = new_dir.join("kitsupin.sqlite3");
+        let old_db_pastily = old_dir.join("pastily.sqlite3");
+        let old_db_kitsupin = old_dir.join("kitsupin.sqlite3");
+
+        if !new_db.exists() {
+            if old_db_kitsupin.exists() {
+                let _ = std::fs::rename(&old_db_kitsupin, &new_db);
+            } else if old_db_pastily.exists() {
+                let _ = std::fs::rename(&old_db_pastily, &new_db);
+            }
         }
     }
 
     if new_dir.exists() {
-        // Rename database files if old names exist
+        // Rename database files if old names exist within new_dir
         let old_db = new_dir.join("pastily.sqlite3");
         let new_db = new_dir.join("kitsupin.sqlite3");
         if old_db.exists() && !new_db.exists() {
@@ -53,16 +86,10 @@ fn migrate_data_dir() {
         if old_shm.exists() && !new_shm.exists() {
             let _ = std::fs::rename(&old_shm, &new_shm);
         }
-
     }
 }
 
-fn migrate_autostart() {
-    let config_home = match get_xdg_config_home() {
-        Some(path) => path,
-        None => return,
-    };
-
+fn migrate_autostart_at(config_home: &PathBuf) {
     let autostart_dir = config_home.join("autostart");
     let old_entry = autostart_dir.join("pastily.desktop");
     let new_entry = autostart_dir.join("kitsupin.desktop");
@@ -82,12 +109,7 @@ fn migrate_autostart() {
     }
 }
 
-fn migrate_native_host_manifests() {
-    let config_home = match get_xdg_config_home() {
-        Some(path) => path,
-        None => return,
-    };
-
+fn migrate_native_host_manifests_at(config_home: &PathBuf) {
     let browser_dirs = [
         config_home.join("google-chrome/NativeMessagingHosts"),
         config_home.join("chromium/NativeMessagingHosts"),
@@ -115,10 +137,28 @@ fn migrate_native_host_manifests() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_migration_paths() {
         // Simple test to ensure functions run without panic in missing dirs
         migrate_pastily_to_kitsupin();
     }
+
+    #[test]
+    fn test_pastily_directory_migration() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_home = temp_dir.path().to_path_buf();
+        let old_dir = data_home.join("pastily");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("pastily.sqlite3"), b"test db data").unwrap();
+
+        migrate_data_dir_at(&data_home);
+
+        let new_dir = data_home.join("kitsupin");
+        assert!(new_dir.exists(), "kitsupin directory should be created via rename");
+        assert!(!old_dir.exists(), "pastily directory should be moved");
+        assert!(new_dir.join("kitsupin.sqlite3").exists(), "pastily.sqlite3 should be renamed to kitsupin.sqlite3");
+    }
 }
+

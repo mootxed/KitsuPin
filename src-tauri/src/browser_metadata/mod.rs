@@ -45,11 +45,26 @@ impl BrowserCopyEvent {
         DateTime::parse_from_rfc3339(&self.timestamp)?;
         Ok(self)
     }
+
+    pub fn timestamp_millis(&self) -> Result<i64> {
+        let dt = DateTime::parse_from_rfc3339(&self.timestamp)?;
+        Ok(dt.timestamp_millis())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ClipUpsertReceipt {
+    pub clip_id: String,
+    pub previous_last_copied_at: Option<i64>,
+    pub previous_sort_key: Option<i64>,
+    pub previous_copy_count: i64,
+    pub copy_timestamp: i64,
 }
 
 #[derive(Default)]
 pub struct MetadataBuffer {
     events: Mutex<VecDeque<(DateTime<Utc>, BrowserCopyEvent)>>,
+    receipts: Mutex<VecDeque<(String, usize, ClipUpsertReceipt)>>,
 }
 impl MetadataBuffer {
     pub fn push(&self, event: BrowserCopyEvent) -> Result<()> {
@@ -84,6 +99,20 @@ impl MetadataBuffer {
         }) {
             events.remove(pos);
         }
+    }
+    pub fn push_receipt(&self, hash: &str, length: usize, receipt: ClipUpsertReceipt) {
+        let mut receipts = self.receipts.lock();
+        receipts.push_back((hash.to_lowercase(), length, receipt));
+        while receipts.len() > 64 {
+            receipts.pop_front();
+        }
+    }
+    pub fn take_receipt(&self, hash: &str, length: usize) -> Option<ClipUpsertReceipt> {
+        let mut receipts = self.receipts.lock();
+        let pos = receipts.iter().rposition(|(h, l, _)| {
+            h.eq_ignore_ascii_case(hash) && *l == length
+        })?;
+        receipts.remove(pos).map(|(_, _, r)| r)
     }
 }
 

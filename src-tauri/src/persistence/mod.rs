@@ -369,7 +369,8 @@ impl Repository {
                      CREATE UNIQUE INDEX idx_clips_hash_domain_key ON clips(content_hash, domain_key);
                      CREATE INDEX idx_clips_recency ON clips(last_copied_at DESC, sort_key DESC);
                      CREATE INDEX idx_clips_type_recency ON clips(content_type, last_copied_at DESC, sort_key DESC);
-                     CREATE INDEX idx_clips_domain_recency ON clips(domain, last_copied_at DESC, sort_key DESC);",
+                     CREATE INDEX idx_clips_domain_recency ON clips(domain, last_copied_at DESC, sort_key DESC);
+                     CREATE INDEX IF NOT EXISTS idx_clip_categories_category ON clip_user_categories(category_id, clip_id);",
                 )?;
 
                 // Rebuild FTS if it exists.
@@ -462,11 +463,59 @@ impl Repository {
             )?;
         }
 
+        // ── Migration 8: FTS5 rebuild with trigram tokenizer + restore category index ──
+        let exists_8: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=8)",
+            [],
+            |r| r.get(0),
+        )?;
+        if !exists_8 {
+            tx.execute_batch(
+                "DROP TRIGGER IF EXISTS clips_ai;
+                 DROP TRIGGER IF EXISTS clips_ad;
+                 DROP TRIGGER IF EXISTS clips_au;
+                 DROP TABLE IF EXISTS clips_fts;
+
+                 CREATE VIRTUAL TABLE clips_fts USING fts5(
+                     content,
+                     page_title,
+                     content='clips',
+                     tokenize='trigram'
+                 );
+
+                 INSERT INTO clips_fts(clips_fts) VALUES('rebuild');
+
+                 CREATE TRIGGER clips_ai AFTER INSERT ON clips BEGIN
+                   INSERT INTO clips_fts(rowid, content, page_title)
+                   VALUES (new.rowid, new.content, COALESCE(new.page_title, ''));
+                 END;
+                 CREATE TRIGGER clips_ad AFTER DELETE ON clips BEGIN
+                   INSERT INTO clips_fts(clips_fts, rowid, content, page_title)
+                   VALUES('delete', old.rowid, old.content, COALESCE(old.page_title, ''));
+                 END;
+                 CREATE TRIGGER clips_au AFTER UPDATE OF content, page_title ON clips BEGIN
+                   INSERT INTO clips_fts(clips_fts, rowid, content, page_title)
+                   VALUES('delete', old.rowid, old.content, COALESCE(old.page_title, ''));
+                   INSERT INTO clips_fts(rowid, content, page_title)
+                   VALUES (new.rowid, new.content, COALESCE(new.page_title, ''));
+                 END;
+
+                 CREATE INDEX IF NOT EXISTS idx_clip_categories_category ON clip_user_categories(category_id, clip_id);",
+            )?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(8, datetime('now'))",
+                [],
+            )?;
+        }
+
         tx.commit()?;
         Ok(())
     }
 
-    pub fn upsert_clip(&self, input: NewClip<'_>) -> Result<ClipSummary> {
+    pub fn upsert_clip(
+        &self,
+        input: NewClip<'_>,
+    ) -> Result<(ClipSummary, Option<crate::browser_metadata::ClipUpsertReceipt>)> {
         let normalized = normalize_content(input.content);
         anyhow::ensure!(!normalized.is_empty(), "пустой Clipboard не сохраняется");
         anyhow::ensure!(normalized.len() <= 1_000_000, "текст превышает лимит 1 МБ");
@@ -482,14 +531,32 @@ impl Repository {
         let mut db = self.connection.lock();
         let tx = db.transaction()?;
 
-        let existing_id: Option<String> = match tx.query_row(
-            "SELECT id FROM clips WHERE content_hash=?1 AND domain_key=?2",
-            params![hash, domain_key],
-            |r| r.get(0),
-        ) {
-            Ok(id) => Some(id),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(e) => return Err(e.into()),
+        let prior_state: Option<(String, Option<i64>, Option<i64>, i64)> = if domain_key.is_empty() {
+            match tx.query_row(
+                "SELECT id, last_copied_at, sort_key, copy_count FROM clips WHERE content_hash=?1 AND domain_key=''",
+                params![hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            ) {
+                Ok(row) => Some(row),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(e.into()),
+            }
+        } else {
+            None
+        };
+
+        let existing_id: Option<String> = if domain_key.is_empty() {
+            prior_state.as_ref().map(|(id, _, _, _)| id.clone())
+        } else {
+            match tx.query_row(
+                "SELECT id FROM clips WHERE content_hash=?1 AND domain_key=?2",
+                params![hash, domain_key],
+                |r| r.get(0),
+            ) {
+                Ok(id) => Some(id),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(e.into()),
+            }
         };
 
         let id = existing_id.unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -504,13 +571,30 @@ impl Repository {
             )?;
         }
         let clip = load_clip_summary(&tx, &id)?;
+
+        let receipt = if domain_key.is_empty() {
+            let (clip_id, prev_last, prev_sort, prev_count) = match prior_state {
+                Some((cid, last, sort, count)) => (cid, last, sort, count),
+                None => (id.clone(), None, None, 0),
+            };
+            Some(crate::browser_metadata::ClipUpsertReceipt {
+                clip_id,
+                previous_last_copied_at: prev_last,
+                previous_sort_key: prev_sort,
+                previous_copy_count: prev_count,
+                copy_timestamp: input.now,
+            })
+        } else {
+            None
+        };
+
         tx.commit()?;
-        Ok(clip)
+        Ok((clip, receipt))
     }
 
     /// Attach browser metadata to a recently saved clip whose source was not yet known.
     ///
-    /// Matches by content_hash + content_length_bytes within METADATA_RECONCILE_WINDOW_MS.
+    /// Matches by content_hash + normalized content_length_bytes within METADATA_RECONCILE_WINDOW_MS.
     /// If a clip already exists with (content_hash, domain_key), merges the two clips
     /// atomically (preserving pinned, categories, copy_count).
     ///
@@ -521,7 +605,8 @@ impl Repository {
         content_length_bytes: usize,
         domain: &str,
         page_title: Option<&str>,
-        now_ms: i64,
+        event_ts_ms: i64,
+        receipt: Option<crate::browser_metadata::ClipUpsertReceipt>,
     ) -> Result<Option<String>> {
         let domain_key = domain;
         let title = page_title
@@ -532,24 +617,24 @@ impl Repository {
         let mut db = self.connection.lock();
         let tx = db.transaction()?;
 
-        // Find an unattributed clip (domain_key='') matching hash+length within window.
-        let candidate: Option<(String, usize, i64, i64, i64, bool, String, String)> = match tx.query_row(
-            "SELECT id, length(CAST(content AS BLOB)), copy_count, sort_key, created_at, pinned, content, content_type
+        // Find an unattributed clip (domain_key='') matching hash near event_ts_ms within window.
+        let candidate: Option<(String, i64, i64, i64, bool, String, String, i64)> = match tx.query_row(
+            "SELECT id, copy_count, sort_key, created_at, pinned, content, content_type, last_copied_at
              FROM clips
-             WHERE content_hash=?1 AND domain_key='' AND last_copied_at >= ?2
-             ORDER BY last_copied_at DESC
+             WHERE content_hash=?1 AND domain_key='' AND abs(last_copied_at - ?2) <= ?3
+             ORDER BY abs(last_copied_at - ?2) ASC
              LIMIT 1",
-            params![content_hash_val, now_ms - METADATA_RECONCILE_WINDOW_MS],
+            params![content_hash_val, event_ts_ms, METADATA_RECONCILE_WINDOW_MS],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
-                    r.get::<_, usize>(1)?,
+                    r.get::<_, i64>(1)?,
                     r.get::<_, i64>(2)?,
                     r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, bool>(5)?,
+                    r.get::<_, bool>(4)?,
+                    r.get::<_, String>(5)?,
                     r.get::<_, String>(6)?,
-                    r.get::<_, String>(7)?,
+                    r.get::<_, i64>(7)?,
                 ))
             },
         ) {
@@ -560,23 +645,24 @@ impl Repository {
 
         let Some((
             temp_id,
-            stored_len,
             temp_count,
             temp_sort,
             temp_created,
             temp_pinned,
             temp_content,
             temp_kind,
+            _temp_last_copied_at,
         )) = candidate
         else {
             return Ok(None);
         };
 
-        // Verify content_length_bytes matches (defence against hash collision / wrong match).
-        if stored_len != content_length_bytes {
+        // Normalize candidate content in Rust to compare byte length accurately.
+        let normalized_len = normalize_content(&temp_content).len();
+        if normalized_len != content_length_bytes {
             log::warn!(
-                "attach_metadata: hash match but length mismatch ({} vs {}), skipping",
-                stored_len,
+                "attach_metadata: hash match but normalized length mismatch ({} vs {}), skipping",
+                normalized_len,
                 content_length_bytes
             );
             return Ok(None);
@@ -602,7 +688,9 @@ impl Repository {
             Err(e) => return Err(e.into()),
         };
 
-        let canonical_id = if temp_count == 1 {
+        let is_new_copy = receipt.as_ref().map_or(temp_count == 1, |r| r.previous_copy_count == 0);
+
+        let canonical_id = if is_new_copy {
             // Unattributed clip was created specifically by this single copy event.
             if let Some((
                 existing_id,
@@ -629,7 +717,7 @@ impl Repository {
                         merged_pinned,
                         merged_created,
                         title,
-                        now_ms
+                        event_ts_ms
                     ],
                 )?;
 
@@ -649,12 +737,28 @@ impl Repository {
                 temp_id
             }
         } else {
-            // Unattributed clip has prior copies (temp_count > 1).
-            // Roll back 1 copy count from the old no-domain clip, keeping its categories & pinned intact.
-            tx.execute(
-                "UPDATE clips SET copy_count = copy_count - 1 WHERE id=?1",
-                params![temp_id],
-            )?;
+            // Unattributed clip had prior copies before this copy event.
+            // Atomic rollback of temp_id using receipt (or copy_count - 1 fallback).
+            if let Some(r) = &receipt {
+                tx.execute(
+                    "UPDATE clips SET
+                        copy_count = ?2,
+                        sort_key = COALESCE(?3, sort_key),
+                        last_copied_at = COALESCE(?4, last_copied_at)
+                     WHERE id = ?1",
+                    params![
+                        temp_id,
+                        r.previous_copy_count,
+                        r.previous_sort_key,
+                        r.previous_last_copied_at
+                    ],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE clips SET copy_count = copy_count - 1 WHERE id=?1",
+                    params![temp_id],
+                )?;
+            }
 
             if let Some((existing_id, _, _, _, _)) = existing {
                 tx.execute(
@@ -664,14 +768,14 @@ impl Repository {
                         last_copied_at = MAX(last_copied_at, ?3),
                         page_title = COALESCE(?4, page_title)
                      WHERE id=?1",
-                    params![existing_id, temp_sort, now_ms, title],
+                    params![existing_id, temp_sort, event_ts_ms, title],
                 )?;
                 existing_id
             } else {
                 let new_id = Uuid::new_v4().to_string();
                 tx.execute(
                     "INSERT INTO clips(id,content,content_hash,content_type,domain,domain_key,page_title,created_at,last_copied_at,copy_count,pinned,sort_key)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8,1,0,?9)",
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,1,0,?10)",
                     params![
                         new_id,
                         temp_content,
@@ -680,8 +784,9 @@ impl Repository {
                         domain,
                         domain_key,
                         title,
-                        now_ms,
-                        temp_sort.saturating_add(1)
+                        temp_created,
+                        event_ts_ms,
+                        temp_sort
                     ],
                 )?;
                 new_id
@@ -700,17 +805,17 @@ impl Repository {
         let limit = query.limit.unwrap_or(100).clamp(1, 200);
         let offset = query.offset.unwrap_or(0);
 
-        // Build domain/category LIKE pattern (only for domain and category name matching).
+        let search_len = search.chars().count();
+        let is_short_query = !search.is_empty() && search_len < 3;
+        let short_query_flag = if is_short_query { 1i32 } else { 0i32 };
+
+        // Build domain/category LIKE pattern.
         let like = if search.is_empty() {
             String::new()
         } else {
             format!("%{}%", search.replace('%', "\\%").replace('_', "\\_"))
         };
 
-        // We use a two-path search:
-        // 1. If FTS query is available → use it for content + page_title
-        // 2. Additionally, LIKE on domain and category name (small sets, not full-content scan)
-        // We never LIKE-scan c.content to avoid full-table scans defeating FTS.
         let mut statement = db.prepare(
             "SELECT DISTINCT c.id,
                     substr(c.content, 1, 300),
@@ -727,6 +832,7 @@ impl Repository {
              LEFT JOIN user_categories uc ON uc.id = cc.category_id
              WHERE (?1 = ''
                     OR (?2 != '' AND c.rowid IN (SELECT rowid FROM clips_fts WHERE clips_fts MATCH ?2))
+                    OR (?9 = 1 AND c.id IN (SELECT id FROM clips ORDER BY last_copied_at DESC, sort_key DESC LIMIT 5000) AND kitsupin_lower(c.content) LIKE ?3 ESCAPE '\\')
                     OR (?3 != '' AND kitsupin_lower(COALESCE(c.domain,'')) LIKE ?3 ESCAPE '\\')
                     OR (?3 != '' AND kitsupin_lower(COALESCE(uc.name,'')) LIKE ?3 ESCAPE '\\'))
                AND (?4 IS NULL OR c.content_type = ?4)
@@ -746,7 +852,8 @@ impl Repository {
                     query.domain,
                     query.category_id,
                     limit,
-                    offset
+                    offset,
+                    short_query_flag
                 ],
                 |r| {
                     let preview: String = r.get(1)?;
@@ -1059,6 +1166,23 @@ mod tests {
             now,
         })
         .unwrap()
+        .0
+    }
+
+    fn add_with_receipt<'a>(
+        repo: &Repository,
+        text: &'a str,
+        domain: Option<&'a str>,
+        title: Option<&'a str>,
+        now: i64,
+    ) -> (ClipSummary, Option<crate::browser_metadata::ClipUpsertReceipt>) {
+        repo.upsert_clip(NewClip {
+            content: text,
+            domain,
+            page_title: title,
+            now,
+        })
+        .unwrap()
     }
 
     #[test]
@@ -1242,6 +1366,7 @@ mod tests {
                 "example.com",
                 Some("Example Page"),
                 now + 200,
+                None,
             )
             .unwrap();
         assert!(result.is_some());
@@ -1276,7 +1401,7 @@ mod tests {
         r.assign_category(&_temp.id, &cat.id, now).unwrap();
 
         let result = r
-            .attach_metadata(&hash, byte_len, "example.com", Some("New Title"), now + 100)
+            .attach_metadata(&hash, byte_len, "example.com", Some("New Title"), now + 100, None)
             .unwrap();
         assert_eq!(result.as_deref(), Some(existing.id.as_str()));
 
@@ -1306,6 +1431,7 @@ mod tests {
                 "example.com",
                 None,
                 now + 100,
+                None,
             )
             .unwrap();
         assert!(result.is_none());
@@ -1321,7 +1447,7 @@ mod tests {
         add(&r, text, None, None, now);
         // Correct hash but wrong length.
         let result = r
-            .attach_metadata(&hash, 9999, "example.com", None, now + 100)
+            .attach_metadata(&hash, 9999, "example.com", None, now + 100, None)
             .unwrap();
         assert!(result.is_none());
     }
@@ -1343,9 +1469,90 @@ mod tests {
                 "example.com",
                 None,
                 now + METADATA_RECONCILE_WINDOW_MS + 1000,
+                None,
             )
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_reconcile_crlf_and_whitespace() {
+        let r = Repository::open_in_memory().unwrap();
+        let now = 1_700_000_000_000i64;
+
+        let test_cases = [
+            "  日本語\r\n  ",
+            "  Привет\r\n",
+            "\r\n  Emoji 🚀 Test \r\n",
+        ];
+
+        for text in test_cases {
+            let normalized = normalize_content(text);
+            let hash = content_hash(&normalized);
+            let byte_len = normalized.len(); // Chrome sends normalized byte length!
+
+            let (_clip, receipt) = add_with_receipt(&r, text, None, None, now);
+            let res = r.attach_metadata(&hash, byte_len, "example.org", Some("Title"), now + 50, receipt).unwrap();
+            assert!(res.is_some(), "reconciliation should succeed for normalized text: {}", text);
+        }
+    }
+
+    #[test]
+    fn test_copy_receipt_rollback() {
+        let r = Repository::open_in_memory().unwrap();
+        let t_old = 1_700_000_000_000i64;
+
+        // Save clip without domain initially, copy_count = 5.
+        let text = "multi copy clip";
+        let normalized = normalize_content(text);
+        let hash = content_hash(&normalized);
+
+        for i in 0..5 {
+            let _ = add_with_receipt(&r, text, None, None, t_old + i * 1000);
+        }
+
+        let t_new = 1_700_000_100_000i64;
+        // User copies it again in Chrome, raising copy_count to 6 temporarily.
+        let (_, receipt) = add_with_receipt(&r, text, None, None, t_new);
+
+        // Late reconciliation arrives with domain github.com.
+        let canon = r.attach_metadata(&hash, normalized.len(), "github.com", Some("GitHub Page"), t_new, receipt).unwrap();
+        assert!(canon.is_some());
+
+        let clips = r.list_clips(&ClipQuery::default()).unwrap();
+        // There should be 2 clips: 1 with github.com domain (copy_count = 1), 1 without domain (copy_count = 5, restored to t_old + 4000).
+        assert_eq!(clips.len(), 2);
+
+        let github_clip = clips.iter().find(|c| c.domain.as_deref() == Some("github.com")).unwrap();
+        let domainless_clip = clips.iter().find(|c| c.domain.is_none()).unwrap();
+
+        assert_eq!(github_clip.copy_count, 1);
+        assert_eq!(github_clip.last_copied_at, t_new);
+
+        assert_eq!(domainless_clip.copy_count, 5);
+        assert_eq!(domainless_clip.last_copied_at, t_old + 4000);
+    }
+
+    #[test]
+    fn test_short_search_query() {
+        let r = Repository::open_in_memory().unwrap();
+        let now = 1_700_000_000_000i64;
+        add(&r, "Learning JS today", None, None, now);
+        add(&r, "The 猫 is soft", None, None, now + 100);
+        add(&r, "Building AI agent", None, None, now + 200);
+
+        for q in ["JS", "猫", "AI", "日本"] {
+            let res = r.list_clips(&ClipQuery {
+                search: Some(q.into()),
+                ..Default::default()
+            }).unwrap();
+
+            if q == "日本" {
+                assert_eq!(res.len(), 0);
+            } else {
+                assert_eq!(res.len(), 1, "Short query '{}' should match 1 clip", q);
+            }
+        }
     }
 
     #[test]

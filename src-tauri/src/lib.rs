@@ -279,12 +279,17 @@ fn save_settings(
         }
     }
 
-    // Step 3: unregister old shortcut (best-effort; log if fails).
+    // Step 3: unregister old shortcut.
     if shortcut_changed {
         let old_reg = state.registered_shortcut.lock().clone();
         let old_key = old_reg.as_deref().unwrap_or(previous.shortcut.as_str());
         if let Err(e) = app.global_shortcut().unregister(old_key) {
-            log::warn!("save_settings: could not unregister old shortcut '{old_key}': {e}");
+            log::error!("save_settings: could not unregister old shortcut '{old_key}': {e}");
+            let _ = app.global_shortcut().unregister(settings.shortcut.as_str());
+            *state.registered_shortcut.lock() = Some(old_key.to_string());
+            return Err(err(format!(
+                "Не удалось снять старую горячую клавишу '{old_key}': {e}"
+            )));
         }
         *state.registered_shortcut.lock() = Some(settings.shortcut.clone());
     }
@@ -424,8 +429,10 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                 }
             }
             "clear" => {
-                let _ = app.state::<AppState>().repo.clear_unpinned();
-                let _ = app.emit("clips-changed", ());
+                show_main(app);
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.emit("confirm-clear-history", ());
+                }
             }
             "quit" => {
                 app.state::<AppState>()
@@ -523,6 +530,9 @@ pub fn run() {
     let background = std::env::args().any(|value| value == "--background");
     let project = settings::project_dirs().expect("XDG directories");
     let data_dir = project.data_dir().to_path_buf();
+    // ── Legacy migration (BEFORE creating target directory or locking single-instance) ──
+    migration::migrate_pastily_to_kitsupin();
+
     std::fs::create_dir_all(&data_dir).expect("data directory");
     #[cfg(unix)]
     {
@@ -530,7 +540,7 @@ pub fn run() {
         let _ = std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700));
     }
 
-    // ── Atomic single-instance check (BEFORE pastily migration, DB open, or starting threads) ──
+    // ── Atomic single-instance check (BEFORE DB open or starting threads) ──
     let _lock_file = match try_acquire_instance_lock(&data_dir) {
         Ok(Some(file)) => file,
         Ok(None) => {
@@ -547,8 +557,6 @@ pub fn run() {
             return;
         }
     };
-
-    migration::migrate_pastily_to_kitsupin();
 
     // ── Open DB and start application (lock is held) ───────────────────────
     let repo = Arc::new(Repository::open(&data_dir.join("kitsupin.sqlite3")).expect("database"));
@@ -636,7 +644,11 @@ pub fn run() {
             let app_reconcile = app.handle().clone();
             let metadata_reconcile = metadata.clone();
             let reconcile_callback = Arc::new(move |event: browser_metadata::BrowserCopyEvent| {
-                let now_ms = Utc::now().timestamp_millis();
+                let event_ts_ms = match event.timestamp_millis() {
+                    Ok(ts) => ts,
+                    Err(_) => Utc::now().timestamp_millis(),
+                };
+                let receipt = metadata_reconcile.take_receipt(&event.content_hash, event.content_length);
                 match repo_reconcile.attach_metadata(
                     &event.content_hash,
                     event.content_length,
@@ -646,7 +658,8 @@ pub fn run() {
                     } else {
                         Some(&event.page_title)
                     },
-                    now_ms,
+                    event_ts_ms,
+                    receipt,
                 ) {
                     Ok(Some(id)) => {
                         metadata_reconcile.remove_matching(&event.content_hash, event.content_length);
