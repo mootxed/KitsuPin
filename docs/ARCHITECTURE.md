@@ -55,20 +55,23 @@ KitsuPin состоит из одного долгоживущего Tauri-пр�
   - Связи `clip_user_categories` вставляются по каноническим ID через `INSERT OR IGNORE`.
 - **Транзакционность и ошибки**: любые ошибки при чтении или вставке откатывают транзакцию, оставляя исходную и целевую базы нетронутыми и возвращая `ConflictPreserved`.
 - **Валидация и бэкап**:
+  - Перед диагностикой доступности баз выполняется проверка `inspect_database_data_state` (`Missing`, `Empty`, `ContainsData`, `Unreadable`). Повреждённые или нечитаемые базы отклоняются с `ConflictPreserved` без автоматической замены.
+  - Вычисление fingerprint учитывает uncheckpointed WAL-страницы через создание временного snapshot via SQLite Backup API.
   - После восстановления или слияния выполняются `PRAGMA integrity_check` (проверка ответа `"ok"`) и `PRAGMA foreign_key_check` (проверка `stmt.exists([])?`).
-  - Файл `.empty.bak` сохраняется в качестве диагностического бэкапа.
-  - Старая база переименовывается в `.sqlite3.migrated.bak` только после полного успеха транзакции, проверок и повторного открывающего теста целевой базы через `Repository::open`.
+  - При восстановлении в `legacy_imports` записывается completed-маркер источника, исключающий повторное удвоение записей.
+  - Файл `.empty.bak` вместе со своими sidecar-файлами (`.empty.bak-wal`, `.empty.bak-shm`) сохраняется в качестве диагностического бэкапа.
+  - Старая база переименовывается в `.sqlite3.migrated.bak` (с очисткой устаревших WAL/SHM) только после полного успеха транзакции, проверок и повторного открывающего теста целевой базы через `Repository::open`.
 
 ### Поддерживаемые сценарии
 
 1. **Сценарий A (Только старый каталог)**:
-   Атомарно переименовывает `~/.local/share/pastily` в `~/.local/share/kitsupin` и переименовывает файлы базы данных.
+   Восстанавливает старую базу в `~/.local/share/kitsupin/kitsupin.sqlite3` через SQLite Backup API, заносит реестровую запись в `legacy_imports` и переносит старую базу в backup.
 2. **Сценарий B (Существует каталог kitsupin без kitsupin.sqlite3)**:
-   Переносит старую базу через SQLite Backup API, синхронизирует временный файл (`sync_all`), проверяет `integrity_check` и `foreign_key_check`, после чего переименовывает старую базу в backup.
+   Очищает оставшиеся sidecar-файлы (`-wal`, `-shm`), переносит старую базу через SQLite Backup API, заносит запись в `legacy_imports`, проверяет `integrity_check` и `foreign_key_check`, после чего переименовывает старую базу в backup.
 3. **Сценарий C (kitsupin.sqlite3 существует, но фактически пуст)**:
-   Перемещает пустую новую базу в `kitsupin.sqlite3.empty.bak`, переносит старую базу через SQLite Backup API с проверкой целостности, сохраняя `.empty.bak`.
+   Перемещает пустую новую базу и её sidecar-файлы в `kitsupin.sqlite3.empty.bak*`, переносит старую базу через SQLite Backup API с записью в `legacy_imports` и проверкой целостности, сохраняя `.empty.bak`.
 4. **Сценарий D (Обе базы содержат пользовательские данные)**:
-   Открывает и мигрирует новую базу до актуальной схемы v1–8 via `Repository::open`, затем выполняет транзакционный merge legacy Pastily v1 с подсчетом отчета `LegacyMergeReport`.
+   Открывает и мигрирует новую базу до актуальной схемы v1–9 via `Repository::open`, затем выполняет транзакционный merge legacy Pastily v1 с проверкой `legacy_imports` и подсчетом отчета `LegacyMergeReport`.
 
 ---
 
@@ -84,7 +87,7 @@ KitsuPin состоит из одного долгоживущего Tauri-пр�
   └── X11 Clipboard Event (или Polling fallback)
         └─ Clipboard Watcher:
              ├─ Попытка take_match (Metadata before Clipboard)
-             │    └─ Если найден event: сразу создаёт карточку с доменом и заголовком
+             │    └─ Если найден незарезервированный event: сразу создаёт карточку с доменом и заголовком
              └─ Иначе (Metadata after Clipboard):
                   └─ Создаёт domainless-карточку + генерирует ClipUpsertReceipt
                        └─ Pushes receipt в MetadataBuffer
@@ -92,11 +95,13 @@ KitsuPin состоит из одного долгоживущего Tauri-пр�
 
 ### Прикрепление метаданных (reconciliation)
 
-- Callback Chrome socket строго требует наличия `ClipUpsertReceipt` via `take_matching_receipt(hash, length, timestamp_ms, RECEIPT_MATCH_WINDOW_MS = 2000)`.
-- Без `receipt` функция `attach_metadata_with_receipt` НЕ вызывается, а `BrowserCopyEvent` остается в `MetadataBuffer` для дальнейшего подхвата Clipboard watcher.
+- `reserve_matching_pair` под единым мьютексом атомарно завышает флаг `reserved = true` и у `BufferedEvent`, и у `ClipUpsertReceipt`.
+- Метод `take_match` игнорирует зарезервированные события (`reserved == true`), предотвращая параллельную кражу события в Clipboard watcher.
 - Метод `attach_metadata_with_receipt` атомарно проверяет наличие карточки по `receipt.clip_id`, совпадение `content_hash`, `domain_key == ''`, и совпадение текущего состояния DB данным receipt (`copy_count`, `last_copied_at`).
-- Вызов `remove_event(event_id)` выполняется только после успешного возврата `Ok(Some(canonical_id))`.
-- Устаревшие events и receipts старше 10 000 мс автоматически очищаются (`cleanup_stale`).
+- При успешном прикреплении (`Ok(Some(canonical_id))`) обе записи удаляются из `MetadataBuffer` (`acknowledge_pair`).
+- При получении `Ok(None)` (устаревший receipt, не соответствующий текущему состоянию DB) удаляется только несостоятельный receipt (`remove_receipt`), а событие освобождается (`release_event`), оставаясь доступным для свежего receipt или `take_match`.
+- При ошибках БД (`Err`) бронирование снимется с обоих объектов (`release_receipt` и `release_event`).
+- Устаревшие незарезервированные events и receipts старше 10 000 мс автоматически очищаются (`cleanup_stale`).
 
 ---
 
@@ -144,6 +149,7 @@ UNIQUE constraint: `(content_hash, domain_key)`.
 
 - **1–7**: Начальная схема, `domain_key`, FTS5, integer timestamps, merge duplicates, UPDATE triggers.
 - **8**: Пересоздание FTS5 с `trigram` токенизатором, индекс `idx_clip_categories_category`.
+- **9**: Добавление реестровой таблицы `legacy_imports` для учёта и дедупликации импортированных legacy-баз.
 
 ---
 

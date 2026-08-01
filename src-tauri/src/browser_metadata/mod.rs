@@ -76,9 +76,16 @@ pub struct ClipUpsertReceipt {
     pub copy_timestamp: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct BufferedEvent {
+    pub at: DateTime<Utc>,
+    pub event: BrowserCopyEvent,
+    pub reserved: bool,
+}
+
 #[derive(Default)]
 pub struct MetadataBuffer {
-    events: Mutex<VecDeque<(DateTime<Utc>, BrowserCopyEvent)>>,
+    events: Mutex<VecDeque<BufferedEvent>>,
     receipts: Mutex<VecDeque<(String, usize, ClipUpsertReceipt, bool)>>,
 }
 
@@ -87,7 +94,11 @@ impl MetadataBuffer {
         let event = event.validate()?;
         let at = DateTime::parse_from_rfc3339(&event.timestamp)?.with_timezone(&Utc);
         let mut events = self.events.lock();
-        events.push_back((at, event));
+        events.push_back(BufferedEvent {
+            at,
+            event,
+            reserved: false,
+        });
         while events.len() > 64 {
             events.pop_front();
         }
@@ -103,19 +114,34 @@ impl MetadataBuffer {
         now: DateTime<Utc>,
     ) -> Option<BrowserCopyEvent> {
         let mut events = self.events.lock();
-        events.retain(|(at, _)| now.signed_duration_since(*at).num_milliseconds().abs() <= 10_000);
-        let pos = events.iter().rposition(|(at, e)| {
-            e.content_hash.eq_ignore_ascii_case(hash)
-                && e.content_length == length
-                && now.signed_duration_since(*at).num_milliseconds().abs() <= 2_500
+        events.retain(|e| e.reserved || now.signed_duration_since(e.at).num_milliseconds().abs() <= 10_000);
+        let pos = events.iter().rposition(|e| {
+            !e.reserved
+                && e.event.content_hash.eq_ignore_ascii_case(hash)
+                && e.event.content_length == length
+                && now.signed_duration_since(e.at).num_milliseconds().abs() <= 2_500
         })?;
-        events.remove(pos).map(|(_, e)| e)
+        events.remove(pos).map(|e| e.event)
     }
 
     pub fn remove_event(&self, event_id: Uuid) {
         let mut events = self.events.lock();
-        if let Some(pos) = events.iter().position(|(_, e)| e.event_id == event_id) {
+        if let Some(pos) = events.iter().position(|e| e.event.event_id == event_id) {
             events.remove(pos);
+        }
+    }
+
+    pub fn release_event(&self, event_id: Uuid) {
+        let mut events = self.events.lock();
+        if let Some(e) = events.iter_mut().find(|e| e.event.event_id == event_id) {
+            e.reserved = false;
+        }
+    }
+
+    pub fn remove_receipt(&self, receipt_id: Uuid) {
+        let mut receipts = self.receipts.lock();
+        if let Some(pos) = receipts.iter().position(|(_, _, r, _)| r.receipt_id == receipt_id) {
+            receipts.remove(pos);
         }
     }
 
@@ -133,31 +159,36 @@ impl MetadataBuffer {
         &self,
         allowed_delta_ms: i64,
     ) -> Option<(BrowserCopyEvent, ClipUpsertReceipt)> {
-        let events = self.events.lock();
+        let mut events = self.events.lock();
         let mut receipts = self.receipts.lock();
 
-        let mut best_pair = None;
+        let mut best_pair: Option<(usize, usize, BrowserCopyEvent, ClipUpsertReceipt)> = None;
         let mut min_diff = i64::MAX;
 
-        for (receipt_idx, (r_hash, r_len, receipt, reserved)) in receipts.iter().enumerate() {
-            if *reserved {
+        for (receipt_idx, (r_hash, r_len, receipt, r_reserved)) in receipts.iter().enumerate() {
+            if *r_reserved {
                 continue;
             }
-            for (_at, event) in events.iter() {
+            for (event_idx, buffered) in events.iter().enumerate() {
+                if buffered.reserved {
+                    continue;
+                }
+                let event = &buffered.event;
                 if r_hash.eq_ignore_ascii_case(&event.content_hash) && *r_len == event.content_length {
                     if let Ok(event_ts_ms) = event.timestamp_millis() {
                         let diff = (receipt.copy_timestamp - event_ts_ms).abs();
                         if diff <= allowed_delta_ms && diff < min_diff {
                             min_diff = diff;
-                            best_pair = Some((receipt_idx, event.clone(), receipt.clone()));
+                            best_pair = Some((event_idx, receipt_idx, event.clone(), receipt.clone()));
                         }
                     }
                 }
             }
         }
 
-        if let Some((idx, event, receipt)) = best_pair {
-            receipts[idx].3 = true;
+        if let Some((e_idx, r_idx, event, receipt)) = best_pair {
+            events[e_idx].reserved = true;
+            receipts[r_idx].3 = true;
             Some((event, receipt))
         } else {
             None
@@ -165,16 +196,8 @@ impl MetadataBuffer {
     }
 
     pub fn acknowledge_pair(&self, event_id: Uuid, receipt_id: Uuid) {
-        let mut events = self.events.lock();
-        if let Some(pos) = events.iter().position(|(_, e)| e.event_id == event_id) {
-            events.remove(pos);
-        }
-        drop(events);
-
-        let mut receipts = self.receipts.lock();
-        if let Some(pos) = receipts.iter().position(|(_, _, r, _)| r.receipt_id == receipt_id) {
-            receipts.remove(pos);
-        }
+        self.remove_event(event_id);
+        self.remove_receipt(receipt_id);
     }
 
     pub fn discard_pair(&self, event_id: Uuid, receipt_id: Uuid) {
@@ -209,15 +232,17 @@ impl MetadataBuffer {
                 }
                 Ok(None) => {
                     log::debug!(
-                        "Late reconciliation: receipt/event pair no longer valid for hash {hash}; discarding pair"
+                        "Late reconciliation: receipt no longer valid for hash {hash}; removing receipt and unreserving event"
                     );
-                    self.discard_pair(event_id, receipt_id);
+                    self.remove_receipt(receipt_id);
+                    self.release_event(event_id);
                 }
                 Err(e) => {
                     log::warn!(
-                        "Late reconciliation error for hash {hash}: {e}; releasing receipt reservation"
+                        "Late reconciliation error for hash {hash}: {e}; releasing reservations"
                     );
                     self.release_receipt(receipt_id);
+                    self.release_event(event_id);
                     break;
                 }
             }
@@ -256,13 +281,7 @@ impl MetadataBuffer {
         let now_ms = now.timestamp_millis();
 
         let mut events = self.events.lock();
-        events.retain(|(_, e)| {
-            if let Ok(ts) = e.timestamp_millis() {
-                (now_ms - ts).abs() <= 10_000
-            } else {
-                false
-            }
-        });
+        events.retain(|e| e.reserved || (now_ms - e.event.timestamp_millis().unwrap_or(0)).abs() <= 10_000);
 
         let mut receipts = self.receipts.lock();
         receipts.retain(|(_, _, r, reserved)| *reserved || (now_ms - r.copy_timestamp).abs() <= 10_000);
@@ -428,5 +447,125 @@ mod tests {
         let cb = Arc::new(|_: BrowserCopyEvent| {});
         let res = start_socket_server(path.clone(), buffer, cb);
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn reservation_locks_both_event_and_receipt_and_blocks_take_match() {
+        let b = MetadataBuffer::default();
+        let hash = "a".repeat(64);
+        let now = Utc::now();
+        let now_ms = now.timestamp_millis();
+
+        let e = BrowserCopyEvent {
+            event_id: Uuid::new_v4(),
+            version: 1,
+            event: "copy".into(),
+            content_hash: hash.clone(),
+            content_length: 5,
+            domain: "example.com".into(),
+            page_title: "Title".into(),
+            timestamp: now.to_rfc3339(),
+        };
+
+        let r = ClipUpsertReceipt {
+            receipt_id: Uuid::new_v4(),
+            clip_id: "clip_1".into(),
+            content_hash: hash.clone(),
+            normalized_length_bytes: 5,
+            previous_last_copied_at: None,
+            previous_sort_key: None,
+            previous_copy_count: 0,
+            resulting_last_copied_at: now_ms,
+            resulting_sort_key: 1,
+            resulting_copy_count: 1,
+            copy_timestamp: now_ms,
+        };
+
+        b.push(e.clone()).unwrap();
+        b.push_receipt(&hash, 5, r.clone());
+
+        // Reserving pair should lock both
+        let (reserved_event, reserved_receipt) = b
+            .reserve_matching_pair(RECEIPT_MATCH_WINDOW_MS)
+            .expect("should reserve pair");
+
+        assert_eq!(reserved_event.event_id, e.event_id);
+        assert_eq!(reserved_receipt.receipt_id, r.receipt_id);
+
+        // Reserved event cannot be stolen by take_match
+        assert!(b.take_match(&hash, 5, now).is_none());
+
+        // Subsequent reserve_matching_pair returns None because pair is reserved
+        assert!(b.reserve_matching_pair(RECEIPT_MATCH_WINDOW_MS).is_none());
+
+        // Releasing event reservation makes it available for take_match again
+        b.release_event(e.event_id);
+        let matched = b.take_match(&hash, 5, now).expect("should take match after release");
+        assert_eq!(matched.event_id, e.event_id);
+    }
+
+    #[test]
+    fn unreserving_event_keeps_it_for_next_receipt_on_stale_receipt_cleanup() {
+        let b = MetadataBuffer::default();
+        let hash = "a".repeat(64);
+        let now = Utc::now();
+        let now_ms = now.timestamp_millis();
+
+        let e = BrowserCopyEvent {
+            event_id: Uuid::new_v4(),
+            version: 1,
+            event: "copy".into(),
+            content_hash: hash.clone(),
+            content_length: 5,
+            domain: "example.com".into(),
+            page_title: "Title".into(),
+            timestamp: now.to_rfc3339(),
+        };
+
+        let r_stale = ClipUpsertReceipt {
+            receipt_id: Uuid::new_v4(),
+            clip_id: "clip_stale".into(),
+            content_hash: hash.clone(),
+            normalized_length_bytes: 5,
+            previous_last_copied_at: None,
+            previous_sort_key: None,
+            previous_copy_count: 0,
+            resulting_last_copied_at: now_ms - 100,
+            resulting_sort_key: 1,
+            resulting_copy_count: 1,
+            copy_timestamp: now_ms - 100,
+        };
+
+        b.push(e.clone()).unwrap();
+        b.push_receipt(&hash, 5, r_stale.clone());
+
+        let (reserved_event, reserved_receipt) = b
+            .reserve_matching_pair(RECEIPT_MATCH_WINDOW_MS)
+            .unwrap();
+
+        // Simulate stale receipt handling (Ok(None)): remove receipt, release event reservation
+        b.remove_receipt(reserved_receipt.receipt_id);
+        b.release_event(reserved_event.event_id);
+
+        // Push new correct receipt
+        let r_fresh = ClipUpsertReceipt {
+            receipt_id: Uuid::new_v4(),
+            clip_id: "clip_fresh".into(),
+            content_hash: hash.clone(),
+            normalized_length_bytes: 5,
+            previous_last_copied_at: None,
+            previous_sort_key: None,
+            previous_copy_count: 0,
+            resulting_last_copied_at: now_ms,
+            resulting_sort_key: 2,
+            resulting_copy_count: 1,
+            copy_timestamp: now_ms,
+        };
+        b.push_receipt(&hash, 5, r_fresh.clone());
+
+        // Event should match with fresh receipt
+        let (e2, r2) = b.reserve_matching_pair(RECEIPT_MATCH_WINDOW_MS).unwrap();
+        assert_eq!(e2.event_id, e.event_id);
+        assert_eq!(r2.receipt_id, r_fresh.receipt_id);
     }
 }
