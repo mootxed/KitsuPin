@@ -173,6 +173,7 @@ pub fn start(
                 Ok((_, receipt)) => {
                     if let Some(r) = receipt {
                         metadata.push_receipt(&hash, normalized.len(), r);
+                        metadata.reconcile_pending(&repo, Some(&app));
                     }
                     let _ = app.emit("clips-changed", ());
                 }

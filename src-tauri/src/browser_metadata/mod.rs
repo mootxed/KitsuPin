@@ -11,6 +11,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tauri::Emitter;
 use uuid::Uuid;
 
 pub const RECEIPT_MATCH_WINDOW_MS: i64 = 2000;
@@ -78,7 +79,7 @@ pub struct ClipUpsertReceipt {
 #[derive(Default)]
 pub struct MetadataBuffer {
     events: Mutex<VecDeque<(DateTime<Utc>, BrowserCopyEvent)>>,
-    receipts: Mutex<VecDeque<(String, usize, ClipUpsertReceipt)>>,
+    receipts: Mutex<VecDeque<(String, usize, ClipUpsertReceipt, bool)>>,
 }
 
 impl MetadataBuffer {
@@ -120,12 +121,107 @@ impl MetadataBuffer {
 
     pub fn push_receipt(&self, hash: &str, length: usize, receipt: ClipUpsertReceipt) {
         let mut receipts = self.receipts.lock();
-        receipts.push_back((hash.to_lowercase(), length, receipt));
+        receipts.push_back((hash.to_lowercase(), length, receipt, false));
         while receipts.len() > 64 {
             receipts.pop_front();
         }
         drop(receipts);
         self.cleanup_stale(Utc::now());
+    }
+
+    pub fn reserve_matching_pair(
+        &self,
+        allowed_delta_ms: i64,
+    ) -> Option<(BrowserCopyEvent, ClipUpsertReceipt)> {
+        let events = self.events.lock();
+        let mut receipts = self.receipts.lock();
+
+        let mut best_pair = None;
+        let mut min_diff = i64::MAX;
+
+        for (receipt_idx, (r_hash, r_len, receipt, reserved)) in receipts.iter().enumerate() {
+            if *reserved {
+                continue;
+            }
+            for (_at, event) in events.iter() {
+                if r_hash.eq_ignore_ascii_case(&event.content_hash) && *r_len == event.content_length {
+                    if let Ok(event_ts_ms) = event.timestamp_millis() {
+                        let diff = (receipt.copy_timestamp - event_ts_ms).abs();
+                        if diff <= allowed_delta_ms && diff < min_diff {
+                            min_diff = diff;
+                            best_pair = Some((receipt_idx, event.clone(), receipt.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((idx, event, receipt)) = best_pair {
+            receipts[idx].3 = true;
+            Some((event, receipt))
+        } else {
+            None
+        }
+    }
+
+    pub fn acknowledge_pair(&self, event_id: Uuid, receipt_id: Uuid) {
+        let mut events = self.events.lock();
+        if let Some(pos) = events.iter().position(|(_, e)| e.event_id == event_id) {
+            events.remove(pos);
+        }
+        drop(events);
+
+        let mut receipts = self.receipts.lock();
+        if let Some(pos) = receipts.iter().position(|(_, _, r, _)| r.receipt_id == receipt_id) {
+            receipts.remove(pos);
+        }
+    }
+
+    pub fn discard_pair(&self, event_id: Uuid, receipt_id: Uuid) {
+        self.acknowledge_pair(event_id, receipt_id);
+    }
+
+    pub fn release_receipt(&self, receipt_id: Uuid) {
+        let mut receipts = self.receipts.lock();
+        if let Some((_, _, _, reserved)) =
+            receipts.iter_mut().find(|(_, _, r, _)| r.receipt_id == receipt_id)
+        {
+            *reserved = false;
+        }
+    }
+
+    pub fn reconcile_pending(
+        &self,
+        repo: &crate::persistence::Repository,
+        app: Option<&tauri::AppHandle>,
+    ) {
+        while let Some((event, receipt)) = self.reserve_matching_pair(RECEIPT_MATCH_WINDOW_MS) {
+            let receipt_id = receipt.receipt_id;
+            let event_id = event.event_id;
+            let hash = event.content_hash.clone();
+            match repo.attach_metadata_with_receipt(&event, receipt) {
+                Ok(Some(clip_id)) => {
+                    self.acknowledge_pair(event_id, receipt_id);
+                    log::info!("Late reconciliation: metadata attached to clip {clip_id}");
+                    if let Some(app) = app {
+                        let _ = app.emit("clips-changed", ());
+                    }
+                }
+                Ok(None) => {
+                    log::debug!(
+                        "Late reconciliation: receipt/event pair no longer valid for hash {hash}; discarding pair"
+                    );
+                    self.discard_pair(event_id, receipt_id);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Late reconciliation error for hash {hash}: {e}; releasing receipt reservation"
+                    );
+                    self.release_receipt(receipt_id);
+                    break;
+                }
+            }
+        }
     }
 
     pub fn take_matching_receipt(
@@ -139,8 +235,8 @@ impl MetadataBuffer {
         let mut best_idx = None;
         let mut min_diff = i64::MAX;
 
-        for (idx, (h, l, r)) in receipts.iter().enumerate() {
-            if h.eq_ignore_ascii_case(hash) && *l == length {
+        for (idx, (h, l, r, reserved)) in receipts.iter().enumerate() {
+            if !*reserved && h.eq_ignore_ascii_case(hash) && *l == length {
                 let diff = (r.copy_timestamp - browser_event_ts_ms).abs();
                 if diff <= allowed_delta_ms && diff < min_diff {
                     min_diff = diff;
@@ -150,7 +246,7 @@ impl MetadataBuffer {
         }
 
         if let Some(pos) = best_idx {
-            receipts.remove(pos).map(|(_, _, r)| r)
+            receipts.remove(pos).map(|(_, _, r, _)| r)
         } else {
             None
         }
@@ -169,7 +265,7 @@ impl MetadataBuffer {
         });
 
         let mut receipts = self.receipts.lock();
-        receipts.retain(|(_, _, r)| (now_ms - r.copy_timestamp).abs() <= 10_000);
+        receipts.retain(|(_, _, r, reserved)| *reserved || (now_ms - r.copy_timestamp).abs() <= 10_000);
     }
 }
 

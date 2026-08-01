@@ -38,6 +38,9 @@ pub fn migrate_pastily_to_kitsupin_at(
     config_home: Option<&Path>,
 ) -> LegacyMigrationResult {
     let lock_path = data_home.join(".kitsupin-migration.lock");
+    if let Some(parent) = lock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let file = match std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -52,8 +55,16 @@ pub fn migrate_pastily_to_kitsupin_at(
                 let _ =
                     std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600));
             }
-            if file.try_lock_exclusive().is_err() {
-                log::warn!("Migration lock held by another process; aborting migration");
+            let mut acquired = false;
+            for _ in 0..30 {
+                if file.try_lock_exclusive().is_ok() {
+                    acquired = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            if !acquired {
+                log::warn!("Migration lock held by another process; aborting migration after timeout");
                 return LegacyMigrationResult::ConflictPreserved;
             }
             file
@@ -81,12 +92,33 @@ fn migrate_data_dir_at(data_home: &Path) -> LegacyMigrationResult {
 
     // Scenario A: pastily exists, kitsupin does not exist
     if old_dir.exists() && !new_dir.exists() {
-        if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
+        if let Some(old_db_path) = find_legacy_db(&old_dir) {
+            let new_db = new_dir.join("kitsupin.sqlite3");
+            let res = restore_legacy_db(&old_db_path, &new_db);
+            if res == LegacyMigrationResult::ConflictPreserved {
+                let _ = std::fs::remove_dir_all(&new_dir);
+                return LegacyMigrationResult::ConflictPreserved;
+            }
+            if let Ok(entries) = std::fs::read_dir(&old_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let file_name = path.file_name().unwrap_or_default();
+                    let file_name_str = file_name.to_string_lossy();
+                    if !file_name_str.starts_with("pastily.sqlite3")
+                        && !file_name_str.starts_with("kitsupin.sqlite3")
+                    {
+                        let dest = new_dir.join(file_name);
+                        let _ = std::fs::copy(&path, &dest);
+                    }
+                }
+            }
+            return LegacyMigrationResult::DirectoryMoved;
+        } else if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
             log::error!("Failed to rename pastily directory to kitsupin: {e}");
             return LegacyMigrationResult::ConflictPreserved;
+        } else {
+            return LegacyMigrationResult::DirectoryMoved;
         }
-        normalize_db_names_in(&new_dir);
-        return LegacyMigrationResult::DirectoryMoved;
     }
 
     if !old_dir.exists() && new_dir.exists() {
@@ -103,7 +135,6 @@ fn migrate_data_dir_at(data_home: &Path) -> LegacyMigrationResult {
     let new_db = new_dir.join("kitsupin.sqlite3");
 
     let Some(old_db_path) = old_db else {
-        // old_dir exists but has no db
         return LegacyMigrationResult::NothingToMigrate;
     };
 
@@ -124,14 +155,13 @@ fn migrate_data_dir_at(data_home: &Path) -> LegacyMigrationResult {
             return LegacyMigrationResult::ConflictPreserved;
         }
         let res = restore_legacy_db(&old_db_path, &new_db);
-        // Leave backup_empty as diagnostic backup per requirements
         return res;
     }
 
     if old_clip_count == 0 {
         // Old database is empty, nothing useful to import
         let backup_old = old_dir.join("pastily.sqlite3.empty.bak");
-        let _ = std::fs::rename(&old_db_path, &backup_old);
+        let _ = backup_database_file(&old_db_path, &backup_old);
         return LegacyMigrationResult::NothingToMigrate;
     }
 
@@ -205,6 +235,74 @@ fn ensure_integrity_ok(conn: &Connection) -> anyhow::Result<()> {
     if res != "ok" {
         anyhow::bail!("integrity check failed with output: {res}");
     }
+    Ok(())
+}
+
+fn backup_database_file(src_db_path: &Path, dst_backup_path: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = dst_backup_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let temp_backup = dst_backup_path.with_extension("tmp_bak");
+    if temp_backup.exists() {
+        let _ = std::fs::remove_file(&temp_backup);
+    }
+
+    let src_conn = Connection::open_with_flags(
+        src_db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+
+    let mut dst_conn = Connection::open(&temp_backup)?;
+    let backup_res =
+        rusqlite::backup::Backup::new(&src_conn, &mut dst_conn).and_then(|b| b.step(-1));
+
+    if let Err(e) = backup_res {
+        let _ = std::fs::remove_file(&temp_backup);
+        anyhow::bail!("Backup API failed for {:?}: {e}", src_db_path);
+    }
+
+    ensure_integrity_ok(&dst_conn)?;
+    drop(dst_conn);
+    drop(src_conn);
+
+    if let Ok(file) = std::fs::File::open(&temp_backup) {
+        let _ = file.sync_all();
+    }
+
+    std::fs::rename(&temp_backup, dst_backup_path)?;
+
+    let _ = std::fs::remove_file(src_db_path);
+    let src_str = src_db_path.to_string_lossy();
+    let wal = PathBuf::from(format!("{src_str}-wal"));
+    if wal.exists() {
+        let _ = std::fs::remove_file(&wal);
+    }
+    let shm = PathBuf::from(format!("{src_str}-shm"));
+    if shm.exists() {
+        let _ = std::fs::remove_file(&shm);
+    }
+
+    Ok(())
+}
+
+fn compute_db_fingerprint(db_path: &Path) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(db_path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn ensure_legacy_imports_table(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS legacy_imports (
+            id TEXT PRIMARY KEY,
+            source_fingerprint TEXT NOT NULL UNIQUE,
+            imported_at INTEGER NOT NULL,
+            source_path TEXT NOT NULL,
+            status TEXT NOT NULL
+        );",
+    )?;
     Ok(())
 }
 
@@ -294,8 +392,8 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
 
     // Preserve old database as backup
     let old_backup = old_db_path.with_extension("sqlite3.migrated.bak");
-    if let Err(e) = std::fs::rename(old_db_path, &old_backup) {
-        log::error!("Failed to rename old DB to backup: {e}");
+    if let Err(e) = backup_database_file(old_db_path, &old_backup) {
+        log::error!("Failed to backup old DB: {e}");
         return LegacyMigrationResult::ConflictPreserved;
     }
 
@@ -408,6 +506,7 @@ struct LegacyMergeReport {
     links_read: usize,
     links_imported: usize,
     duplicate_clips_merged: usize,
+    already_imported: bool,
 }
 
 fn merge_legacy_db_into_new(old_db_path: &Path, new_db_path: &Path) -> LegacyMigrationResult {
@@ -416,6 +515,14 @@ fn merge_legacy_db_into_new(old_db_path: &Path, new_db_path: &Path) -> LegacyMig
         log::error!("Failed to open/migrate target DB before merge: {e}");
         return LegacyMigrationResult::ConflictPreserved;
     }
+
+    let fingerprint = match compute_db_fingerprint(old_db_path) {
+        Ok(fp) => fp,
+        Err(e) => {
+            log::error!("Failed to compute fingerprint of old DB {:?}: {e}", old_db_path);
+            return LegacyMigrationResult::ConflictPreserved;
+        }
+    };
 
     // 2. Open source legacy DB
     let src_conn = match Connection::open_with_flags(
@@ -444,7 +551,7 @@ fn merge_legacy_db_into_new(old_db_path: &Path, new_db_path: &Path) -> LegacyMig
     }
     let _ = dst_conn.busy_timeout(std::time::Duration::from_secs(3));
 
-    let report = match perform_legacy_merge(&src_conn, &mut dst_conn) {
+    let report = match perform_legacy_merge(&src_conn, &mut dst_conn, &fingerprint, old_db_path) {
         Ok(rep) => rep,
         Err(e) => {
             log::error!("Legacy DB merge failed (transaction rolled back): {e}");
@@ -470,21 +577,23 @@ fn merge_legacy_db_into_new(old_db_path: &Path, new_db_path: &Path) -> LegacyMig
     }
 
     let old_backup = old_db_path.with_extension("sqlite3.migrated.bak");
-    if let Err(e) = std::fs::rename(old_db_path, &old_backup) {
-        log::error!("Failed to rename old DB to backup after merge: {e}");
+    if let Err(e) = backup_database_file(old_db_path, &old_backup) {
+        log::error!("Failed to backup old DB after merge: {e}");
         return LegacyMigrationResult::ConflictPreserved;
     }
 
-    log::info!(
-        "Legacy merge completed successfully: clips read={}, canonical touched={}, categories read={}, canonical touched={}, links read={}, imported={}, duplicates merged={}",
-        report.legacy_clips_read,
-        report.canonical_clips_touched,
-        report.legacy_categories_read,
-        report.canonical_categories_touched,
-        report.links_read,
-        report.links_imported,
-        report.duplicate_clips_merged
-    );
+    if !report.already_imported {
+        log::info!(
+            "Legacy merge completed successfully: clips read={}, canonical touched={}, categories read={}, canonical touched={}, links read={}, imported={}, duplicates merged={}",
+            report.legacy_clips_read,
+            report.canonical_clips_touched,
+            report.legacy_categories_read,
+            report.canonical_categories_touched,
+            report.links_read,
+            report.links_imported,
+            report.duplicate_clips_merged
+        );
+    }
 
     LegacyMigrationResult::DatabasesMerged
 }
@@ -492,8 +601,36 @@ fn merge_legacy_db_into_new(old_db_path: &Path, new_db_path: &Path) -> LegacyMig
 fn perform_legacy_merge(
     src_conn: &Connection,
     dst_conn: &mut Connection,
+    fingerprint: &str,
+    source_path: &Path,
 ) -> anyhow::Result<LegacyMergeReport> {
     let now_ms = chrono::Utc::now().timestamp_millis();
+    ensure_legacy_imports_table(dst_conn)?;
+
+    let already_imported: bool = dst_conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM legacy_imports WHERE source_fingerprint = ?1 AND status = 'completed')",
+            params![fingerprint],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+
+    if already_imported {
+        log::info!(
+            "Legacy DB fingerprint {} was already imported; skipping duplicate data merge",
+            fingerprint
+        );
+        return Ok(LegacyMergeReport {
+            legacy_clips_read: 0,
+            canonical_clips_touched: 0,
+            legacy_categories_read: 0,
+            canonical_categories_touched: 0,
+            links_read: 0,
+            links_imported: 0,
+            duplicate_clips_merged: 0,
+            already_imported: true,
+        });
+    }
 
     let has_clips = has_column(src_conn, "clips", "id");
     if !has_clips {
@@ -619,11 +756,17 @@ fn perform_legacy_merge(
                 continue;
             }
             let norm_name = trimmed.to_lowercase();
+            let safe_color = if crate::persistence::is_valid_hex_color(&color) {
+                color
+            } else {
+                log::warn!("Invalid legacy category color '{}'; using fallback #6b7280", color);
+                "#6b7280".to_string()
+            };
             imported_categories.push(ImportedCategory {
                 legacy_id: id,
                 name: trimmed.to_string(),
                 normalized_name: norm_name,
-                color,
+                color: safe_color,
                 created_at_ms: created_ms,
                 sort_order,
             });
@@ -771,6 +914,19 @@ fn perform_legacy_merge(
         }
     }
 
+    let import_id = uuid::Uuid::new_v4().to_string();
+    tx.execute(
+        "INSERT INTO legacy_imports(id, source_fingerprint, imported_at, source_path, status) VALUES(?1, ?2, ?3, ?4, 'completed')",
+        params![import_id, fingerprint, now_ms, source_path.to_string_lossy()],
+    )?;
+
+    {
+        let mut fk_stmt = tx.prepare("PRAGMA foreign_key_check;")?;
+        if fk_stmt.exists([])? {
+            anyhow::bail!("Foreign key check failed inside transaction during legacy merge");
+        }
+    }
+
     tx.commit()?;
 
     Ok(LegacyMergeReport {
@@ -781,6 +937,7 @@ fn perform_legacy_merge(
         links_read,
         links_imported,
         duplicate_clips_merged,
+        already_imported: false,
     })
 }
 
@@ -1069,8 +1226,25 @@ mod tests {
         assert!(shared.pinned);
         assert!(shared.copy_count >= 7);
 
-        // Verify foreign key check passes on merged database
+        // Verify category Work was imported and linked to shared clip
+        let categories = repo.list_categories().unwrap();
+        let work_cat = categories
+            .iter()
+            .find(|c| c.name == "Work")
+            .expect("category Work imported");
+        assert_eq!(work_cat.color, "#ff0000");
+
         let conn = Connection::open(&new_db).unwrap();
+        let category_link_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM clip_user_categories WHERE clip_id = ?1 AND category_id = ?2",
+                params![shared.id, work_cat.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(category_link_count, 1);
+
+        // Verify foreign key check passes on merged database
         let mut fk_stmt = conn.prepare("PRAGMA foreign_key_check;").unwrap();
         assert!(!fk_stmt.exists([]).unwrap());
     }
@@ -1083,11 +1257,41 @@ mod tests {
         let new_dir = data_home.join("kitsupin");
 
         let old_db = old_dir.join("pastily.sqlite3");
+        std::fs::create_dir_all(&old_dir).unwrap();
+
+        // Create corrupt old_db missing required clips table
+        {
+            let conn = Connection::open(&old_db).unwrap();
+            conn.execute_batch("CREATE TABLE invalid_table (id INT);").unwrap();
+        }
+
+        let new_db = new_dir.join("kitsupin.sqlite3");
+        create_current_kitsupin_db(&new_db, &[("c1_valid", "valid initial clip", false, 1)]);
+
+        let new_count_before = count_clips_safely(&new_db);
+
+        let res = migrate_pastily_to_kitsupin_at(data_home, None);
+        assert_eq!(res, LegacyMigrationResult::ConflictPreserved);
+
+        // Target database must remain untouched
+        assert_eq!(count_clips_safely(&new_db), new_count_before);
+        // Source database file must remain intact
+        assert!(old_db.exists());
+    }
+
+    #[test]
+    fn test_corrupted_category_color_fallback() {
+        let temp = TempDir::new().unwrap();
+        let data_home = temp.path();
+        let old_dir = data_home.join("pastily");
+        let new_dir = data_home.join("kitsupin");
+
+        let old_db = old_dir.join("pastily.sqlite3");
         create_real_pastily_v1_db(
             &old_db,
             &[(
                 "c1",
-                "corrupt test",
+                "color test item",
                 "",
                 "2023-01-01T00:00:00Z",
                 "2023-01-01T00:00:00Z",
@@ -1096,24 +1300,84 @@ mod tests {
             )],
         );
 
-        // Corrupt legacy DB table schema by dropping content column requirement or inserting NULL in non-nullable field
         {
             let conn = Connection::open(&old_db).unwrap();
-            conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-            conn.execute("INSERT INTO clips(id, content, normalized_content, content_hash, content_type, created_at, last_copied_at) VALUES('bad', NULL, '', '', 'Text', '', '')", []).unwrap_err();
-            // SQLite enforces NOT NULL
+            conn.execute(
+                "INSERT INTO user_categories(id, name, normalized_name, color, created_at, sort_order)
+                 VALUES('cat_bad', 'Hacked', 'hacked', 'red\" style=\"bad', '2023-01-01T00:00:00Z', 1)",
+                [],
+            )
+            .unwrap();
         }
 
         let new_db = new_dir.join("kitsupin.sqlite3");
-        create_current_kitsupin_db(&new_db, &[("c1_valid", "valid initial clip", false, 1)]);
+        create_current_kitsupin_db(&new_db, &[("c1_valid", "valid clip", false, 1)]);
 
-        // Break new_db by closing it and changing its permissions or forcing transaction error if possible
-        let new_count_before = count_clips_safely(&new_db);
-
-        // Run migration on intact old_db vs intact new_db -> should succeed
         let res = migrate_pastily_to_kitsupin_at(data_home, None);
         assert_eq!(res, LegacyMigrationResult::DatabasesMerged);
-        assert_ne!(count_clips_safely(&new_db), new_count_before);
+
+        let repo = crate::persistence::Repository::open(&new_db).unwrap();
+        let categories = repo.list_categories().unwrap();
+        let hacked = categories
+            .iter()
+            .find(|c| c.name == "Hacked")
+            .expect("category Hacked imported");
+        assert_eq!(hacked.color, "#6b7280");
+    }
+
+    #[test]
+    fn test_idempotent_merge_with_ledger() {
+        let temp = TempDir::new().unwrap();
+        let data_home = temp.path();
+        let old_dir = data_home.join("pastily");
+        let new_dir = data_home.join("kitsupin");
+
+        let old_db = old_dir.join("pastily.sqlite3");
+        create_real_pastily_v1_db(
+            &old_db,
+            &[(
+                "c1",
+                "shared content",
+                "",
+                "2023-01-01T10:00:00Z",
+                "2023-01-01T10:00:00Z",
+                3,
+                0,
+            )],
+        );
+
+        let new_db = new_dir.join("kitsupin.sqlite3");
+        create_current_kitsupin_db(&new_db, &[("c1_new", "shared content", false, 5)]);
+
+        let res1 = migrate_pastily_to_kitsupin_at(data_home, None);
+        assert_eq!(res1, LegacyMigrationResult::DatabasesMerged);
+
+        let repo = crate::persistence::Repository::open(&new_db).unwrap();
+        let clips1 = repo.list_clips(&crate::domain::ClipQuery::default()).unwrap();
+        let shared1 = clips1.iter().find(|c| c.preview.contains("shared content")).unwrap();
+        let copy_count_after_first_merge = shared1.copy_count;
+        assert_eq!(copy_count_after_first_merge, 8); // 5 + 3 = 8
+
+        // Re-create old_db with same content to simulate repeated launch before backup cleanup or duplicate run
+        create_real_pastily_v1_db(
+            &old_db,
+            &[(
+                "c1",
+                "shared content",
+                "",
+                "2023-01-01T10:00:00Z",
+                "2023-01-01T10:00:00Z",
+                3,
+                0,
+            )],
+        );
+
+        let res2 = migrate_pastily_to_kitsupin_at(data_home, None);
+        assert_eq!(res2, LegacyMigrationResult::DatabasesMerged);
+
+        let clips2 = repo.list_clips(&crate::domain::ClipQuery::default()).unwrap();
+        let shared2 = clips2.iter().find(|c| c.preview.contains("shared content")).unwrap();
+        assert_eq!(shared2.copy_count, 8); // Must stay 8, NOT increment to 11
     }
 
     #[test]
