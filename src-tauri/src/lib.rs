@@ -825,7 +825,12 @@ pub fn run() {
             let app_reconcile = app.handle().clone();
             let metadata_reconcile = metadata.clone();
             let reconcile_callback = Arc::new(move |_: browser_metadata::BrowserCopyEvent| {
-                metadata_reconcile.reconcile_pending(&repo_reconcile, Some(&app_reconcile));
+                metadata_reconcile.reconcile_pending(
+                    &repo_reconcile,
+                    Some(&|| {
+                        let _ = app_reconcile.emit("clips-changed", ());
+                    }),
+                );
             });
 
             if let Err(error) = browser_metadata::start_socket_server(

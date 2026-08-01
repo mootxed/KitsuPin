@@ -11,7 +11,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tauri::Emitter;
 use uuid::Uuid;
 
 pub const RECEIPT_MATCH_WINDOW_MS: i64 = 2000;
@@ -225,7 +224,7 @@ impl MetadataBuffer {
     pub fn reconcile_pending(
         &self,
         repo: &crate::persistence::Repository,
-        app: Option<&tauri::AppHandle>,
+        notify: Option<&dyn Fn()>,
     ) {
         while let Some((event, receipt)) = self.reserve_matching_pair(RECEIPT_MATCH_WINDOW_MS) {
             let receipt_id = receipt.receipt_id;
@@ -235,8 +234,8 @@ impl MetadataBuffer {
                 Ok(Some(clip_id)) => {
                     self.acknowledge_pair(event_id, receipt_id);
                     log::info!("Late reconciliation: metadata attached to clip {clip_id}");
-                    if let Some(app) = app {
-                        let _ = app.emit("clips-changed", ());
+                    if let Some(notify) = notify {
+                        notify();
                     }
                 }
                 Ok(None) => {
