@@ -5,15 +5,16 @@ const tauri = "__TAURI_INTERNALS__" in window;
 
 const now = Date.now();
 let demoClips: ClipSummary[] = [
-  { id: "sample-1", preview: "曖昧さを恐れず、まず小さく試してみる。", contentLength: 21, contentType: "Text", domain: "youtube.com", pageTitle: "Japanese listening practice — quiet morning", createdAt: now, lastCopiedAt: now - 180_000, copyCount: 3, pinned: true, categories: [] },
-  { id: "sample-2", preview: "https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging", contentLength: 76, contentType: "Links", domain: "developer.chrome.com", pageTitle: "Native messaging | Chrome for Developers", createdAt: now, lastCopiedAt: now - 3_600_000, copyCount: 1, pinned: false, categories: [] },
-  { id: "sample-3", preview: "A clipboard is most useful when it stays out of your way.", contentLength: 55, contentType: "Text", domain: null, pageTitle: null, createdAt: now, lastCopiedAt: now - 86_400_000, copyCount: 1, pinned: false, categories: [] }
+  { id: "sample-1", preview: "曖昧さを恐れず、まず小さく試してみる。", contentLength: 21, isTruncated: false, contentType: "Text", domain: "youtube.com", pageTitle: "Japanese listening practice — quiet morning", createdAt: now, lastCopiedAt: now - 180_000, copyCount: 3, pinned: true, categories: [] },
+  { id: "sample-2", preview: "https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging", contentLength: 76, isTruncated: false, contentType: "Links", domain: "developer.chrome.com", pageTitle: "Native messaging | Chrome for Developers", createdAt: now, lastCopiedAt: now - 3_600_000, copyCount: 1, pinned: false, categories: [] },
+  { id: "sample-3", preview: "A clipboard is most useful when it stays out of your way.", contentLength: 55, isTruncated: false, contentType: "Text", domain: null, pageTitle: null, createdAt: now, lastCopiedAt: now - 86_400_000, copyCount: 1, pinned: false, categories: [] }
 ];
 
 const mock: Bootstrap = { clips: demoClips, categories: [], settings: { paused: false, autostart: true, shortcut: "Super+V", retentionDays: 90, excludedApps: [] } };
 
 export const api = {
   bootstrap: (popup: boolean) => tauri ? invoke<Bootstrap>("bootstrap", { popup }) : Promise.resolve(mock),
+  consumeInvalidSettingsWarning: () => tauri ? invoke<boolean>("consume_invalid_settings_warning") : Promise.resolve(false),
   list: (query: ClipQuery) => tauri ? invoke<ClipSummary[]>("list_clips", { query }) : Promise.resolve(
     demoClips.filter(c => {
       if (query.search && !JSON.stringify(c).toLowerCase().includes(query.search.toLowerCase())) return false;

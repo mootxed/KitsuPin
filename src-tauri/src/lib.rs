@@ -15,6 +15,7 @@ use parking_lot::Mutex;
 use persistence::Repository;
 use serde::Serialize;
 use settings::{Settings, SettingsStore};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -37,7 +38,10 @@ struct AppState {
     paused: Arc<AtomicBool>,
     quitting: AtomicBool,
     pause_item: Mutex<Option<MenuItem<tauri::Wry>>>,
+    /// The shortcut currently registered at runtime, tracked for rollback.
+    registered_shortcut: Mutex<Option<String>>,
 }
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Bootstrap {
@@ -46,6 +50,7 @@ struct Bootstrap {
     settings: Settings,
     invalid_settings_warning: bool,
 }
+
 type CommandResult<T> = Result<T, String>;
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -67,14 +72,36 @@ fn bootstrap(state: tauri::State<AppState>, popup: bool) -> CommandResult<Bootst
         invalid_settings_warning: state.settings.has_invalid_warning(),
     })
 }
+
+/// Returns true if the invalid-settings warning should be shown, and clears the flag.
+/// Call once per window; subsequent calls return false.
+#[tauri::command]
+fn consume_invalid_settings_warning(state: tauri::State<AppState>) -> bool {
+    state.settings.consume_invalid_warning()
+}
+
 #[tauri::command]
 fn list_clips(state: tauri::State<AppState>, query: ClipQuery) -> CommandResult<Vec<ClipSummary>> {
     state.repo.list_clips(&query).map_err(err)
 }
+
 #[tauri::command]
 fn get_clip_content(state: tauri::State<AppState>, id: String) -> CommandResult<String> {
     state.repo.get_clip_content(&id).map_err(err)
 }
+
+/// Copy a clip to the system clipboard.
+///
+/// Operation order (safe):
+/// 1. Read clip content from DB.
+/// 2. Mark expected own-copy in guard.
+/// 3. Write to system clipboard.
+/// 4. Only on success: update copy stats in DB.
+/// 5. Emit clips-changed.
+/// 6. Hide popup (only if all steps succeeded).
+///
+/// If clipboard write fails → DB is NOT updated, popup stays open, error returned.
+/// If DB update fails after clipboard write → error logged, returned; popup stays open.
 #[tauri::command]
 fn copy_clip(
     app: AppHandle,
@@ -82,10 +109,23 @@ fn copy_clip(
     id: String,
     popup: Option<bool>,
 ) -> CommandResult<()> {
-    let now = Utc::now().timestamp_millis();
-    let content = state.repo.touch_clip(&id, now).map_err(err)?;
+    // Step 1: read content (does not mutate anything).
+    let content = state.repo.get_clip_content(&id).map_err(err)?;
+
+    // Steps 2+3: set clipboard (marks pending guard, commits on success, cancels on fail).
     clipboard::set_clipboard(&content, &state.guard, &state.clipboard).map_err(err)?;
+
+    // Step 4: update DB stats only after clipboard write succeeded.
+    let now = Utc::now().timestamp_millis();
+    if let Err(e) = state.repo.mark_clip_copied(&id, now) {
+        log::error!("copy_clip: clipboard set but DB update failed: {e}");
+        return Err(err(e));
+    }
+
+    // Step 5: notify UI.
     let _ = app.emit("clips-changed", ());
+
+    // Step 6: hide popup only on full success.
     if popup.unwrap_or(false) {
         if let Some(w) = app.get_webview_window("popup") {
             let _ = w.hide();
@@ -93,6 +133,7 @@ fn copy_clip(
     }
     Ok(())
 }
+
 #[tauri::command]
 fn delete_clip(app: AppHandle, state: tauri::State<AppState>, id: String) -> CommandResult<()> {
     let res = state.repo.delete_clip(&id).map_err(err);
@@ -101,6 +142,7 @@ fn delete_clip(app: AppHandle, state: tauri::State<AppState>, id: String) -> Com
     }
     res
 }
+
 #[tauri::command]
 fn set_pinned(
     app: AppHandle,
@@ -114,6 +156,7 @@ fn set_pinned(
     }
     res
 }
+
 #[tauri::command]
 fn clear_unpinned(app: AppHandle, state: tauri::State<AppState>) -> CommandResult<usize> {
     let res = state.repo.clear_unpinned().map_err(err);
@@ -122,6 +165,7 @@ fn clear_unpinned(app: AppHandle, state: tauri::State<AppState>) -> CommandResul
     }
     res
 }
+
 #[tauri::command]
 fn create_category(
     app: AppHandle,
@@ -139,6 +183,7 @@ fn create_category(
     }
     res
 }
+
 #[tauri::command]
 fn update_category(
     app: AppHandle,
@@ -153,12 +198,9 @@ fn update_category(
     }
     res
 }
+
 #[tauri::command]
-fn delete_category(
-    app: AppHandle,
-    state: tauri::State<AppState>,
-    id: String,
-) -> CommandResult<()> {
+fn delete_category(app: AppHandle, state: tauri::State<AppState>, id: String) -> CommandResult<()> {
     let res = state.repo.delete_category(&id).map_err(err);
     if res.is_ok() {
         let _ = app.emit("categories-changed", ());
@@ -166,6 +208,7 @@ fn delete_category(
     }
     res
 }
+
 #[tauri::command]
 fn assign_category(
     app: AppHandle,
@@ -182,6 +225,7 @@ fn assign_category(
     }
     res
 }
+
 #[tauri::command]
 fn unassign_category(
     app: AppHandle,
@@ -198,30 +242,88 @@ fn unassign_category(
     }
     res
 }
+
+/// Save settings with full rollback on partial failure.
+///
+/// Rollback order:
+/// 1. Validate new settings.
+/// 2. Register new shortcut (if changed).
+///    - On fail → return Err, old shortcut still active.
+/// 3. Unregister old shortcut.
+/// 4. Apply autostart (if changed).
+///    - On fail → re-register old shortcut, return Err.
+/// 5. Write settings file atomically.
+///    - On fail → rollback autostart, re-register old shortcut, return Err.
+/// 6. Update runtime state (paused flag, tray, etc.).
+/// 7. Emit settings-changed.
 #[tauri::command]
 fn save_settings(
     app: AppHandle,
     state: tauri::State<AppState>,
     settings: Settings,
 ) -> CommandResult<()> {
+    // Step 1: validate.
+    settings.validate().map_err(err)?;
+
     let previous = state.settings.get();
-    if previous.shortcut != settings.shortcut {
-        app.global_shortcut()
-            .unregister(previous.shortcut.as_str())
-            .map_err(err)?;
-        if let Err(error) = app.global_shortcut().register(settings.shortcut.as_str()) {
-            let _ = app.global_shortcut().register(previous.shortcut.as_str());
-            return Err(err(error));
+    let shortcut_changed = previous.shortcut != settings.shortcut;
+    let autostart_changed = previous.autostart != settings.autostart;
+
+    // Step 2: register new shortcut before doing anything else.
+    if shortcut_changed {
+        if let Err(e) = app.global_shortcut().register(settings.shortcut.as_str()) {
+            return Err(err(format!(
+                "Не удалось зарегистрировать горячую клавишу '{}': {e}",
+                settings.shortcut
+            )));
         }
     }
-    settings::set_autostart(settings.autostart).map_err(err)?;
+
+    // Step 3: unregister old shortcut (best-effort; log if fails).
+    if shortcut_changed {
+        let old_reg = state.registered_shortcut.lock().clone();
+        let old_key = old_reg.as_deref().unwrap_or(previous.shortcut.as_str());
+        if let Err(e) = app.global_shortcut().unregister(old_key) {
+            log::warn!("save_settings: could not unregister old shortcut '{old_key}': {e}");
+        }
+        *state.registered_shortcut.lock() = Some(settings.shortcut.clone());
+    }
+
+    // Step 4: apply autostart.
+    if autostart_changed {
+        if let Err(e) = settings::set_autostart(settings.autostart) {
+            // Rollback shortcut.
+            if shortcut_changed {
+                let _ = app.global_shortcut().unregister(settings.shortcut.as_str());
+                let _ = app.global_shortcut().register(previous.shortcut.as_str());
+                *state.registered_shortcut.lock() = Some(previous.shortcut.clone());
+            }
+            return Err(err(format!("Не удалось изменить автозапуск: {e}")));
+        }
+    }
+
+    // Step 5: write settings file atomically.
+    if let Err(e) = state.settings.save(settings.clone()) {
+        // Rollback autostart.
+        if autostart_changed {
+            let _ = settings::set_autostart(previous.autostart);
+        }
+        // Rollback shortcut.
+        if shortcut_changed {
+            let _ = app.global_shortcut().unregister(settings.shortcut.as_str());
+            let _ = app.global_shortcut().register(previous.shortcut.as_str());
+            *state.registered_shortcut.lock() = Some(previous.shortcut.clone());
+        }
+        return Err(err(format!("Не удалось сохранить настройки: {e}")));
+    }
+
+    // Step 6: update runtime state (these cannot meaningfully fail).
     state.paused.store(settings.paused, Ordering::Relaxed);
     update_pause_indicators(&app, settings.paused);
-    let res = state.settings.save(settings).map_err(err);
-    if res.is_ok() {
-        let _ = app.emit("settings-changed", ());
-    }
-    res
+
+    // Step 7: notify.
+    let _ = app.emit("settings-changed", ());
+    Ok(())
 }
 
 fn show_main(app: &AppHandle) {
@@ -231,6 +333,7 @@ fn show_main(app: &AppHandle) {
         let _ = w.set_focus();
     }
 }
+
 fn toggle_popup(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("popup") {
         if w.is_visible().unwrap_or(false) {
@@ -337,44 +440,89 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+// ── Single-instance: advisory file lock ──────────────────────────────────────
+
+fn instance_lock_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("kitsupin.lock")
+}
+
 fn single_instance_socket_path(data_dir: &Path) -> PathBuf {
     data_dir.join("app.sock")
 }
 
-fn handle_single_instance(data_dir: &Path) -> bool {
-    let socket_path = single_instance_socket_path(data_dir);
-    if let Ok(mut stream) = UnixStream::connect(&socket_path) {
-        let _ = stream.write_all(b"show_main\n");
-        let _ = stream.flush();
-        return true;
+/// Acquire an exclusive advisory file lock for single-instance enforcement.
+///
+/// Returns the open File that must be kept alive for the duration of the process.
+/// If the lock is already held by another process, returns None.
+fn try_acquire_instance_lock(data_dir: &Path) -> std::io::Result<Option<File>> {
+    use fs2::FileExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let lock_path = instance_lock_path(data_dir);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&lock_path)?;
+
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e),
     }
-    let _ = std::fs::remove_file(&socket_path);
+}
+
+/// Try to signal the existing instance to show its main window.
+/// Retries up to `retries` times with `delay_ms` between attempts.
+fn try_signal_existing(socket_path: &Path, retries: u32, delay_ms: u64) -> bool {
+    for attempt in 0..=retries {
+        if let Ok(mut stream) = UnixStream::connect(socket_path) {
+            let _ = stream.write_all(b"show_main\n");
+            let _ = stream.flush();
+            return true;
+        }
+        if attempt < retries {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+    }
     false
 }
 
 fn start_single_instance_listener(data_dir: &Path, app: AppHandle) {
     let socket_path = single_instance_socket_path(data_dir);
-    if let Ok(listener) = UnixListener::bind(&socket_path) {
-        let _ = std::fs::set_permissions(
-            &socket_path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o600),
-        );
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                if let Ok(stream) = stream {
-                    let mut reader = BufReader::new(stream);
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).is_ok() && line.trim() == "show_main" {
-                        show_main(&app);
+    // Remove stale socket from previous crash (lock is already held so we know we're primary).
+    if socket_path.exists() {
+        let _ = std::fs::remove_file(&socket_path);
+    }
+    match UnixListener::bind(&socket_path) {
+        Ok(listener) => {
+            let _ = std::fs::set_permissions(
+                &socket_path,
+                std::os::unix::fs::PermissionsExt::from_mode(0o600),
+            );
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if let Ok(stream) = stream {
+                        let mut reader = BufReader::new(stream);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_ok() && line.trim() == "show_main" {
+                            show_main(&app);
+                        }
+                        // Unknown commands are silently ignored for security.
                     }
                 }
-            }
-        });
+            });
+        }
+        Err(e) => {
+            log::error!("Single-instance listener: не удалось создать socket: {e}");
+        }
     }
 }
 
 pub fn run() {
     migration::migrate_pastily_to_kitsupin();
+
     let background = std::env::args().any(|value| value == "--background");
     let project = settings::project_dirs().expect("XDG directories");
     let data_dir = project.data_dir().to_path_buf();
@@ -384,16 +532,47 @@ pub fn run() {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700));
     }
-    if handle_single_instance(&data_dir) {
-        log::info!("Уже запущен другой экземпляр KitsuPin. Основное окно показано.");
-        return;
-    }
+
+    // ── Atomic single-instance check (BEFORE opening DB or starting threads) ──
+    let _lock_file = match try_acquire_instance_lock(&data_dir) {
+        Ok(Some(file)) => file,
+        Ok(None) => {
+            // Another instance holds the lock. Signal it and exit.
+            log::info!("KitsuPin уже запущен. Показываем главное окно.");
+            let socket_path = single_instance_socket_path(&data_dir);
+            if !try_signal_existing(&socket_path, 3, 100) {
+                log::warn!("Не удалось подключиться к socket существующего экземпляра.");
+            }
+            return;
+        }
+        Err(e) => {
+            log::error!("Не удалось создать lock-файл: {e}. Запуск без single-instance защиты.");
+            // Safety: open a placeholder file so the type is consistent.
+            // We do not hold a real lock, but we proceed anyway.
+            // This is a degraded mode — better than refusing to start.
+            match File::create(instance_lock_path(&data_dir)) {
+                Ok(f) => f,
+                Err(_) => {
+                    // Cannot even create a file — proceed without lock.
+                    // In practice this should not happen after create_dir_all succeeded.
+                    eprintln!("WARNING: KitsuPin running without single-instance lock");
+                    // We need a File value; use /dev/null as a harmless placeholder.
+                    File::open("/dev/null").expect("/dev/null")
+                }
+            }
+        }
+    };
+
+    // ── Open DB and start application (lock is held) ───────────────────────
     let repo = Arc::new(Repository::open(&data_dir.join("kitsupin.sqlite3")).expect("database"));
     let settings = SettingsStore::load(&data_dir).expect("settings");
     let paused = Arc::new(AtomicBool::new(settings.get().paused));
     let guard = Arc::new(OwnCopyGuard::default());
     let clipboard = Arc::new(ClipboardAccess::default());
     let metadata = Arc::new(MetadataBuffer::default());
+
+    let initial_shortcut = settings.get().shortcut.clone();
+
     let state = AppState {
         repo: repo.clone(),
         settings: settings.clone(),
@@ -402,7 +581,9 @@ pub fn run() {
         paused: paused.clone(),
         quitting: AtomicBool::new(false),
         pause_item: Mutex::new(None),
+        registered_shortcut: Mutex::new(Some(initial_shortcut)),
     };
+
     tauri::Builder::default()
         .plugin(
             tauri_plugin_log::Builder::new()
@@ -422,6 +603,7 @@ pub fn run() {
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             bootstrap,
+            consume_invalid_settings_warning,
             list_clips,
             get_clip_content,
             copy_clip,
@@ -449,20 +631,61 @@ pub fn run() {
             .visible(false)
             .resizable(false)
             .build()?;
+
             if let Err(error) = setup_tray(app) {
                 log::error!("KDE System Tray недоступен: {error}");
             }
+
             let shortcut = settings.get().shortcut;
             if let Err(e) = app.global_shortcut().register(shortcut.as_str()) {
                 log::error!("Горячая клавиша недоступна: {e}");
+                // Clear tracked shortcut so user can re-set it via settings.
+                *app.state::<AppState>().registered_shortcut.lock() = None;
             }
+
+            // Set up late-reconciliation callback: when Chrome metadata arrives via socket,
+            // try to attach it to a recently saved clipboard entry.
+            let repo_reconcile = repo.clone();
+            let app_reconcile = app.handle().clone();
+            let reconcile_callback = Arc::new(move |event: browser_metadata::BrowserCopyEvent| {
+                let now_ms = Utc::now().timestamp_millis();
+                match repo_reconcile.attach_metadata(
+                    &event.content_hash,
+                    event.content_length,
+                    &event.domain,
+                    if event.page_title.is_empty() {
+                        None
+                    } else {
+                        Some(&event.page_title)
+                    },
+                    now_ms,
+                ) {
+                    Ok(Some(id)) => {
+                        log::info!("Late reconciliation: metadata attached to clip {id}");
+                        let _ = app_reconcile.emit("clips-changed", ());
+                    }
+                    Ok(None) => {
+                        log::debug!(
+                            "Late reconciliation: no matching clip for hash {}",
+                            event.content_hash
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!("Late reconciliation error: {e}");
+                    }
+                }
+            });
+
             if let Err(error) = browser_metadata::start_socket_server(
                 browser_metadata::socket_path(&data_dir),
                 metadata.clone(),
+                reconcile_callback,
             ) {
                 log::error!("Native Messaging socket недоступен: {error}");
             }
+
             start_single_instance_listener(&data_dir, app.handle().clone());
+
             clipboard::start(
                 app.handle().clone(),
                 repo.clone(),
@@ -472,6 +695,7 @@ pub fn run() {
                 paused.clone(),
             );
             jobs::start(repo.clone(), settings.clone());
+
             if settings.get().autostart {
                 let _ = settings::set_autostart(true);
             }

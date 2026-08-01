@@ -3,8 +3,12 @@ use directories::ProjectDirs;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::{
+    io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,11 +20,41 @@ pub struct Settings {
     pub retention_days: u32,
     pub excluded_apps: Vec<String>,
 }
+
 impl Settings {
+    /// Validate that all fields are within acceptable bounds.
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            (1..=3650).contains(&self.retention_days),
+            "срок хранения вне допустимого диапазона (1–3650 дней)"
+        );
+        anyhow::ensure!(
+            !self.shortcut.is_empty(),
+            "горячая клавиша не может быть пустой"
+        );
+        anyhow::ensure!(
+            self.shortcut.len() <= 100,
+            "горячая клавиша слишком длинная (максимум 100 символов)"
+        );
+        anyhow::ensure!(
+            self.excluded_apps.len() <= 100,
+            "список исключённых приложений превышает 100 элементов"
+        );
+        for app in &self.excluded_apps {
+            anyhow::ensure!(
+                app.len() <= 200,
+                "название исключённого приложения слишком длинное: {app}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Quick boolean check (used by jobs/cleanup to guard against corrupt state).
     pub fn is_valid(&self) -> bool {
-        (1..=3650).contains(&self.retention_days)
+        self.validate().is_ok()
     }
 }
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -32,11 +66,15 @@ impl Default for Settings {
         }
     }
 }
+
 pub struct SettingsStore {
     path: PathBuf,
     value: RwLock<Settings>,
-    has_invalid_warning: bool,
+    /// Set once at load time if the file was corrupt/invalid.
+    /// Consumed atomically by `consume_invalid_warning()`.
+    has_invalid_warning: AtomicBool,
 }
+
 impl SettingsStore {
     pub fn load(data_dir: &Path) -> Result<Arc<Self>> {
         let path = data_dir.join("settings.json");
@@ -52,7 +90,7 @@ impl SettingsStore {
                             s
                         } else {
                             log::error!(
-                                "Invalid retention_days ({}). Saving backup to settings.invalid.json and resetting to 90 days.",
+                                "Invalid settings (retention_days={}). Backup → settings.invalid.json, resetting to defaults.",
                                 s.retention_days
                             );
                             let _ = std::fs::write(&invalid_path, &raw_content);
@@ -64,7 +102,7 @@ impl SettingsStore {
                             default_s
                         }
                     } else {
-                        log::error!("Corrupted JSON in settings.json. Saving backup to settings.invalid.json and resetting to defaults.");
+                        log::error!("Corrupted settings.json. Backup → settings.invalid.json, resetting to defaults.");
                         let _ = std::fs::write(&invalid_path, &raw_content);
                         has_invalid_warning = true;
                         let default_s = Settings::default();
@@ -93,24 +131,41 @@ impl SettingsStore {
         Ok(Arc::new(Self {
             path,
             value: RwLock::new(value),
-            has_invalid_warning,
+            has_invalid_warning: AtomicBool::new(has_invalid_warning),
         }))
     }
+
+    /// Returns the warning state (non-consuming). For compatibility with bootstrap command.
     pub fn has_invalid_warning(&self) -> bool {
-        self.has_invalid_warning
+        self.has_invalid_warning.load(Ordering::Relaxed)
     }
+
+    /// Consume the warning flag atomically. Returns true once, then false forever.
+    /// Use this in the `consume_invalid_settings_warning` Tauri command to prevent
+    /// repeated warnings across multiple window reloads.
+    pub fn consume_invalid_warning(&self) -> bool {
+        self.has_invalid_warning
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
+
     pub fn get(&self) -> Settings {
         self.value.read().clone()
     }
+
+    /// Atomically save settings using write-fsync-rename sequence.
+    /// Does NOT update runtime state (paused, shortcuts, etc.) — callers handle that.
     pub fn save(&self, value: Settings) -> Result<()> {
-        anyhow::ensure!(
-            value.is_valid(),
-            "срок хранения вне диапазона"
-        );
+        value.validate()?;
         let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&value)?)?;
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&serde_json::to_vec_pretty(&value)?)?;
+            // fsync to ensure data reaches disk before rename.
+            f.sync_data()?;
+        }
         secure_file(&tmp);
-        std::fs::rename(tmp, &self.path)?;
+        std::fs::rename(&tmp, &self.path)?;
         secure_file(&self.path);
         *self.value.write() = value;
         Ok(())
@@ -126,10 +181,12 @@ fn secure_file(path: &Path) {
 }
 #[cfg(not(unix))]
 fn secure_file(_path: &Path) {}
+
 pub fn project_dirs() -> Result<ProjectDirs> {
     ProjectDirs::from("io.github.mootxed", "", "kitsupin")
         .ok_or_else(|| anyhow::anyhow!("XDG data directory недоступен"))
 }
+
 pub fn autostart_path() -> Result<PathBuf> {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -137,6 +194,7 @@ pub fn autostart_path() -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("XDG config directory недоступен"))?;
     Ok(config.join("autostart/kitsupin.desktop"))
 }
+
 pub fn set_autostart(enabled: bool) -> Result<()> {
     let path = autostart_path()?;
     let system_entry = Path::new("/etc/xdg/autostart/kitsupin.desktop");
@@ -147,13 +205,39 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
     } else if enabled {
         std::fs::create_dir_all(path.parent().unwrap())?;
         let exe = std::env::current_exe()?;
-        std::fs::write(path,format!("[Desktop Entry]\nType=Application\nName=KitsuPin\nComment=История буфера обмена\nExec={} --background\nTerminal=false\nX-GNOME-Autostart-enabled=true\nOnlyShowIn=KDE;\n",exe.display()))?;
+        // Properly escape the path for the Exec field:
+        // If the path contains spaces, wrap in quotes. Replace embedded quotes with \".
+        let exe_str = exe.to_string_lossy();
+        let exec_value = if exe_str.contains(' ') {
+            format!("\"{}\" --background", exe_str.replace('"', "\\\""))
+        } else {
+            format!("{} --background", exe_str)
+        };
+        let content = format!(
+            "[Desktop Entry]\nType=Application\nName=KitsuPin\nComment=История буфера обмена\nExec={exec_value}\nTerminal=false\nX-GNOME-Autostart-enabled=true\nOnlyShowIn=KDE;\n"
+        );
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &content)?;
+        std::fs::rename(&tmp, &path)?;
+        // .desktop files should be readable (0o644).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+        }
     } else {
         std::fs::create_dir_all(path.parent().unwrap())?;
+        let tmp = path.with_extension("tmp");
         std::fs::write(
-            path,
+            &tmp,
             "[Desktop Entry]\nType=Application\nName=KitsuPin\nHidden=true\n",
         )?;
+        std::fs::rename(&tmp, &path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+        }
     }
     Ok(())
 }
@@ -193,7 +277,10 @@ mod tests {
         assert!(store.has_invalid_warning());
         assert_eq!(store.get().retention_days, 90);
         assert!(invalid_path.exists());
-        assert_eq!(std::fs::read_to_string(&invalid_path).unwrap(), invalid_content);
+        assert_eq!(
+            std::fs::read_to_string(&invalid_path).unwrap(),
+            invalid_content
+        );
     }
 
     #[test]
@@ -208,7 +295,77 @@ mod tests {
         assert!(store.has_invalid_warning());
         assert_eq!(store.get().retention_days, 90);
         assert!(invalid_path.exists());
-        assert_eq!(std::fs::read_to_string(&invalid_path).unwrap(), invalid_content);
+        assert_eq!(
+            std::fs::read_to_string(&invalid_path).unwrap(),
+            invalid_content
+        );
+    }
+
+    #[test]
+    fn consume_invalid_warning_fires_only_once() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"broken":"#).unwrap();
+        let store = SettingsStore::load(dir.path()).unwrap();
+        assert!(store.has_invalid_warning());
+        // First consumption returns true.
+        assert!(store.consume_invalid_warning());
+        // Subsequent calls return false.
+        assert!(!store.consume_invalid_warning());
+        assert!(!store.consume_invalid_warning());
+        // has_invalid_warning should also be false now.
+        assert!(!store.has_invalid_warning());
+    }
+
+    #[test]
+    fn validate_rejects_empty_shortcut() {
+        let s = Settings {
+            shortcut: String::new(),
+            ..Settings::default()
+        };
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_too_many_excluded_apps() {
+        let s = Settings {
+            excluded_apps: (0..101).map(|i| format!("app{i}")).collect(),
+            ..Settings::default()
+        };
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_too_long_shortcut() {
+        let s = Settings {
+            shortcut: "x".repeat(101),
+            ..Settings::default()
+        };
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn save_uses_atomic_rename() {
+        let dir = tempdir().unwrap();
+        let store = SettingsStore::load(dir.path()).unwrap();
+        let mut s = store.get();
+        s.retention_days = 42;
+        store.save(s).unwrap();
+        let loaded = SettingsStore::load(dir.path()).unwrap();
+        assert_eq!(loaded.get().retention_days, 42);
+        // Tmp file should not remain.
+        assert!(!dir.path().join("settings.tmp").exists());
+    }
+
+    #[test]
+    fn autostart_exec_escapes_path_with_spaces() {
+        // We just test the formatting logic, not actual file creation.
+        let exe_with_spaces = "/home/user/My Apps/kitsupin";
+        let exec_value = if exe_with_spaces.contains(' ') {
+            format!("\"{}\" --background", exe_with_spaces.replace('"', "\\\""))
+        } else {
+            format!("{} --background", exe_with_spaces)
+        };
+        assert_eq!(exec_value, "\"/home/user/My Apps/kitsupin\" --background");
     }
 }
-

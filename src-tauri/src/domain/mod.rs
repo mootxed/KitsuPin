@@ -24,6 +24,8 @@ pub struct ClipSummary {
     pub id: String,
     pub preview: String,
     pub content_length: usize,
+    /// True when preview does not contain the full content (content_length > preview chars).
+    pub is_truncated: bool,
     pub content_type: ContentType,
     pub domain: Option<String>,
     pub page_title: Option<String>,

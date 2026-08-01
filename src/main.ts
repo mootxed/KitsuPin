@@ -34,10 +34,51 @@ const state: {
   hasMore: false,
 };
 
+/** Tracks whether the invalid-settings warning has already been shown this session. */
+let invalidWarningConsumed = false;
+
 const app = document.querySelector<HTMLElement>("#app")!;
 const esc = (value: string) =>
   value.replace(/[&<>'"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[c]!));
 const tag = (text: string, className = "", style = "") => `<span class="tag ${className}" ${style}>${esc(text)}</span>`;
+
+// ── Toast notifications ───────────────────────────────────────────────────────
+
+let toastTimer = 0;
+function showToast(message: string, type: "error" | "info" = "error") {
+  let container = document.querySelector<HTMLElement>("#toast-container");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "toast-container";
+    container.setAttribute("aria-live", "assertive");
+    container.style.cssText =
+      "position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column;gap:8px;max-width:360px;";
+    document.body.appendChild(container);
+  }
+  const toast = document.createElement("div");
+  toast.className = `toast toast-${type}`;
+  toast.textContent = message;
+  toast.style.cssText =
+    `padding:10px 16px;border-radius:8px;font-size:13px;line-height:1.4;pointer-events:auto;` +
+    (type === "error"
+      ? "background:#b91c1c;color:#fff;"
+      : "background:#1e293b;color:#e2e8f0;");
+  container.appendChild(toast);
+  clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => {
+    toast.remove();
+  }, 4000);
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
+/** Returns true if the event target is an interactive element that should receive
+ *  keyboard events exclusively (button, input, select, textarea, [role=button]).
+ *  Use to prevent card-level Enter handler from firing when focus is on a control. */
+function isInteractiveTarget(el: EventTarget | null): boolean {
+  if (!(el instanceof HTMLElement)) return false;
+  return !!el.closest('button, input, select, textarea, [role="button"], a');
+}
 
 function query(): ClipQuery {
   return {
@@ -56,6 +97,8 @@ async function refresh() {
   renderFilters();
   renderCards();
 }
+
+// ── Filters ───────────────────────────────────────────────────────────────────
 
 function filtersMarkup(): string {
   const types: ContentType[] = ["Text", "Links", "Email", "Numbers"];
@@ -103,7 +146,7 @@ function bindFilters(root: HTMLElement) {
     el.ondrop = (e) => {
       e.preventDefault();
       const id = e.dataTransfer?.getData("text/kitsupin");
-      if (id) api.assign(id, el.dataset.category!).then(reload);
+      if (id) api.assign(id, el.dataset.category!).then(reload).catch(() => showToast("Не удалось назначить категорию"));
     };
   });
   root.querySelectorAll<HTMLElement>("[data-domain]").forEach(
@@ -124,8 +167,11 @@ function bindFilters(root: HTMLElement) {
   root.querySelector("[data-action=new-category]")?.addEventListener("click", showCategoryModal);
 }
 
+// ── Shell ─────────────────────────────────────────────────────────────────────
+
 function renderShell() {
   app.className = popup ? "popup-shell" : "main-shell";
+  // No arguments — no duplicate filters-container ID.
   app.innerHTML = popup ? popupShell() : mainWindowShell();
   bindShell();
   hydrateIcons(app);
@@ -147,6 +193,8 @@ function bindShell() {
   document.querySelector("[data-action=settings]")?.addEventListener("click", showSettings);
 }
 
+// ── Card rendering ────────────────────────────────────────────────────────────
+
 function clipCard(c: ClipSummary, index: number) {
   const categories = c.categories
     .map(
@@ -156,7 +204,13 @@ function clipCard(c: ClipSummary, index: number) {
         }</button>`
     )
     .join("");
-  const isTruncated = c.contentLength > c.preview.length;
+  // 6.3: use backend is_truncated flag (not JS string.length comparison).
+  const isTruncated = c.isTruncated;
+  // 6.1: details button only in main window (no #modal-root in popup).
+  const detailsButton =
+    isTruncated && !popup
+      ? `<button data-action="details" aria-label="Просмотреть полностью" title="Просмотреть полностью"><i data-lucide="eye"></i></button>`
+      : "";
   return `<article class="clip-card type-edge-${c.contentType.toLowerCase()} ${
     popup && index === state.selected ? "selected" : ""
   }" tabindex="0" data-clip="${c.id}" draggable="${!popup}" aria-label="Скопировать фрагмент"><div class="card-meta">${tag(
@@ -166,9 +220,7 @@ function clipCard(c: ClipSummary, index: number) {
     c.lastCopiedAt
   )}</time></div><p class="preview">${esc(c.preview)}${isTruncated ? "…" : ""}</p>${c.pageTitle ? `<p class="page-title">${esc(c.pageTitle)}</p>` : ""}<div class="card-foot"><span>${
     c.copyCount > 1 ? `скопировано ${c.copyCount} раза` : "одна копия"
-  }${isTruncated ? ` · ${c.contentLength} симв.` : ""}</span><div class="card-actions">${
-    isTruncated ? `<button data-action="details" aria-label="Просмотреть полностью" title="Просмотреть полностью"><i data-lucide="eye"></i></button>` : ""
-  }${
+  }${isTruncated ? ` · ${c.contentLength} симв.` : ""}</span><div class="card-actions">${detailsButton}${
     popup
       ? ""
       : `<button data-action="pin" aria-label="${c.pinned ? "Открепить" : "Закрепить"}"><i data-lucide="${
@@ -221,7 +273,7 @@ function renderCards() {
     root.innerHTML =
       groups()
         .filter(([, clips]) => clips.length)
-        .map(([name, clips]) => `<section class="clip-group"><h3>${esc(name)}</h3><div class="clip-grid">${clips.map((c, i) => clipCard(c, i)).join("")}</div></section>`)
+        .map(([name, clips]) => `<section class="clip-group">${name ? `<h3>${esc(name)}</h3>` : ""}<div class="clip-grid">${clips.map((c, i) => clipCard(c, i)).join("")}</div></section>`)
         .join("") + `${state.hasMore ? '<button class="load-more" data-load-more>Показать ещё</button>' : ""}`;
   }
   bindCards(root);
@@ -239,30 +291,84 @@ async function loadMore() {
 function bindCards(root: HTMLElement) {
   root.querySelectorAll<HTMLElement>("[data-clip]").forEach((card) => {
     const clip = state.clips.find((c) => c.id === card.dataset.clip)!;
+
     card.onclick = async (e) => {
-      if ((e.target as HTMLElement).closest("button")) return;
-      let content: string | undefined;
-      if (!isTauri) {
-        content = await api.getClipContent(clip.id);
-      }
-      api.copy(clip.id, popup, content);
-    };
-    card.onkeydown = async (e) => {
-      if (e.key === "Enter") {
+      // 6.2: ignore clicks on interactive child elements.
+      if (isInteractiveTarget(e.target)) return;
+      try {
         let content: string | undefined;
         if (!isTauri) {
           content = await api.getClipContent(clip.id);
         }
-        api.copy(clip.id, popup, content);
+        await api.copy(clip.id, popup, content);
+      } catch {
+        showToast("Не удалось скопировать");
       }
     };
+
+    card.onkeydown = async (e) => {
+      if (e.key === "Enter") {
+        // 6.2: ignore Enter when focus is on an interactive element within the card.
+        if (isInteractiveTarget(e.target)) return;
+        try {
+          let content: string | undefined;
+          if (!isTauri) {
+            content = await api.getClipContent(clip.id);
+          }
+          await api.copy(clip.id, popup, content);
+        } catch {
+          showToast("Не удалось скопировать");
+        }
+      }
+    };
+
     card.ondragstart = (e) => e.dataTransfer?.setData("text/kitsupin", clip.id);
-    card.querySelector<HTMLElement>("[data-action=details]")?.addEventListener("click", () => showClipDetailsModal(clip.id));
-    card.querySelector<HTMLElement>("[data-action=pin]")?.addEventListener("click", () => api.pin(clip.id, !clip.pinned).then(reload));
-    card.querySelector<HTMLElement>("[data-action=delete]")?.addEventListener("click", () => api.remove(clip.id).then(reload));
-    card.querySelectorAll<HTMLElement>("[data-unassign]").forEach((x) => (x.onclick = () => api.unassign(clip.id, x.dataset.unassign!).then(reload)));
+
+    card.querySelector<HTMLElement>("[data-action=details]")?.addEventListener("click", () =>
+      showClipDetailsModal(clip.id)
+    );
+
+    card.querySelector<HTMLElement>("[data-action=pin]")?.addEventListener("click", async () => {
+      try {
+        await api.pin(clip.id, !clip.pinned);
+        await reload();
+      } catch {
+        showToast(clip.pinned ? "Не удалось открепить" : "Не удалось закрепить");
+      }
+    });
+
+    // 6.7: confirm before deleting a pinned clip.
+    card.querySelector<HTMLElement>("[data-action=delete]")?.addEventListener("click", async () => {
+      if (clip.pinned) {
+        const confirmed = await confirmModal(
+          "Удалить закреплённую карточку?",
+          "Карточка закреплена. Удалить её из истории?"
+        );
+        if (!confirmed) return;
+      }
+      try {
+        await api.remove(clip.id);
+        await reload();
+      } catch {
+        showToast("Не удалось удалить");
+      }
+    });
+
+    card.querySelectorAll<HTMLElement>("[data-unassign]").forEach(
+      (x) =>
+        (x.onclick = async () => {
+          try {
+            await api.unassign(clip.id, x.dataset.unassign!);
+            await reload();
+          } catch {
+            showToast("Не удалось убрать категорию");
+          }
+        })
+    );
   });
 }
+
+// ── Modals ────────────────────────────────────────────────────────────────────
 
 function modal(title: string, body: string): HTMLElement | null {
   const root = document.querySelector<HTMLElement>("#modal-root");
@@ -271,6 +377,19 @@ function modal(title: string, body: string): HTMLElement | null {
   root.querySelector("[data-close]")?.addEventListener("click", () => (root.innerHTML = ""));
   hydrateIcons(root);
   return root;
+}
+
+/** Show a confirmation dialog using our own modal system.
+ *  Returns a promise that resolves to true (confirmed) or false (cancelled). */
+function confirmModal(title: string, message: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const root = document.querySelector<HTMLElement>("#modal-root");
+    if (!root) { resolve(false); return; }
+    root.innerHTML = `<div class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true"><header><h2>${esc(title)}</h2></header><p style="padding:12px 0">${esc(message)}</p><div class="modal-actions" style="display:flex;gap:8px;justify-content:flex-end"><button data-cancel>Отмена</button><button class="danger" data-confirm>Удалить</button></div></section></div>`;
+    hydrateIcons(root);
+    root.querySelector("[data-cancel]")?.addEventListener("click", () => { root.innerHTML = ""; resolve(false); });
+    root.querySelector("[data-confirm]")?.addEventListener("click", () => { root.innerHTML = ""; resolve(true); });
+  });
 }
 
 async function showClipDetailsModal(clipId: string) {
@@ -284,9 +403,13 @@ async function showClipDetailsModal(clipId: string) {
     }</div><pre class="clip-details-content">${esc(content)}</pre><div class="modal-actions" style="margin-top:16px;display:flex;justify-content:flex-end;"><button class="primary" data-action="copy-details">Скопировать в буфер</button></div></div>`
   );
   if (!root) return;
-  root.querySelector("[data-action=copy-details]")?.addEventListener("click", () => {
-    api.copy(clipId, popup, content);
-    root.innerHTML = "";
+  root.querySelector("[data-action=copy-details]")?.addEventListener("click", async () => {
+    try {
+      await api.copy(clipId, popup, content);
+      root.innerHTML = "";
+    } catch {
+      showToast("Не удалось скопировать");
+    }
   });
 }
 
@@ -311,25 +434,37 @@ function showCategoryModal() {
   root.querySelector<HTMLFormElement>("#category-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target as HTMLFormElement);
-    await api.createCategory(String(fd.get("name")), String(fd.get("color")));
-    root.innerHTML = "";
-    await reload();
+    try {
+      await api.createCategory(String(fd.get("name")), String(fd.get("color")));
+      root.innerHTML = "";
+      await reload();
+    } catch {
+      showToast("Не удалось создать категорию");
+    }
   });
   root.querySelectorAll<HTMLFormElement>("[data-edit]").forEach((form) =>
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const fd = new FormData(form);
-      await api.updateCategory(form.dataset.edit!, String(fd.get("name")), String(fd.get("color")));
-      root.innerHTML = "";
-      await reload();
+      try {
+        await api.updateCategory(form.dataset.edit!, String(fd.get("name")), String(fd.get("color")));
+        root.innerHTML = "";
+        await reload();
+      } catch {
+        showToast("Не удалось сохранить категорию");
+      }
     })
   );
   root.querySelectorAll<HTMLElement>("[data-delete]").forEach(
     (button) =>
       (button.onclick = async () => {
-        await api.deleteCategory(button.dataset.delete!);
-        root.innerHTML = "";
-        await reload();
+        try {
+          await api.deleteCategory(button.dataset.delete!);
+          root.innerHTML = "";
+          await reload();
+        } catch {
+          showToast("Не удалось удалить категорию");
+        }
       })
   );
 }
@@ -350,7 +485,24 @@ function showSettings() {
     }"/></label><div class="notice">Исключение приложений подготовлено архитектурно, но отключено в MVP: X11 не сообщает надёжно источник Clipboard во всех случаях.</div><button class="primary" type="submit">Сохранить</button><button class="danger" type="button" data-clear>Очистить незакреплённую историю</button></form>`
   );
   if (!root) return;
-  root.querySelector("[data-clear]")?.addEventListener("click", () => api.clear().then(reload));
+
+  // 6.7: confirm before clearing all history.
+  root.querySelector("[data-clear]")?.addEventListener("click", async () => {
+    const confirmed = await confirmModal(
+      "Очистить историю?",
+      "Удалить всю незакреплённую историю? Это действие нельзя отменить."
+    );
+    if (confirmed) {
+      try {
+        await api.clear();
+        await reload();
+        root.innerHTML = "";
+      } catch {
+        showToast("Не удалось очистить историю");
+      }
+    }
+  });
+
   root.querySelector("form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target as HTMLFormElement);
@@ -361,11 +513,17 @@ function showSettings() {
       shortcut: String(fd.get("shortcut")),
       retentionDays: Number(fd.get("retention")),
     };
-    await api.saveSettings(next);
-    state.settings = next;
-    root.innerHTML = "";
+    try {
+      await api.saveSettings(next);
+      state.settings = next;
+      root.innerHTML = "";
+    } catch (err) {
+      showToast(typeof err === "string" ? err : "Не удалось сохранить настройки");
+    }
   });
 }
+
+// ── Reload / bootstrap ────────────────────────────────────────────────────────
 
 async function reload() {
   const data = await api.bootstrap(popup);
@@ -375,15 +533,24 @@ async function reload() {
   state.hasMore = !popup && state.clips.length === 60;
   renderFilters();
   renderCards();
-  if (data.invalidSettingsWarning && !popup) {
-    setTimeout(() => {
-      modal(
-        "Предупреждение",
-        `<div class="notice" style="border-left-color:var(--coral);background:#fae2dc;color:#92463a;padding:12px;font-size:12px;line-height:1.5;">Файл настроек (settings.json) был повреждён или содержал недопустимые значения. Настройки были сброшены до безопасных значений (90 дней), а исходный файл сохранён как <b>settings.invalid.json</b>.</div>`
-      );
-    }, 100);
+
+  // 6.4: show invalid-settings warning only once per session (not on each reload).
+  // Use consume_invalid_settings_warning to clear the flag on the backend.
+  if (!invalidWarningConsumed && !popup) {
+    const shouldWarn = await api.consumeInvalidSettingsWarning();
+    if (shouldWarn) {
+      invalidWarningConsumed = true;
+      setTimeout(() => {
+        modal(
+          "Предупреждение",
+          `<div class="notice" style="border-left-color:var(--coral);background:#fae2dc;color:#92463a;padding:12px;font-size:12px;line-height:1.5;">Файл настроек (settings.json) был повреждён или содержал недопустимые значения. Настройки были сброшены до безопасных значений (90 дней), а исходный файл сохранён как <b>settings.invalid.json</b>.</div>`
+        );
+      }, 100);
+    }
   }
 }
+
+// ── Keyboard navigation ───────────────────────────────────────────────────────
 
 document.addEventListener("keydown", (e) => {
   if (!popup) return;
@@ -399,13 +566,23 @@ document.addEventListener("keydown", (e) => {
     renderCards();
   } else if (e.key === "Enter" && document.activeElement?.id === "search" && state.clips[state.selected]) {
     const clip = state.clips[state.selected]!;
-    if (isTauri) {
-      api.copy(clip.id, true);
-    } else {
-      api.getClipContent(clip.id).then((content) => api.copy(clip.id, true, content));
-    }
+    const doIt = async () => {
+      try {
+        if (isTauri) {
+          await api.copy(clip.id, true);
+        } else {
+          const content = await api.getClipContent(clip.id);
+          await api.copy(clip.id, true, content);
+        }
+      } catch {
+        showToast("Не удалось скопировать");
+      }
+    };
+    doIt();
   }
 });
+
+// ── Init ──────────────────────────────────────────────────────────────────────
 
 renderShell();
 reload();

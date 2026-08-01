@@ -6,3 +6,5 @@ pub mod persistence;
 pub mod browser_metadata;
 #[path = "native_host.rs"]
 pub mod native_host;
+#[path = "settings/mod.rs"]
+pub mod settings;

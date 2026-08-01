@@ -1,4 +1,4 @@
-export function mainWindowShell(filters: string = '<div id="filters-container"></div>'): string {
+export function mainWindowShell(): string {
   return `<div class="top-wash"></div>
     <header class="masthead">
       <div class="brand"><div class="brand-mark">K</div><div><h1>KitsuPin</h1><p>ваши мысли, под рукой</p></div></div>
@@ -10,7 +10,7 @@ export function mainWindowShell(filters: string = '<div id="filters-container"><
         <div><p class="eyebrow">БУФЕР ОБМЕНА</p><h2>Недавние фрагменты</h2></div>
         <div class="group-control"><label for="grouping">Группировать по</label><select id="grouping"><option value="none">Без группировки</option><option value="domain">Домену</option><option value="category">Категории</option><option value="type">Системному типу</option></select></div>
       </div>
-      <div id="filters-container">${filters}</div>
+      <div id="filters-container"></div>
       <section id="cards" class="card-board" aria-live="polite"></section>
     </main>
     <div id="modal-root"></div>`;

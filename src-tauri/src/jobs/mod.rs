@@ -11,7 +11,10 @@ pub fn start(repo: Arc<Repository>, settings: Arc<SettingsStore>) {
             );
             return;
         }
-        match repo.cleanup(current_settings.retention_days, Utc::now().timestamp_millis()) {
+        match repo.cleanup(
+            current_settings.retention_days,
+            Utc::now().timestamp_millis(),
+        ) {
             Ok(n) if n > 0 => log::info!("Удалено устаревших карточек: {n}"),
             Err(e) => log::error!("Ошибка очистки: {e}"),
             _ => {}

@@ -100,4 +100,3 @@ mod tests {
         assert!(!guard.should_suppress("hello"));
     }
 }
-
