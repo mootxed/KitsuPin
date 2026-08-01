@@ -10,7 +10,7 @@ if [ -d "$OLD_DIR" ] && [ ! -L "$OLD_DIR" ]; then
     echo "Cleaning legacy directory $OLD_DIR from previous installation..."
     rm -rf "$OLD_DIR/chrome-extension"
     rm -rf "$OLD_DIR/scripts"
-    rmdir "$OLD_DIR" 2>/dev/null || rm -rf "$OLD_DIR"
+    rmdir "$OLD_DIR" 2>/dev/null || true
 fi
 
 exit 0

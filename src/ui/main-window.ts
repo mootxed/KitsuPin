@@ -110,7 +110,7 @@ export function mainWindowShell(): string {
           </svg>
           <h1>KitsuPin</h1>
           <p>Локальная история буфера обмена для KDE Plasma и X11.</p>
-          <div class="kbd" style="display:inline-block">Версия 0.1.0 · Tauri 2</div>
+          <div class="kbd" style="display:inline-block">Версия 0.1.1 · Tauri 2</div>
           <p>Данные хранятся только на этом устройстве.<br>Без аккаунтов, облака и телеметрии.</p>
         </div>
       </main>

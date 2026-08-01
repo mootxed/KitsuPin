@@ -17,9 +17,9 @@
   --warning: oklch(66% 0.14 82);
   --danger: oklch(57% 0.19 25);
   --shadow: oklch(20% 0.02 45 / .12);
-  --font-display: "Noto Sans", "Segoe UI", system-ui, sans-serif;
-  --font-body: "Noto Sans", "Segoe UI", system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", "Noto Sans Mono", monospace;
+  --font-display: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --font-body: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
 
   /* Legacy compat aliases for JS-generated toasts/modals */
   --coral: var(--danger);

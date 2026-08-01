@@ -110,7 +110,7 @@ function filtersMarkup(): string {
     ...state.categories.map((c) => `<button class="chip user-chip ${state.category === c.id ? "active" : ""}" data-category="${c.id}" style="--tag:${c.color}">${esc(c.name)}</button>`),
     ...domains.map((d) => `<button class="chip ${state.domain === d ? "active" : ""}" data-domain="${esc(d)}">${esc(d)}</button>`),
     `<span class="spacer"></span>`,
-    popup ? "" : `<select class="grouping-select" id="grouping" aria-label="Группировка"><option value="none">Без группировки</option><option value="domain">По домену</option><option value="category">По категории</option><option value="type">По типу</option></select>`,
+    popup ? "" : `<select class="grouping-select" id="grouping" aria-label="Группировка"><option value="none" ${state.grouping === "none" ? "selected" : ""}>Без группировки</option><option value="domain" ${state.grouping === "domain" ? "selected" : ""}>По домену</option><option value="category" ${state.grouping === "category" ? "selected" : ""}>По категории</option><option value="type" ${state.grouping === "type" ? "selected" : ""}>По типу</option></select>`,
   ].join("");
 }
 
@@ -118,6 +118,8 @@ function renderFilters() {
   const root = document.querySelector<HTMLElement>("#filters-container");
   if (!root) return;
   root.innerHTML = filtersMarkup();
+  const select = root.querySelector<HTMLSelectElement>("#grouping");
+  if (select) select.value = state.grouping;
   bindFilters(root);
   hydrateIcons(root);
 }
@@ -274,7 +276,7 @@ function clipCard(c: ClipSummary, index: number) {
     : `<button class="iconbtn" data-action="pin" aria-label="Закрепить"><i data-lucide="pin"></i></button>`;
 
   return `<article class="clip ${c.pinned ? "pinned" : ""}" tabindex="0" data-clip="${c.id}" draggable="true" aria-label="Скопировать фрагмент">
-    <button class="clip-main">
+    <div class="clip-main" role="button" tabindex="0">
       <div class="clip-top">
         <strong>${esc(typeLabel)}</strong>
         ${c.domain ? `<span>${esc(c.domain)}</span>` : ""}
@@ -287,7 +289,7 @@ function clipCard(c: ClipSummary, index: number) {
         <span>${c.copyCount > 1 ? `скопировано ${c.copyCount} раз` : "одна копия"}${isTruncated ? ` · ${c.contentLength} симв.` : ""}</span>
         <span>· ${relativeTime(c.lastCopiedAt)}</span>
       </div>
-    </button>
+    </div>
     <div class="clip-actions">
       ${detailsButton}
       ${pinIcon}
@@ -407,7 +409,7 @@ function bindCards(root: HTMLElement) {
 
     card.querySelector<HTMLElement>("[data-action=assign-cat]")?.addEventListener("click", (e) => {
       e.stopPropagation();
-      showCategoryModal();
+      showAssignCategoryModal(clip);
     });
 
     // 6.7: confirm before deleting a pinned clip.
@@ -571,6 +573,73 @@ function showCategoryModal() {
         }
       })
   );
+}
+
+function showAssignCategoryModal(clip: ClipSummary) {
+  const root = document.querySelector<HTMLElement>("#modal-root");
+  if (!root) return;
+
+  const renderContent = () => {
+    const assignedIds = new Set(clip.categories.map((c) => c.id));
+    const categoriesHtml = state.categories.length
+      ? state.categories
+          .map((cat) => {
+            const isAssigned = assignedIds.has(cat.id);
+            return `<button type="button" class="btn ${isAssigned ? "primary" : ""}" data-toggle-cat="${cat.id}" style="display:flex;align-items:center;justify-content:space-between;width:100%;margin-bottom:8px;padding:8px 12px;border-radius:8px;text-align:left;">
+              <span style="display:flex;align-items:center;gap:8px;">
+                <i class="swatch" style="--cat-color:${cat.color}"></i>
+                <span>${esc(cat.name)}</span>
+              </span>
+              <span>${isAssigned ? "✓ Назначено" : "+ Назначить"}</span>
+            </button>`;
+          })
+          .join("")
+      : `<p class="notice" style="margin:12px 0">Пользовательских категорий пока нет.</p>`;
+
+    root.innerHTML = `<div class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true">
+      <header>
+        <h2>Назначить категорию</h2>
+        <button data-close aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </header>
+      <div style="padding:16px">
+        <div style="margin-bottom:12px;font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+          Фрагмент: <strong>${esc(clip.preview.slice(0, 40))}</strong>
+        </div>
+        <div class="assign-category-list">${categoriesHtml}</div>
+        <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;">
+          <button type="button" class="btn" id="btn-manage-cats-modal" style="font-size:12px;">Управление категориями</button>
+        </div>
+      </div>
+    </section></div>`;
+
+    hydrateIcons(root);
+    root.querySelector("[data-close]")?.addEventListener("click", () => (root.innerHTML = ""));
+    root.querySelector("#btn-manage-cats-modal")?.addEventListener("click", () => {
+      showCategoryModal();
+    });
+
+    root.querySelectorAll<HTMLElement>("[data-toggle-cat]").forEach((btn) => {
+      btn.onclick = async () => {
+        const catId = btn.dataset.toggleCat!;
+        const isAssigned = assignedIds.has(catId);
+        try {
+          if (isAssigned) {
+            await api.unassign(clip.id, catId);
+          } else {
+            await api.assign(clip.id, catId);
+          }
+          await reload();
+          const updatedClip = state.clips.find((c) => c.id === clip.id);
+          if (updatedClip) clip = updatedClip;
+          renderContent();
+        } catch {
+          showToast(isAssigned ? "Не удалось убрать категорию" : "Не удалось назначить категорию");
+        }
+      };
+    });
+  };
+
+  renderContent();
 }
 
 async function renderIntegrationView(container: HTMLElement) {
@@ -806,6 +875,7 @@ async function reload() {
   state.hasMore = !popup && state.clips.length === 60;
   renderFilters();
   renderCards();
+  if (!popup) renderCategoriesScreen();
 
   // Update recording status indicator
   if (!popup && state.settings) updateRecordingStatus(state.settings.paused);
@@ -828,6 +898,16 @@ async function reload() {
 // ── Keyboard navigation ───────────────────────────────────────────────────────
 
 document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && (e.key === "f" || e.key === "F" || e.key === "а" || e.key === "А")) {
+    e.preventDefault();
+    if (!popup) showScreen("history");
+    const searchInput = document.querySelector<HTMLInputElement>("#search");
+    if (searchInput) {
+      searchInput.focus();
+      searchInput.select();
+    }
+    return;
+  }
   if (!popup) return;
   if (e.key === "Escape") {
     if (isTauri) getCurrentWindow().hide();
