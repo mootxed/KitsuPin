@@ -126,10 +126,7 @@ jobs:
           echo "$CONTENTS" | grep -q "./usr/bin/kitsupin" || (echo "Ошибка: /usr/bin/kitsupin отсутствует!" && exit 1)
           echo "$CONTENTS" | grep -q "./usr/lib/kitsupin/kitsupin-native-host" || (echo "Ошибка: /usr/lib/kitsupin/kitsupin-native-host отсутствует!" && exit 1)
           echo "$CONTENTS" | grep -q "./etc/xdg/autostart/kitsupin.desktop" || (echo "Ошибка: autostart файл отсутствует!" && exit 1)
-
-          if [[ -n "${{ vars.KITSUPIN_CHROME_EXTENSION_ID }}" ]]; then
-            echo "$CONTENTS" | grep -q "./etc/opt/chrome/native-messaging-hosts/io.github.mootxed.kitsupin.native.json" || (echo "Ошибка: system native manifest отсутствует в prod пакете!" && exit 1)
-          fi
+          echo "$CONTENTS" | grep -q "./usr/lib/kitsupin/resources/chrome-extension/" || (echo "Ошибка: Chrome extension отсутствует!" && exit 1)
 
           sha256sum "$FINAL_DEB" > "${FINAL_DEB}.sha256"
 
