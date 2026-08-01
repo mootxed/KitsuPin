@@ -85,7 +85,11 @@ pub struct BufferedEvent {
 
 #[derive(Default)]
 pub struct MetadataBuffer {
+<<<<<<< HEAD
     events: Mutex<VecDeque<BufferedEvent>>,
+=======
+    events: Mutex<VecDeque<(DateTime<Utc>, BrowserCopyEvent)>>,
+>>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
     receipts: Mutex<VecDeque<(String, usize, ClipUpsertReceipt, bool)>>,
 }
 
@@ -159,6 +163,7 @@ impl MetadataBuffer {
         &self,
         allowed_delta_ms: i64,
     ) -> Option<(BrowserCopyEvent, ClipUpsertReceipt)> {
+<<<<<<< HEAD
         let mut events = self.events.lock();
         let mut receipts = self.receipts.lock();
 
@@ -174,21 +179,43 @@ impl MetadataBuffer {
                     continue;
                 }
                 let event = &buffered.event;
+=======
+        let events = self.events.lock();
+        let mut receipts = self.receipts.lock();
+
+        let mut best_pair = None;
+        let mut min_diff = i64::MAX;
+
+        for (receipt_idx, (r_hash, r_len, receipt, reserved)) in receipts.iter().enumerate() {
+            if *reserved {
+                continue;
+            }
+            for (_at, event) in events.iter() {
+>>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
                 if r_hash.eq_ignore_ascii_case(&event.content_hash) && *r_len == event.content_length {
                     if let Ok(event_ts_ms) = event.timestamp_millis() {
                         let diff = (receipt.copy_timestamp - event_ts_ms).abs();
                         if diff <= allowed_delta_ms && diff < min_diff {
                             min_diff = diff;
+<<<<<<< HEAD
                             best_pair = Some((event_idx, receipt_idx, event.clone(), receipt.clone()));
+=======
+                            best_pair = Some((receipt_idx, event.clone(), receipt.clone()));
+>>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
                         }
                     }
                 }
             }
         }
 
+<<<<<<< HEAD
         if let Some((e_idx, r_idx, event, receipt)) = best_pair {
             events[e_idx].reserved = true;
             receipts[r_idx].3 = true;
+=======
+        if let Some((idx, event, receipt)) = best_pair {
+            receipts[idx].3 = true;
+>>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
             Some((event, receipt))
         } else {
             None
@@ -196,8 +223,21 @@ impl MetadataBuffer {
     }
 
     pub fn acknowledge_pair(&self, event_id: Uuid, receipt_id: Uuid) {
+<<<<<<< HEAD
         self.remove_event(event_id);
         self.remove_receipt(receipt_id);
+=======
+        let mut events = self.events.lock();
+        if let Some(pos) = events.iter().position(|(_, e)| e.event_id == event_id) {
+            events.remove(pos);
+        }
+        drop(events);
+
+        let mut receipts = self.receipts.lock();
+        if let Some(pos) = receipts.iter().position(|(_, _, r, _)| r.receipt_id == receipt_id) {
+            receipts.remove(pos);
+        }
+>>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
     }
 
     pub fn discard_pair(&self, event_id: Uuid, receipt_id: Uuid) {
@@ -232,6 +272,7 @@ impl MetadataBuffer {
                 }
                 Ok(None) => {
                     log::debug!(
+<<<<<<< HEAD
                         "Late reconciliation: receipt no longer valid for hash {hash}; removing receipt and unreserving event"
                     );
                     self.remove_receipt(receipt_id);
@@ -243,6 +284,17 @@ impl MetadataBuffer {
                     );
                     self.release_receipt(receipt_id);
                     self.release_event(event_id);
+=======
+                        "Late reconciliation: receipt/event pair no longer valid for hash {hash}; discarding pair"
+                    );
+                    self.discard_pair(event_id, receipt_id);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Late reconciliation error for hash {hash}: {e}; releasing receipt reservation"
+                    );
+                    self.release_receipt(receipt_id);
+>>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
                     break;
                 }
             }

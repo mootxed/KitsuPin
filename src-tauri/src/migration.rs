@@ -183,7 +183,23 @@ fn migrate_data_dir_at(data_home: &Path) -> LegacyMigrationResult {
         (DatabaseDataState::Missing, _) | (_, DatabaseDataState::Missing) => {
             LegacyMigrationResult::NothingToMigrate
         }
+<<<<<<< HEAD
     }
+=======
+        let res = restore_legacy_db(&old_db_path, &new_db);
+        return res;
+    }
+
+    if old_clip_count == 0 {
+        // Old database is empty, nothing useful to import
+        let backup_old = old_dir.join("pastily.sqlite3.empty.bak");
+        let _ = backup_database_file(&old_db_path, &backup_old);
+        return LegacyMigrationResult::NothingToMigrate;
+    }
+
+    // Scenario D: both databases contain user data
+    merge_legacy_db_into_new(&old_db_path, &new_db)
+>>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
 }
 
 fn find_legacy_db(dir: &Path) -> Option<PathBuf> {
@@ -355,13 +371,27 @@ fn backup_database_file(src_db_path: &Path, dst_backup_path: &Path) -> anyhow::R
 
     std::fs::rename(&temp_backup, dst_backup_path)?;
 
+<<<<<<< HEAD
     remove_db_and_sidecars(src_db_path);
+=======
+    let _ = std::fs::remove_file(src_db_path);
+    let src_str = src_db_path.to_string_lossy();
+    let wal = PathBuf::from(format!("{src_str}-wal"));
+    if wal.exists() {
+        let _ = std::fs::remove_file(&wal);
+    }
+    let shm = PathBuf::from(format!("{src_str}-shm"));
+    if shm.exists() {
+        let _ = std::fs::remove_file(&shm);
+    }
+>>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
 
     Ok(())
 }
 
 fn compute_db_fingerprint(db_path: &Path) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
+<<<<<<< HEAD
 
     let temp_dir = std::env::temp_dir();
     let temp_snapshot = temp_dir.join(format!("kitsupin_fp_{}.tmp", uuid::Uuid::new_v4()));
@@ -389,6 +419,8 @@ fn compute_db_fingerprint(db_path: &Path) -> anyhow::Result<String> {
     }
 
     let _ = std::fs::remove_file(&temp_snapshot);
+=======
+>>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
     let bytes = std::fs::read(db_path)?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
@@ -511,8 +543,12 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
     let old_backup = old_db_path.with_extension("sqlite3.migrated.bak");
     if let Err(e) = backup_database_file(old_db_path, &old_backup) {
         log::error!("Failed to backup old DB: {e}");
+<<<<<<< HEAD
         // Even if old DB backup fails, target database is successfully restored with ledger record
         return LegacyMigrationResult::LegacyDatabaseRestored;
+=======
+        return LegacyMigrationResult::ConflictPreserved;
+>>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
     }
 
     LegacyMigrationResult::LegacyDatabaseRestored
@@ -625,6 +661,7 @@ struct LegacyMergeReport {
     links_imported: usize,
     duplicate_clips_merged: usize,
     already_imported: bool,
+<<<<<<< HEAD
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -647,6 +684,8 @@ fn perform_legacy_merge(
         source_path,
         None::<fn(MergeHookStage) -> anyhow::Result<()>>,
     )
+=======
+>>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
 }
 
 fn merge_legacy_db_into_new(old_db_path: &Path, new_db_path: &Path) -> LegacyMigrationResult {
@@ -743,11 +782,15 @@ fn perform_legacy_merge_with_hook<F>(
     dst_conn: &mut Connection,
     fingerprint: &str,
     source_path: &Path,
+<<<<<<< HEAD
     hook: Option<F>,
 ) -> anyhow::Result<LegacyMergeReport>
 where
     F: Fn(MergeHookStage) -> anyhow::Result<()>,
 {
+=======
+) -> anyhow::Result<LegacyMergeReport> {
+>>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
     let now_ms = chrono::Utc::now().timestamp_millis();
     ensure_legacy_imports_table(dst_conn)?;
 
@@ -1083,10 +1126,13 @@ where
         }
     }
 
+<<<<<<< HEAD
     if let Some(h) = &hook {
         h(MergeHookStage::BeforeCommit)?;
     }
 
+=======
+>>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
     tx.commit()?;
 
     Ok(LegacyMergeReport {
@@ -1420,6 +1466,7 @@ mod tests {
         let old_db = old_dir.join("pastily.sqlite3");
         std::fs::create_dir_all(&old_dir).unwrap();
 
+<<<<<<< HEAD
         // Create old_db with clips table having bad column structure causing perform_legacy_merge to fail
         {
             let conn = Connection::open(&old_db).unwrap();
@@ -1435,6 +1482,12 @@ mod tests {
                 VALUES('c1', 'corrupt', '', '2023-01-01T00:00:00Z', '2023-01-01T00:00:00Z');",
             )
             .unwrap();
+=======
+        // Create corrupt old_db missing required clips table
+        {
+            let conn = Connection::open(&old_db).unwrap();
+            conn.execute_batch("CREATE TABLE invalid_table (id INT);").unwrap();
+>>>>>>> 408e62ef9c6a3f3615efb6e1e93fa1f728b45716
         }
 
         let new_db = new_dir.join("kitsupin.sqlite3");
