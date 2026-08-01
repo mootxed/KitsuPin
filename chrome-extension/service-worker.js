@@ -1,4 +1,4 @@
-const HOST = "app.pastily.native";
+const HOST = "io.github.mootxed.kitsupin.native";
 async function send(message) {
   try {
     const response = await chrome.runtime.sendNativeMessage(HOST, message);

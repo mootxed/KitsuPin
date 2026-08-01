@@ -1,18 +1,67 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Bootstrap,Category,Clip,ClipQuery,Settings } from "./types";
+import type { Bootstrap, Category, ClipSummary, ClipQuery, Settings } from "./types";
+
 const tauri = "__TAURI_INTERNALS__" in window;
-const demoClips:Clip[]=[
-  {id:"sample-1",content:"曖昧さを恐れず、まず小さく試してみる。",contentType:"Text",domain:"youtube.com",pageTitle:"Japanese listening practice — quiet morning",createdAt:new Date().toISOString(),lastCopiedAt:new Date(Date.now()-180_000).toISOString(),copyCount:3,pinned:true,categories:[]},
-  {id:"sample-2",content:"https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging",contentType:"Links",domain:"developer.chrome.com",pageTitle:"Native messaging | Chrome for Developers",createdAt:new Date().toISOString(),lastCopiedAt:new Date(Date.now()-3_600_000).toISOString(),copyCount:1,pinned:false,categories:[]},
-  {id:"sample-3",content:"A clipboard is most useful when it stays out of your way.",contentType:"Text",domain:null,pageTitle:null,createdAt:new Date().toISOString(),lastCopiedAt:new Date(Date.now()-86_400_000).toISOString(),copyCount:1,pinned:false,categories:[]}
+
+const now = Date.now();
+let demoClips: ClipSummary[] = [
+  { id: "sample-1", preview: "曖昧さを恐れず、まず小さく試してみる。", contentLength: 21, contentType: "Text", domain: "youtube.com", pageTitle: "Japanese listening practice — quiet morning", createdAt: now, lastCopiedAt: now - 180_000, copyCount: 3, pinned: true, categories: [] },
+  { id: "sample-2", preview: "https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging", contentLength: 76, contentType: "Links", domain: "developer.chrome.com", pageTitle: "Native messaging | Chrome for Developers", createdAt: now, lastCopiedAt: now - 3_600_000, copyCount: 1, pinned: false, categories: [] },
+  { id: "sample-3", preview: "A clipboard is most useful when it stays out of your way.", contentLength: 55, contentType: "Text", domain: null, pageTitle: null, createdAt: now, lastCopiedAt: now - 86_400_000, copyCount: 1, pinned: false, categories: [] }
 ];
-const mock:Bootstrap={clips:demoClips,categories:[],settings:{paused:false,autostart:true,shortcut:"Super+V",retentionDays:90,excludedApps:[]}};
-export const api={
-  bootstrap:(popup:boolean)=>tauri?invoke<Bootstrap>("bootstrap",{popup}):Promise.resolve(mock),
-  list:(query:ClipQuery)=>tauri?invoke<Clip[]>("list_clips",{query}):Promise.resolve(demoClips.filter(c=>!query.search||JSON.stringify(c).toLowerCase().includes(query.search.toLowerCase()))),
-  copy:(clip:Clip,popup:boolean)=>tauri?invoke("copy_clip",{id:clip.id,content:clip.content,popup}):navigator.clipboard.writeText(clip.content),
-  remove:(id:string)=>invoke("delete_clip",{id}),pin:(id:string,pinned:boolean)=>invoke("set_pinned",{id,pinned}),clear:()=>invoke<number>("clear_unpinned"),
-  createCategory:(name:string,color:string)=>invoke<Category>("create_category",{name,color}),updateCategory:(id:string,name:string,color:string)=>invoke("update_category",{id,name,color}),deleteCategory:(id:string)=>invoke("delete_category",{id}),
-  assign:(clipId:string,categoryId:string)=>invoke("assign_category",{clipId,categoryId}),unassign:(clipId:string,categoryId:string)=>invoke("unassign_category",{clipId,categoryId}),saveSettings:(settings:Settings)=>invoke("save_settings",{settings})
+
+const mock: Bootstrap = { clips: demoClips, categories: [], settings: { paused: false, autostart: true, shortcut: "Super+V", retentionDays: 90, excludedApps: [] } };
+
+export const api = {
+  bootstrap: (popup: boolean) => tauri ? invoke<Bootstrap>("bootstrap", { popup }) : Promise.resolve(mock),
+  list: (query: ClipQuery) => tauri ? invoke<ClipSummary[]>("list_clips", { query }) : Promise.resolve(
+    demoClips.filter(c => {
+      if (query.search && !JSON.stringify(c).toLowerCase().includes(query.search.toLowerCase())) return false;
+      if (query.contentType && c.contentType !== query.contentType) return false;
+      if (query.domain && c.domain !== query.domain) return false;
+      if (query.categoryId && !c.categories.some(cat => cat.id === query.categoryId)) return false;
+      return true;
+    })
+  ),
+  getClipContent: (id: string) => tauri ? invoke<string>("get_clip_content", { id }) : Promise.resolve(demoClips.find(c => c.id === id)?.preview || ""),
+  copy: (id: string, popup: boolean, content?: string) => tauri ? invoke("copy_clip", { id, popup }) : (content ? navigator.clipboard.writeText(content || "") : Promise.resolve()),
+  remove: (id: string) => tauri ? invoke("delete_clip", { id }) : (demoClips = demoClips.filter(c => c.id !== id), mock.clips = demoClips, Promise.resolve()),
+  pin: (id: string, pinned: boolean) => tauri ? invoke("set_pinned", { id, pinned }) : (demoClips.forEach(c => { if (c.id === id) c.pinned = pinned; }), Promise.resolve()),
+  clear: () => tauri ? invoke<number>("clear_unpinned") : (() => {
+    const initialLen = demoClips.length;
+    demoClips = demoClips.filter(c => c.pinned);
+    mock.clips = demoClips;
+    return Promise.resolve(initialLen - demoClips.length);
+  })(),
+  createCategory: (name: string, color: string) => tauri ? invoke<Category>("create_category", { name, color }) : (() => {
+    const cat: Category = { id: `cat-${Date.now()}`, name, color, createdAt: Date.now(), sortOrder: mock.categories.length };
+    mock.categories.push(cat);
+    return Promise.resolve(cat);
+  })(),
+  updateCategory: (id: string, name: string, color: string) => tauri ? invoke("update_category", { id, name, color }) : (() => {
+    const cat = mock.categories.find(c => c.id === id);
+    if (cat) { cat.name = name; cat.color = color; }
+    demoClips.forEach(c => c.categories.forEach(cat => { if (cat.id === id) { cat.name = name; cat.color = color; } }));
+    return Promise.resolve();
+  })(),
+  deleteCategory: (id: string) => tauri ? invoke("delete_category", { id }) : (() => {
+    mock.categories = mock.categories.filter(c => c.id !== id);
+    demoClips.forEach(c => { c.categories = c.categories.filter(cat => cat.id !== id); });
+    return Promise.resolve();
+  })(),
+  assign: (clipId: string, categoryId: string) => tauri ? invoke("assign_category", { clipId, categoryId }) : (() => {
+    const clip = demoClips.find(c => c.id === clipId);
+    const cat = mock.categories.find(c => c.id === categoryId);
+    if (clip && cat && !clip.categories.some(c => c.id === categoryId)) {
+      clip.categories.push(cat);
+    }
+    return Promise.resolve();
+  })(),
+  unassign: (clipId: string, categoryId: string) => tauri ? invoke("unassign_category", { clipId, categoryId }) : (() => {
+    const clip = demoClips.find(c => c.id === clipId);
+    if (clip) { clip.categories = clip.categories.filter(c => c.id !== categoryId); }
+    return Promise.resolve();
+  })(),
+  saveSettings: (settings: Settings) => tauri ? invoke("save_settings", { settings }) : (mock.settings = settings, Promise.resolve())
 };
-export const isTauri=tauri;
+export const isTauri = tauri;

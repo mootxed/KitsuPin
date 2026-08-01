@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=KitsuPin
+Comment=Локальная история буфера обмена
+Exec=__KITSUPIN_PATH__ --background
+Icon=io.github.mootxed.kitsupin
+Terminal=false
+Categories=Utility;
+OnlyShowIn=KDE;
+X-GNOME-Autostart-enabled=true

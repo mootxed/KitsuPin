@@ -382,6 +382,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "kitsupin-core-tests"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "log",
+ "parking_lot",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -461,24 +479,6 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-link",
-]
-
-[[package]]
-name = "pastily-core-tests"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "hex",
- "log",
- "parking_lot",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "url",
- "uuid",
 ]
 
 [[package]]

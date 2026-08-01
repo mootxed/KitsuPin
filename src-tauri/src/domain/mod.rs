@@ -14,23 +14,48 @@ pub struct Category {
     pub id: String,
     pub name: String,
     pub color: String,
-    pub created_at: String,
+    pub created_at: i64,
     pub sort_order: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ClipSummary {
+    pub id: String,
+    pub preview: String,
+    pub content_length: usize,
+    pub content_type: ContentType,
+    pub domain: Option<String>,
+    pub page_title: Option<String>,
+    pub created_at: i64,
+    pub last_copied_at: i64,
+    pub copy_count: i64,
+    pub pinned: bool,
+    pub categories: Vec<Category>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct Clip {
     pub id: String,
     pub content: String,
     pub content_type: ContentType,
     pub domain: Option<String>,
     pub page_title: Option<String>,
-    pub created_at: String,
-    pub last_copied_at: String,
+    pub created_at: i64,
+    pub last_copied_at: i64,
     pub copy_count: i64,
     pub pinned: bool,
     pub categories: Vec<Category>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct ClipDetails {
+    pub id: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -49,5 +74,5 @@ pub struct NewClip<'a> {
     pub content: &'a str,
     pub domain: Option<&'a str>,
     pub page_title: Option<&'a str>,
-    pub now: &'a str,
+    pub now: i64,
 }

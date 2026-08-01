@@ -3,8 +3,8 @@ fn main() {
         .nth(1)
         .is_some_and(|value| value.starts_with("chrome-extension://"))
     {
-        pastily_lib::native_host::run();
+        kitsupin_lib::native_host::run();
         return;
     }
-    pastily_lib::run();
+    kitsupin_lib::run();
 }

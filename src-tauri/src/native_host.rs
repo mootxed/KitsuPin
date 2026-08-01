@@ -11,7 +11,7 @@ fn data_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .map(|p| p.join("pastily/native.sock"))
+        .map(|p| p.join("kitsupin/native.sock"))
 }
 
 fn read_message() -> anyhow::Result<Vec<u8>> {
@@ -59,7 +59,7 @@ pub fn run() {
     match handle() {
         Ok(()) => respond(json!({"ok": true, "version": 1})),
         Err(error) => {
-            eprintln!("Pastily native host: {error}");
+            eprintln!("KitsuPin native host: {error}");
             respond(json!({"ok": false, "version": 1, "error": "host_unavailable"}));
         }
     }

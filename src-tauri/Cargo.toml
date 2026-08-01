@@ -1,21 +1,21 @@
 [package]
-name = "pastily"
+name = "kitsupin"
 version = "0.1.0"
 description = "Локальная история буфера обмена для KDE X11"
-authors = ["Pastily contributors"]
+authors = ["KitsuPin contributors"]
 edition = "2021"
-default-run = "pastily"
+default-run = "kitsupin"
 
 [lib]
-name = "pastily_lib"
+name = "kitsupin_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
-name = "pastily"
+name = "kitsupin"
 path = "src/main.rs"
 
 [[bin]]
-name = "pastily-native-host"
+name = "kitsupin-native-host"
 path = "src/bin/native_host.rs"
 
 [build-dependencies]
@@ -30,7 +30,7 @@ hex = "0.4"
 log = "0.4"
 parking_lot = "0.12"
 regex = "1"
-rusqlite = { version = "0.32", features = ["bundled", "chrono", "functions"] }
+rusqlite = { version = "0.32", features = ["bundled-full", "chrono", "functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

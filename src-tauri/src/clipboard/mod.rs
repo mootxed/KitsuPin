@@ -64,9 +64,17 @@ pub fn set_clipboard(
     access: &ClipboardAccess,
 ) -> anyhow::Result<()> {
     let normalized = normalize_content(content);
-    access.with(|clipboard| clipboard.set_text(content.to_owned()))?;
-    guard.mark(&normalized);
-    Ok(())
+    let token = guard.mark_pending(&normalized);
+    match access.with(|clipboard| clipboard.set_text(content.to_owned())) {
+        Ok(()) => {
+            guard.commit(token);
+            Ok(())
+        }
+        Err(error) => {
+            guard.cancel(token);
+            Err(error.into())
+        }
+    }
 }
 
 fn x11_notifications() -> anyhow::Result<Receiver<()>> {
@@ -133,9 +141,6 @@ pub fn start(
                 std::thread::sleep(Duration::from_millis(350));
                 false
             };
-            if paused.load(Ordering::Relaxed) {
-                continue;
-            }
             let Some(text) = access.read_text() else {
                 continue;
             };
@@ -144,10 +149,15 @@ pub fn start(
                 continue;
             }
             let hash = content_hash(&normalized);
-            if !from_event && hash == last_hash {
+            let is_same = hash == last_hash;
+            last_hash.clone_from(&hash);
+
+            if paused.load(Ordering::Relaxed) {
                 continue;
             }
-            last_hash.clone_from(&hash);
+            if !from_event && is_same {
+                continue;
+            }
             if guard.should_suppress(&normalized) {
                 continue;
             }
@@ -157,7 +167,7 @@ pub fn start(
                 content: &text,
                 domain: browser.as_ref().map(|event| event.domain.as_str()),
                 page_title: browser.as_ref().map(|event| event.page_title.as_str()),
-                now: &now.to_rfc3339(),
+                now: now.timestamp_millis(),
             };
             match repo.upsert_clip(input) {
                 Ok(_) => {
@@ -178,7 +188,7 @@ mod tests {
     fn owned_clipboard_remains_available_after_set_returns() {
         let access = ClipboardAccess::default();
         let guard = OwnCopyGuard::default();
-        let value = format!("Pastily persistent X11 owner {}", std::process::id());
+        let value = format!("KitsuPin persistent X11 owner {}", std::process::id());
         set_clipboard(&value, &guard, &access).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         let mut independent_reader = Clipboard::new().unwrap();

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=KitsuPin
+Comment=Локальная история буфера обмена
+Exec=kitsupin --background
+Icon=kitsupin
+Terminal=false
+OnlyShowIn=KDE;
+X-GNOME-Autostart-enabled=true

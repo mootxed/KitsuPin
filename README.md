@@ -1,6 +1,6 @@
-# Pastily
+# KitsuPin
 
-Pastily — локальный менеджер текстовой истории обычного X11 Clipboard для
+KitsuPin — локальный менеджер текстовой истории обычного X11 Clipboard для
 Ubuntu 24.04, KDE Plasma и Google Chrome. Приложение не отслеживает PRIMARY
 selection, не сохраняет полный URL и не отправляет данные в интернет.
 
@@ -71,11 +71,11 @@ Rust core вынесен в отдельный test harness, поэтому до
 1. Соберите приложение и установите `.deb`.
 2. Откройте `chrome://extensions`, включите «Режим разработчика».
 3. Нажмите «Загрузить распакованное расширение» и выберите
-   `chrome-extension/` из репозитория либо `/usr/lib/Pastily/chrome-extension/`
+   `chrome-extension/` из репозитория либо `/usr/lib/KitsuPin/chrome-extension/`
    после установки `.deb`.
 4. Скопируйте ID появившегося расширения.
-5. Убедитесь, что `pastily-native-host` доступен в `PATH` (либо задайте
-   `PASTILY_NATIVE_HOST=/полный/путь/pastily-native-host`).
+5. Убедитесь, что `kitsupin-native-host` доступен в `PATH` (либо задайте
+   `KITSUPIN_NATIVE_HOST=/полный/путь/kitsupin-native-host`).
 6. Выполните:
 
 ```bash
@@ -84,10 +84,10 @@ chmod +x scripts/install-native-host.sh
 ```
 
 После установки `.deb` тот же скрипт находится в
-`/usr/lib/Pastily/scripts/install-native-host.sh`.
+`/usr/lib/KitsuPin/scripts/install-native-host.sh`.
 
 Manifest устанавливается только для текущего пользователя в
-`~/.config/google-chrome/NativeMessagingHosts/app.pastily.native.json`.
+`~/.config/google-chrome/NativeMessagingHosts/io.github.mootxed.kitsupin.native.json`.
 `allowed_origins` содержит точный ID расширения без wildcard.
 
 При копировании content script нормализует текст, вычисляет SHA-256 и передаёт
@@ -101,22 +101,22 @@ native host только хеш, байтовую длину, нормализо
 
 ```bash
 chmod +x scripts/install-autostart.sh
-./scripts/install-autostart.sh /полный/путь/к/pastily
+./scripts/install-autostart.sh /полный/путь/к/kitsupin
 ```
 
-Пакет устанавливает `/etc/xdg/autostart/pastily.desktop`, который автоматически
-удаляется вместе с `.deb`. При отключении настройки Pastily создаёт стандартный
-пользовательский override `~/.config/autostart/pastily.desktop` с `Hidden=true`.
+Пакет устанавливает `/etc/xdg/autostart/kitsupin.desktop`, который автоматически
+удаляется вместе с `.deb`. При отключении настройки KitsuPin создаёт стандартный
+пользовательский override `~/.config/autostart/kitsupin.desktop` с `Hidden=true`.
 В dev-режиме используется обычный пользовательский autostart-файл. Горячая
 клавиша по умолчанию — `Super+V`; её можно изменить в настройках. Если комбинация
-занята, Pastily продолжит работать и запишет ошибку в локальный лог.
+занята, KitsuPin продолжит работать и запишет ошибку в локальный лог.
 
 ## Данные, логи и удаление
 
-- база: `${XDG_DATA_HOME:-~/.local/share}/pastily/pastily.sqlite3`;
-- настройки: `${XDG_DATA_HOME:-~/.local/share}/pastily/settings.json`;
-- socket: `${XDG_DATA_HOME:-~/.local/share}/pastily/native.sock`;
-- логи: стандартный XDG log directory плагина Tauri (`Pastily/logs`).
+- база: `${XDG_DATA_HOME:-~/.local/share}/kitsupin/kitsupin.sqlite3`;
+- настройки: `${XDG_DATA_HOME:-~/.local/share}/kitsupin/settings.json`;
+- socket: `${XDG_DATA_HOME:-~/.local/share}/kitsupin/native.sock`;
+- логи: стандартный XDG log directory плагина Tauri (`KitsuPin/logs`).
 
 Удалить пользовательские интеграции, оставив данные:
 
@@ -125,8 +125,8 @@ chmod +x scripts/uninstall-user-data.sh
 ./scripts/uninstall-user-data.sh
 ```
 
-После завершения Pastily данные можно удалить вручную, удалив только конкретный
-каталог `${XDG_DATA_HOME:-$HOME/.local/share}/pastily`.
+После завершения KitsuPin данные можно удалить вручную, удалив только конкретный
+каталог `${XDG_DATA_HOME:-$HOME/.local/share}/kitsupin`.
 
 ## Модель безопасности и ограничения
 

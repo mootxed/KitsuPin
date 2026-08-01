@@ -1,3 +1,3 @@
 fn main() {
-    pastily_lib::native_host::run();
+    kitsupin_lib::native_host::run();
 }

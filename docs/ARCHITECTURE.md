@@ -1,8 +1,8 @@
-# Архитектура Pastily MVP
+# Архитектура KitsuPin MVP
 
-Pastily состоит из одного долгоживущего Tauri-процесса, двух webview-окон и
+KitsuPin состоит из одного долгоживущего Tauri-процесса, двух webview-окон и
 минимального native messaging binary. Все пользовательские данные остаются в
-`$XDG_DATA_HOME/pastily` (или `~/.local/share/pastily`).
+`$XDG_DATA_HOME/kitsupin` (или `~/.local/share/kitsupin`).
 
 ## Слои
 
