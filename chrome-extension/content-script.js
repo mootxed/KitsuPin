@@ -16,12 +16,14 @@ function selectedText(event) {
 }
 document.addEventListener("copy", async (event) => {
   const content = normalize(selectedText(event));
-  if (!content || content.length > 1_000_000) return;
+  if (!content) return;
+  const bytes = new TextEncoder().encode(content);
+  if (bytes.length > 1_000_000) return;
   const domain = normalizeDomain(location.hostname);
   if (!domain) return;
   chrome.runtime.sendMessage({
     version: 1, event: "copy", contentHash: await digest(content),
-    contentLength: new TextEncoder().encode(content).length,
+    contentLength: bytes.length,
     domain, pageTitle: document.title.slice(0, 500), timestamp: new Date().toISOString()
   }).catch(() => {});
 }, true);

@@ -557,7 +557,7 @@ document.addEventListener("keydown", (e) => {
     if (isTauri) getCurrentWindow().hide();
   } else if (e.key === "ArrowDown") {
     e.preventDefault();
-    state.selected = Math.min(state.selected + 1, state.clips.length - 1);
+    state.selected = Math.max(0, Math.min(state.selected + 1, state.clips.length - 1));
     renderCards();
   } else if (e.key === "ArrowUp") {
     e.preventDefault();

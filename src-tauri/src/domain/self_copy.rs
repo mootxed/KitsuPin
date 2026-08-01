@@ -18,7 +18,7 @@ struct ActiveMark {
 #[derive(Default)]
 pub struct OwnCopyGuard {
     next_id: Mutex<u64>,
-    active: Mutex<Option<ActiveMark>>,
+    marks: Mutex<Vec<ActiveMark>>,
 }
 
 impl OwnCopyGuard {
@@ -26,7 +26,9 @@ impl OwnCopyGuard {
         let mut next_id = self.next_id.lock();
         *next_id += 1;
         let id = *next_id;
-        *self.active.lock() = Some(ActiveMark {
+        let mut marks = self.marks.lock();
+        marks.retain(|m| m.created_at.elapsed() < Duration::from_secs(10));
+        marks.push(ActiveMark {
             id,
             hash: content_hash(normalized),
             created_at: Instant::now(),
@@ -36,19 +38,15 @@ impl OwnCopyGuard {
     }
 
     pub fn commit(&self, token: u64) {
-        let mut active = self.active.lock();
-        if let Some(ref mut mark) = *active {
-            if mark.id == token {
-                mark.state = MarkState::Committed;
-            }
+        let mut marks = self.marks.lock();
+        if let Some(mark) = marks.iter_mut().find(|m| m.id == token) {
+            mark.state = MarkState::Committed;
         }
     }
 
     pub fn cancel(&self, token: u64) {
-        let mut active = self.active.lock();
-        if active.as_ref().is_some_and(|mark| mark.id == token) {
-            *active = None;
-        }
+        let mut marks = self.marks.lock();
+        marks.retain(|m| m.id != token);
     }
 
     #[allow(dead_code)]
@@ -58,15 +56,17 @@ impl OwnCopyGuard {
     }
 
     pub fn should_suppress(&self, normalized: &str) -> bool {
-        let mut active = self.active.lock();
-        let matches = active.as_ref().is_some_and(|mark| {
-            mark.created_at.elapsed() < Duration::from_secs(2)
-                && mark.hash == content_hash(normalized)
-        });
-        if matches {
-            *active = None;
+        let mut marks = self.marks.lock();
+        let target_hash = content_hash(normalized);
+        marks.retain(|m| m.created_at.elapsed() < Duration::from_secs(10));
+        if let Some(pos) = marks.iter().position(|m| {
+            m.created_at.elapsed() < Duration::from_secs(2) && m.hash == target_hash
+        }) {
+            marks.remove(pos);
+            true
+        } else {
+            false
         }
-        matches
     }
 }
 
@@ -98,5 +98,18 @@ mod tests {
         let token = guard.mark_pending("hello");
         guard.cancel(token);
         assert!(!guard.should_suppress("hello"));
+    }
+
+    #[test]
+    fn suppresses_multiple_fast_consecutive_copies() {
+        let guard = OwnCopyGuard::default();
+        let token1 = guard.mark_pending("card1");
+        let token2 = guard.mark_pending("card2");
+        guard.commit(token1);
+        guard.commit(token2);
+        assert!(guard.should_suppress("card1"));
+        assert!(guard.should_suppress("card2"));
+        assert!(!guard.should_suppress("card1"));
+        assert!(!guard.should_suppress("card2"));
     }
 }
