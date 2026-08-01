@@ -11,10 +11,15 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use uuid::Uuid;
+
+pub const RECEIPT_MATCH_WINDOW_MS: i64 = 2000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BrowserCopyEvent {
+    #[serde(default = "Uuid::new_v4")]
+    pub event_id: Uuid,
     pub version: u8,
     pub event: String,
     pub content_hash: String,
@@ -43,6 +48,9 @@ impl BrowserCopyEvent {
             normalize_domain(&self.domain).ok_or_else(|| anyhow::anyhow!("некорректный домен"))?;
         self.page_title = self.page_title.trim().chars().take(500).collect();
         DateTime::parse_from_rfc3339(&self.timestamp)?;
+        if self.event_id.is_nil() {
+            self.event_id = Uuid::new_v4();
+        }
         Ok(self)
     }
 
@@ -54,10 +62,16 @@ impl BrowserCopyEvent {
 
 #[derive(Debug, Clone)]
 pub struct ClipUpsertReceipt {
+    pub receipt_id: Uuid,
     pub clip_id: String,
+    pub content_hash: String,
+    pub normalized_length_bytes: usize,
     pub previous_last_copied_at: Option<i64>,
     pub previous_sort_key: Option<i64>,
     pub previous_copy_count: i64,
+    pub resulting_last_copied_at: i64,
+    pub resulting_sort_key: i64,
+    pub resulting_copy_count: i64,
     pub copy_timestamp: i64,
 }
 
@@ -66,6 +80,7 @@ pub struct MetadataBuffer {
     events: Mutex<VecDeque<(DateTime<Utc>, BrowserCopyEvent)>>,
     receipts: Mutex<VecDeque<(String, usize, ClipUpsertReceipt)>>,
 }
+
 impl MetadataBuffer {
     pub fn push(&self, event: BrowserCopyEvent) -> Result<()> {
         let event = event.validate()?;
@@ -75,8 +90,11 @@ impl MetadataBuffer {
         while events.len() > 64 {
             events.pop_front();
         }
+        drop(events);
+        self.cleanup_stale(Utc::now());
         Ok(())
     }
+
     pub fn take_match(
         &self,
         hash: &str,
@@ -84,7 +102,7 @@ impl MetadataBuffer {
         now: DateTime<Utc>,
     ) -> Option<BrowserCopyEvent> {
         let mut events = self.events.lock();
-        events.retain(|(at, _)| now.signed_duration_since(*at).num_milliseconds().abs() <= 5_000);
+        events.retain(|(at, _)| now.signed_duration_since(*at).num_milliseconds().abs() <= 10_000);
         let pos = events.iter().rposition(|(at, e)| {
             e.content_hash.eq_ignore_ascii_case(hash)
                 && e.content_length == length
@@ -92,27 +110,66 @@ impl MetadataBuffer {
         })?;
         events.remove(pos).map(|(_, e)| e)
     }
-    pub fn remove_matching(&self, hash: &str, length: usize) {
+
+    pub fn remove_event(&self, event_id: Uuid) {
         let mut events = self.events.lock();
-        if let Some(pos) = events.iter().rposition(|(_, e)| {
-            e.content_hash.eq_ignore_ascii_case(hash) && e.content_length == length
-        }) {
+        if let Some(pos) = events.iter().position(|(_, e)| e.event_id == event_id) {
             events.remove(pos);
         }
     }
+
     pub fn push_receipt(&self, hash: &str, length: usize, receipt: ClipUpsertReceipt) {
         let mut receipts = self.receipts.lock();
         receipts.push_back((hash.to_lowercase(), length, receipt));
         while receipts.len() > 64 {
             receipts.pop_front();
         }
+        drop(receipts);
+        self.cleanup_stale(Utc::now());
     }
-    pub fn take_receipt(&self, hash: &str, length: usize) -> Option<ClipUpsertReceipt> {
+
+    pub fn take_matching_receipt(
+        &self,
+        hash: &str,
+        length: usize,
+        browser_event_ts_ms: i64,
+        allowed_delta_ms: i64,
+    ) -> Option<ClipUpsertReceipt> {
         let mut receipts = self.receipts.lock();
-        let pos = receipts.iter().rposition(|(h, l, _)| {
-            h.eq_ignore_ascii_case(hash) && *l == length
-        })?;
-        receipts.remove(pos).map(|(_, _, r)| r)
+        let mut best_idx = None;
+        let mut min_diff = i64::MAX;
+
+        for (idx, (h, l, r)) in receipts.iter().enumerate() {
+            if h.eq_ignore_ascii_case(hash) && *l == length {
+                let diff = (r.copy_timestamp - browser_event_ts_ms).abs();
+                if diff <= allowed_delta_ms && diff < min_diff {
+                    min_diff = diff;
+                    best_idx = Some(idx);
+                }
+            }
+        }
+
+        if let Some(pos) = best_idx {
+            receipts.remove(pos).map(|(_, _, r)| r)
+        } else {
+            None
+        }
+    }
+
+    pub fn cleanup_stale(&self, now: DateTime<Utc>) {
+        let now_ms = now.timestamp_millis();
+
+        let mut events = self.events.lock();
+        events.retain(|(_, e)| {
+            if let Ok(ts) = e.timestamp_millis() {
+                (now_ms - ts).abs() <= 10_000
+            } else {
+                false
+            }
+        });
+
+        let mut receipts = self.receipts.lock();
+        receipts.retain(|(_, _, r)| (now_ms - r.copy_timestamp).abs() <= 10_000);
     }
 }
 
@@ -121,13 +178,6 @@ pub fn socket_path(data_dir: &Path) -> PathBuf {
 }
 
 /// Start the Native Messaging Unix socket server.
-///
-/// Probes the existing socket before removing it:
-/// - If connection succeeds → another server is active; returns Err.
-/// - If connection fails   → stale socket; removes it, then binds.
-///
-/// The `reconcile_callback` is called for each validated BrowserCopyEvent so that
-/// the late-reconciliation service can attach metadata to recently saved clips.
 pub fn start_socket_server(
     path: PathBuf,
     buffer: Arc<MetadataBuffer>,
@@ -136,14 +186,12 @@ pub fn start_socket_server(
     if path.exists() {
         match UnixStream::connect(&path) {
             Ok(_) => {
-                // A live server is already listening. Do NOT remove its socket.
                 anyhow::bail!(
                     "Native Messaging socket {:?} уже занят другим активным процессом",
                     path
                 );
             }
             Err(_) => {
-                // Stale socket from a crashed process — safe to remove.
                 log::info!("Removing stale native.sock at {:?}", path);
                 let _ = std::fs::remove_file(&path);
             }
@@ -187,11 +235,13 @@ fn read_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn validates_messages_and_matches_reliably() {
         let b = MetadataBuffer::default();
         let now = Utc::now();
         let e = BrowserCopyEvent {
+            event_id: Uuid::new_v4(),
             version: 1,
             event: "copy".into(),
             content_hash: "a".repeat(64),
@@ -206,6 +256,59 @@ mod tests {
         assert_eq!(found.domain, "example.com");
         assert_eq!(found.page_title, "Page");
     }
+
+    #[test]
+    fn receipt_matching_uses_timestamp_delta_and_picks_closest() {
+        let b = MetadataBuffer::default();
+        let hash = "a".repeat(64);
+        let now_ms = Utc::now().timestamp_millis();
+
+        let r1 = ClipUpsertReceipt {
+            receipt_id: Uuid::new_v4(),
+            clip_id: "clip_1".into(),
+            content_hash: hash.clone(),
+            normalized_length_bytes: 10,
+            previous_last_copied_at: Some(now_ms - 5000),
+            previous_sort_key: Some(10),
+            previous_copy_count: 1,
+            resulting_last_copied_at: now_ms - 1500,
+            resulting_sort_key: 11,
+            resulting_copy_count: 2,
+            copy_timestamp: now_ms - 1500,
+        };
+
+        let r2 = ClipUpsertReceipt {
+            receipt_id: Uuid::new_v4(),
+            clip_id: "clip_2".into(),
+            content_hash: hash.clone(),
+            normalized_length_bytes: 10,
+            previous_last_copied_at: Some(now_ms - 3000),
+            previous_sort_key: Some(20),
+            previous_copy_count: 1,
+            resulting_last_copied_at: now_ms - 300,
+            resulting_sort_key: 21,
+            resulting_copy_count: 2,
+            copy_timestamp: now_ms - 300,
+        };
+
+        b.push_receipt(&hash, 10, r1);
+        b.push_receipt(&hash, 10, r2);
+
+        // Matching for event at now_ms - 200 should pick r2 (delta 100ms vs 1300ms)
+        let matched = b
+            .take_matching_receipt(&hash, 10, now_ms - 200, RECEIPT_MATCH_WINDOW_MS)
+            .expect("should match r2");
+
+        assert_eq!(matched.clip_id, "clip_2");
+
+        // Subsequent match for event at now_ms - 1400 should pick r1
+        let matched2 = b
+            .take_matching_receipt(&hash, 10, now_ms - 1400, RECEIPT_MATCH_WINDOW_MS)
+            .expect("should match r1");
+
+        assert_eq!(matched2.clip_id, "clip_1");
+    }
+
     #[test]
     fn rejects_unknown_protocol() {
         let mut value = serde_json::json!({"version":1,"event":"exec","contentHash":"a".repeat(64),"contentLength":1,"domain":"example.com","pageTitle":"x","timestamp":Utc::now().to_rfc3339()});
@@ -222,18 +325,11 @@ mod tests {
         use std::os::unix::net::UnixListener;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.sock");
-        // Create a stale socket file (no listener).
         let _ = UnixListener::bind(&path).unwrap();
-        // Drop the listener so nothing is listening but the file remains.
-        drop(UnixListener::bind(&path)); // second bind will fail; use the first.
-                                         // Ensure file exists.
+        drop(UnixListener::bind(&path));
         assert!(path.exists());
-        // Now call start_socket_server; should detect stale socket, remove, and bind.
         let buffer = Arc::new(MetadataBuffer::default());
         let cb = Arc::new(|_: BrowserCopyEvent| {});
-        // We can't fully test thread binding here without a live process,
-        // so just verify the file-probe logic doesn't panic.
-        // The actual server start is best-effort in this unit test.
         let res = start_socket_server(path.clone(), buffer, cb);
         assert!(res.is_ok());
     }

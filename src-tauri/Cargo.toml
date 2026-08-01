@@ -40,7 +40,7 @@ tauri-plugin-global-shortcut = "2"
 tauri-plugin-log = "2"
 thiserror = "2"
 url = "2"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 x11rb = { version = "0.13", features = ["xfixes"] }
 
 [dev-dependencies]

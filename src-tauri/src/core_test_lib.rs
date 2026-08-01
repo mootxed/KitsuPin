@@ -8,3 +8,5 @@ pub mod browser_metadata;
 pub mod native_host;
 #[path = "settings/mod.rs"]
 pub mod settings;
+#[path = "migration.rs"]
+pub mod migration;

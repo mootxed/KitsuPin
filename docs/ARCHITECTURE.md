@@ -1,7 +1,5 @@
 # Архитектура KitsuPin
 
-> **Статус:** Ранний MVP. Требуется системное тестирование на целевой среде (Ubuntu 24.04 · KDE Plasma · X11).
-
 KitsuPin состоит из одного долгоживущего Tauri-процесса, двух webview-окон и
 минимального native messaging binary. Все пользовательские данные остаются в
 `$XDG_DATA_HOME/kitsupin` (по умолчанию `~/.local/share/kitsupin`).
@@ -13,12 +11,13 @@ KitsuPin состоит из одного долгоживущего Tauri-пр�
 | Путь | Назначение |
 |---|---|
 | `src-tauri/src/domain` | Нормализация, классификация, модели, дедупликация |
-| `src-tauri/src/persistence` | SQLite, миграции 1–7, запросы, транзакции, reconciliation |
+| `src-tauri/src/persistence` | SQLite, миграции 1–8, trigram FTS5, short-query page_title fallback, reconciliation |
 | `src-tauri/src/clipboard` | XFixes-события только для `CLIPBOARD`, чтение и подавление собственных событий; polling 350 мс — аварийный fallback |
-| `src-tauri/src/browser_metadata` | Unix socket, краткоживущий буфер событий Chrome, late reconciliation callback |
+| `src-tauri/src/browser_metadata` | Unix socket, буфер событий Chrome с `event_id: Uuid`, `ClipUpsertReceipt`, `take_matching_receipt`, cleanup по времени |
 | `src-tauri/src/jobs` | Очистка устаревшей незакреплённой истории |
 | `src-tauri/src/settings` | Настройки (write-fsync-rename), XDG Autostart, consume_invalid_warning |
-| `src-tauri/src/lib.rs` | Команды Tauri, окна, tray, глобальная клавиша, single-instance lock |
+| `src-tauri/src/migration.rs` | Миграция Pastily → KitsuPin, lock 0600, SQLite Backup API, обработка 4 сценариев (A, B, C, D) |
+| `src-tauri/src/lib.rs` | Команды Tauri, окна, tray, регистрация горячих клавиш с обработкой `registered_shortcut = None`, single-instance lock |
 | `src/` | TypeScript UI; режим выбирается по query `?mode=popup` |
 | `chrome-extension/` | Manifest V3 content script, service worker, status page |
 | `scripts/` | Установка native manifest и autostart для текущего пользователя |
@@ -27,118 +26,88 @@ KitsuPin состоит из одного долгоживущего Tauri-пр�
 
 ## Файловая система данных
 
-```
-~/.local/share/kitsupin/
-├── kitsupin.sqlite3         # База данных (WAL, 0o600)
-├── kitsupin.sqlite3-wal
-├── kitsupin.sqlite3-shm
-├── kitsupin.lock            # Advisory file lock (fs2), удерживается весь срок жизни
-├── app.sock                 # Unix socket для single-instance IPC
-├── native.sock              # Unix socket для Native Messaging
-└── settings.json            # Настройки (0o600, write-fsync-rename)
-```
-
----
-
-## Single-instance (атомарный)
-
-Перед открытием базы и запуском Tauri приложение пытается получить **exclusive
-advisory file lock** (`kitsupin.lock`, через crate `fs2`).
-
-- Если lock свободен — процесс запускается в штатном режиме.
-- Если lock занят — второй процесс подключается к `app.sock`, отправляет
-  `show_main\n` (с retry 3×100 мс) и завершается. База данных **не открывается**.
-
-После захвата lock первичный процесс создаёт `app.sock` (предварительно удалив
-stale-файл, если таковой остался после краша). Listener принимает только команду
-`show_main`; любые другие строки игнорируются.
-
-**Native Messaging socket (`native.sock`)** перед bind пробует `connect()`:
-- Соединение успешно → другой сервер активен, возвращает ошибку.
-- Соединение неудачно → stale socket, удаляет файл и делает `bind`.
-
----
-
-## Поток копирования
-
-```
-Пользователь нажимает Ctrl+C
-  → XFixes уведомление (или poll 350 мс)
-    → clipboard::start читает текст
-      → normalize_content + content_hash
-        → MetadataBuffer::take_match (immediate, 0–2.5 сек)
-          → Repository::upsert_clip(content, domain?, title?, now)
-            → clips-changed
+```text
+~/.local/share/
+├── .kitsupin-migration.lock # Advisory lock для миграции (0600, вне каталога приложения)
+└── kitsupin/
+    ├── kitsupin.sqlite3     # База данных (WAL, 0o600)
+    ├── kitsupin.sqlite3-wal
+    ├── kitsupin.sqlite3-shm
+    ├── kitsupin.lock        # Advisory file lock (fs2), удерживается весь срок жизни
+    ├── app.sock             # Unix socket для single-instance IPC
+    ├── native.sock          # Unix socket для Native Messaging (0600)
+    └── settings.json        # Настройки (0o600, write-fsync-rename)
 ```
 
-### Late reconciliation (Chrome metadata)
+---
 
-Content script вычисляет SHA-256 нормализованного текста и передаёт только хеш,
-длину UTF-8 в байтах, hostname и title. Native host пересылает событие в `native.sock`.
+## Миграция данных Pastily → KitsuPin
 
-Если metadata поступают **после** того, как clipboard watcher уже сохранил карточку
-без домена, socket server вызывает `Repository::attach_metadata`:
+Миграция выполняется до запуска базы данных KitsuPin. Использует эксклюзивный lock-файл `$XDG_DATA_HOME/.kitsupin-migration.lock` с правами `0600`.
 
-1. Ищет карточку с `content_hash = ?` AND `domain_key = ''` AND
-   `last_copied_at >= now - 5000 мс`.
-2. Проверяет `length(content)` совпадает с `content_length_bytes` из Chrome.
-3. Если существует карточка с `(content_hash, domain_key)` — **merge**:
-   сохраняет закрепление, объединяет категории, суммирует `copy_count`.
-4. Если нет — обновляет `domain`, `domain_key`, `page_title` на месте.
-5. Отправляет `clips-changed`.
+### Поддерживаемые сценарии
 
-**Metadata не прикрепляются** если:
-- hash не совпадает,
-- длина контента не совпадает,
-- разница времени превышает `METADATA_RECONCILE_WINDOW_MS = 5000 мс`.
+1. **Сценарий A (Только старый каталог)**:
+   Атомарно переименовывает `~/.local/share/pastily` в `~/.local/share/kitsupin` и переименовывает файлы базы данных.
+2. **Сценарий B (Существует каталог kitsupin без kitsupin.sqlite3)**:
+   Переносит старую базу через SQLite Backup API, сбрасывает WAL (`PRAGMA wal_checkpoint(TRUNCATE)`), проверяет `integrity_check` и `foreign_key_check`, после чего создает backup старой базы.
+3. **Сценарий C (kitsupin.sqlite3 существует, но фактически пуст)**:
+   Перемещает пустую новую базу в `kitsupin.sqlite3.empty.bak`, переносит старую базу через SQLite Backup API с проверкой целостности, удаляет временную пустую базу только после успешного переноса.
+4. **Сценарий D (Обе базы содержат пользовательские данные)**:
+   Выполняет транзакционный импорт legacy-карточек и категорий из Pastily в KitsuPin. Объединяет дубликаты по `(content_hash, domain_key)`, сохраняя закрепления (`pinned`), категории, наиболшие `copy_count` и свежие метки времени `last_copied_at`. Не перезаписывает более свежие данные старыми.
 
 ---
 
-## Дедупликация
+## Поток копирования и Late Reconciliation
 
-Уникальность clips: **SHA-256 нормализованного содержимого + `domain_key`**.
+```text
+Пользователь копирует в браузере Chrome
+  │
+  ├── Chrome Extension → Native Host → native.sock
+  │     └─ BrowserCopyEvent { event_id: Uuid, content_hash, content_length, domain, page_title, timestamp }
+  │          └─ Сохраняется в MetadataBuffer
+  │
+  └── X11 Clipboard Event (или Polling fallback)
+        └─ Clipboard Watcher:
+             ├─ Попытка take_match (Metadata before Clipboard)
+             │    └─ Если найден event: сразу создаёт карточку с доменом и заголовком
+             └─ Иначе (Metadata after Clipboard):
+                  └─ Создаёт domainless-карточку + генерирует ClipUpsertReceipt
+                       └─ Pushes receipt в MetadataBuffer
+```
 
-`domain_key` = нормализованный домен (без `www.`, lowercase, trim) либо пустая
-строка `''` для карточек без источника.
+### Прикрепление метаданных (reconciliation)
 
-> **Примечание:** SHA-256 теоретически допускает коллизии. При совпадении хеша
-> `attach_metadata` дополнительно проверяет `length(content) == content_length_bytes`
-> из Chrome, что делает случайное ложное прикрепление практически невозможным.
-> Тем не менее архитектура не полагается слепо на неколлизионность хеша.
-
----
-
-## Транзакция копирования карточки
-
-Команда `copy_clip` выполняет операции в безопасном порядке:
-
-1. `get_clip_content(id)` — читает содержимое (без изменений).
-2. `set_clipboard(content)` — записывает в системный Clipboard.
-3. `mark_clip_copied(id, now)` — только при успехе п.2: обновляет `copy_count`,
-   `last_copied_at`, `sort_key`.
-4. `emit("clips-changed")`.
-5. Скрыть popup — только при полном успехе.
-
-Если clipboard-запись завершилась ошибкой — база не изменяется, popup остаётся открытым.
-
----
-
-## Настройки и rollback
-
-`save_settings` применяет изменения в следующем порядке с полным rollback:
-
-1. Валидация (`shortcut` не пустой, `retention_days` 1–3650, `excluded_apps` ≤ 100).
-2. Регистрация новой горячей клавиши — при ошибке возврат без изменений.
-3. Снятие старой горячей клавиши.
-4. Применение autostart — при ошибке откат shortcut.
-5. Запись `settings.json` (write-fsync-rename) — при ошибке откат autostart и shortcut.
-6. Обновление runtime-состояния (paused, tray).
-
-Файл записывается как `settings.tmp`, затем `fsync`, затем `rename` (атомарная замена).
+- Socket callback вызывает `take_matching_receipt(hash, length, timestamp_ms, RECEIPT_MATCH_WINDOW_MS = 2000)`.
+- Выбирается receipt с минимальной разницей метки времени в пределах допустимого окна.
+- `attach_metadata` проверяет наличие карточки по `receipt.clip_id`, совпадение `content_hash`, `domain_key == ''`, и соответствие текущего состояния DB данным receipt (`copy_count`, `last_copied_at`).
+- Если состояние карточки изменилось (было повторное копирование), receipt считается устаревшим и не применяется.
+- **Без receipt reconciliation для ранее существовавших карточек с copy_count > 1 ЗАПРЕЩЁН**: partial rollback `copy_count - 1` удалён. Без receipt домен прикрепляется только в однозначном случае для впервые созданной карточки (`copy_count == 1`).
+- После успешной синхронизации удаляется строго обработанное событие по `event_id` (`remove_event`).
+- Устаревшие events и receipts старше 10 000 мс автоматически очищаются (`cleanup_stale`).
 
 ---
 
-## SQLite-схема
+## Поиск и FTS5
+
+- Таблица `clips_fts` использует `tokenize='trigram'` над полем `content` и `page_title`.
+- Запросы длиной ≥ 3 символов выполняются через FTS5 match.
+- **Короткие запросы (< 3 Unicode-символов)**: дополнительно ищут по `kitsupin_lower(c.content) LIKE ?` и `kitsupin_lower(COALESCE(c.page_title, '')) LIKE ?` в пределах последних `SHORT_SEARCH_FALLBACK_LIMIT = 5000` карточек.
+
+---
+
+## Настройки и регистрация горячих клавиш
+
+Управление `registered_shortcut`:
+- Если при запуске регистрация комбинации завершилась ошибкой, `registered_shortcut` устанавливается в `None`.
+- При последующем сохранении новых настроек код проверяет `registered_shortcut`:
+  - `Some(old)` -> регистрирует новый shortcut, снимает `old`.
+  - `None` -> регистрирует новый shortcut, старый не снимает.
+- Любая ошибка при вызове global shortcut API, autostart или сохранении `settings.json` приводит к каскадному откату без нарушения runtime-состояния.
+
+---
+
+## SQLite-схема и миграции
 
 ### Таблица `clips`
 
@@ -159,82 +128,21 @@ Content script вычисляет SHA-256 нормализованного те�
 
 UNIQUE constraint: `(content_hash, domain_key)`.
 
-### FTS5 (`clips_fts`)
+### История миграций DB
 
-Виртуальная таблица `external-content` над `clips`, индексирует `content` и
-`page_title`. Triggers:
-
-- `clips_ai` — AFTER INSERT
-- `clips_ad` — AFTER DELETE
-- `clips_au` — **AFTER UPDATE OF content, page_title** (намеренно не срабатывает
-  при изменении `copy_count`, `last_copied_at`, `pinned`, `sort_key`)
-
----
-
-## Миграции
-
-| Версия | Описание |
-|---|---|
-| 1 | Начальная схема |
-| 2 | Колонка `domain_key`, UNIQUE индекс по `(content_hash, domain_key)` |
-| 3 | Попытка `DROP COLUMN normalized_content` (может не сработать при UNIQUE constraint) |
-| 4 | FTS5 + triggers (все UPDATE) |
-| 5 | TEXT timestamps → INTEGER ms (только RFC3339) |
-| 6 | **Безопасный полный rebuild** таблицы `clips` если `normalized_content` ещё присутствует; нормализация INTEGER-секунд → ms; merge дубликатов без потери `pinned`/категорий |
-| 7 | Замена `clips_au` trigger на `AFTER UPDATE OF content, page_title` |
-
-Каждая миграция транзакционна. Migration 6 использует `PRAGMA foreign_keys=OFF`
-внутри транзакции и восстанавливает с `PRAGMA foreign_key_check`.
+- **1–7**: Начальная схема, `domain_key`, FTS5, integer timestamps, merge duplicates, UPDATE triggers.
+- **8**: Пересоздание FTS5 с `trigram` токенизатором, индекс `idx_clip_categories_category`.
 
 ---
 
 ## CI
 
-Файл: `.github/workflows/ci.yml`
+Workflow: `.github/workflows/ci.yml`
 
-| Job | Runner | Шаги |
-|---|---|---|
-| `frontend` | ubuntu-24.04 | `npm ci` · `npm run lint` · `npm test` · `npm run build` |
-| `rust-core` | ubuntu-24.04 | `cargo fmt --check` · `cargo clippy -D warnings` · `cargo test` (core-tests) |
-| `tauri-check` | ubuntu-24.04 | Системные зависимости GTK/WebKit · `cargo check` · `npm run tauri build --bundles deb` |
-
-Все jobs используют `concurrency.cancel-in-progress: true`.
-
----
-
-## Локальные команды
-
-```bash
-# Frontend
-npm ci
-npm run lint
-npm test
-npm run build
-
-# Rust core tests (включает FTS5 через bundled-full)
-cargo test --manifest-path src-tauri/core-tests/Cargo.toml
-
-# Format check
-cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
-
-# Clippy
-cargo clippy --manifest-path src-tauri/core-tests/Cargo.toml --all-targets -- -D warnings
-
-# Tauri check (без сборки бинаря)
-cargo check --manifest-path src-tauri/Cargo.toml
-
-# Полная сборка .deb
-npm run tauri build -- --bundles deb
-```
-
----
-
-## Ограничения текущей версии
-
-- Только X11; Wayland не поддерживается.
-- Только Google Chrome через Native Messaging; Firefox — нет.
-- Синхронизация между устройствами не реализована.
-- Поддержка изображений и файлов не реализована.
-- `excluded_apps` в настройках подготовлено архитектурно, но отключено:
-  X11 не всегда надёжно сообщает источник Clipboard.
-- PRIMARY selection не отслеживается (только `CLIPBOARD` atom).
+1. `frontend`: `npm ci` · `npm run lint` · `npm test` · `npm run build`
+2. `rust-core`:
+   - `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check`
+   - `cargo clippy --manifest-path src-tauri/core-tests/Cargo.toml --all-targets -- -D warnings`
+   - `cargo test --manifest-path src-tauri/core-tests/Cargo.toml`
+   - `cargo test --manifest-path src-tauri/Cargo.toml`
+3. `tauri-check`: `cargo check --manifest-path src-tauri/Cargo.toml` · `npm run tauri build -- --bundles deb`

@@ -268,30 +268,40 @@ fn save_settings(
     let previous = state.settings.get();
     let shortcut_changed = previous.shortcut != settings.shortcut;
     let autostart_changed = previous.autostart != settings.autostart;
+    let old_registered = state.registered_shortcut.lock().clone();
 
-    // Step 2: register new shortcut before doing anything else.
+    // Step 2 & 3: register new shortcut and unregister old shortcut if registered.
     if shortcut_changed {
-        if let Err(e) = app.global_shortcut().register(settings.shortcut.as_str()) {
-            return Err(err(format!(
-                "Не удалось зарегистрировать горячую клавишу '{}': {e}",
-                settings.shortcut
-            )));
+        match &old_registered {
+            Some(old_key) => {
+                if let Err(e) = app.global_shortcut().register(settings.shortcut.as_str()) {
+                    return Err(err(format!(
+                        "Не удалось зарегистрировать горячую клавишу '{}': {e}",
+                        settings.shortcut
+                    )));
+                }
+                if let Err(e) = app.global_shortcut().unregister(old_key.as_str()) {
+                    log::error!(
+                        "save_settings: could not unregister old shortcut '{old_key}': {e}"
+                    );
+                    let _ = app.global_shortcut().unregister(settings.shortcut.as_str());
+                    *state.registered_shortcut.lock() = Some(old_key.clone());
+                    return Err(err(format!(
+                        "Не удалось снять старую горячую клавишу '{old_key}': {e}"
+                    )));
+                }
+                *state.registered_shortcut.lock() = Some(settings.shortcut.clone());
+            }
+            None => {
+                if let Err(e) = app.global_shortcut().register(settings.shortcut.as_str()) {
+                    return Err(err(format!(
+                        "Не удалось зарегистрировать горячую клавишу '{}': {e}",
+                        settings.shortcut
+                    )));
+                }
+                *state.registered_shortcut.lock() = Some(settings.shortcut.clone());
+            }
         }
-    }
-
-    // Step 3: unregister old shortcut.
-    if shortcut_changed {
-        let old_reg = state.registered_shortcut.lock().clone();
-        let old_key = old_reg.as_deref().unwrap_or(previous.shortcut.as_str());
-        if let Err(e) = app.global_shortcut().unregister(old_key) {
-            log::error!("save_settings: could not unregister old shortcut '{old_key}': {e}");
-            let _ = app.global_shortcut().unregister(settings.shortcut.as_str());
-            *state.registered_shortcut.lock() = Some(old_key.to_string());
-            return Err(err(format!(
-                "Не удалось снять старую горячую клавишу '{old_key}': {e}"
-            )));
-        }
-        *state.registered_shortcut.lock() = Some(settings.shortcut.clone());
     }
 
     // Step 4: apply autostart.
@@ -300,8 +310,15 @@ fn save_settings(
             // Rollback shortcut.
             if shortcut_changed {
                 let _ = app.global_shortcut().unregister(settings.shortcut.as_str());
-                let _ = app.global_shortcut().register(previous.shortcut.as_str());
-                *state.registered_shortcut.lock() = Some(previous.shortcut.clone());
+                if let Some(old_key) = &old_registered {
+                    if app.global_shortcut().register(old_key.as_str()).is_ok() {
+                        *state.registered_shortcut.lock() = Some(old_key.clone());
+                    } else {
+                        *state.registered_shortcut.lock() = None;
+                    }
+                } else {
+                    *state.registered_shortcut.lock() = None;
+                }
             }
             return Err(err(format!("Не удалось изменить автозапуск: {e}")));
         }
@@ -316,13 +333,20 @@ fn save_settings(
         // Rollback shortcut.
         if shortcut_changed {
             let _ = app.global_shortcut().unregister(settings.shortcut.as_str());
-            let _ = app.global_shortcut().register(previous.shortcut.as_str());
-            *state.registered_shortcut.lock() = Some(previous.shortcut.clone());
+            if let Some(old_key) = &old_registered {
+                if app.global_shortcut().register(old_key.as_str()).is_ok() {
+                    *state.registered_shortcut.lock() = Some(old_key.clone());
+                } else {
+                    *state.registered_shortcut.lock() = None;
+                }
+            } else {
+                *state.registered_shortcut.lock() = None;
+            }
         }
         return Err(err(format!("Не удалось сохранить настройки: {e}")));
     }
 
-    // Step 6: update runtime state (these cannot meaningfully fail).
+    // Step 6: update runtime state.
     state.paused.store(settings.paused, Ordering::Relaxed);
     update_pause_indicators(&app, settings.paused);
 
@@ -648,7 +672,12 @@ pub fn run() {
                     Ok(ts) => ts,
                     Err(_) => Utc::now().timestamp_millis(),
                 };
-                let receipt = metadata_reconcile.take_receipt(&event.content_hash, event.content_length);
+                let receipt = metadata_reconcile.take_matching_receipt(
+                    &event.content_hash,
+                    event.content_length,
+                    event_ts_ms,
+                    browser_metadata::RECEIPT_MATCH_WINDOW_MS,
+                );
                 match repo_reconcile.attach_metadata(
                     &event.content_hash,
                     event.content_length,
@@ -662,7 +691,7 @@ pub fn run() {
                     receipt,
                 ) {
                     Ok(Some(id)) => {
-                        metadata_reconcile.remove_matching(&event.content_hash, event.content_length);
+                        metadata_reconcile.remove_event(event.event_id);
                         log::info!("Late reconciliation: metadata attached to clip {id}");
                         let _ = app_reconcile.emit("clips-changed", ());
                     }
