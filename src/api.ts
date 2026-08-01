@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Bootstrap, Category, ClipSummary, ClipQuery, Settings } from "./types";
+import type { Bootstrap, Category, ClipSummary, ClipQuery, Settings, IntegrationStatus } from "./types";
 
 const tauri = "__TAURI_INTERNALS__" in window;
 
@@ -11,6 +11,32 @@ let demoClips: ClipSummary[] = [
 ];
 
 const mock: Bootstrap = { clips: demoClips, categories: [], settings: { paused: false, autostart: true, shortcut: "Super+V", retentionDays: 90, excludedApps: [] } };
+
+const mockStatus: IntegrationStatus = {
+  isLinux: true,
+  desktopEnvironment: "KDE",
+  sessionType: "x11",
+  isSupportedX11: true,
+  chromeDetected: true,
+  extensionId: null,
+  nativeHostBinaryExists: true,
+  nativeHostExecutable: true,
+  nativeManifestExists: false,
+  nativeManifestValid: false,
+  nativeSocketAvailable: true,
+  nativeMessagingConnected: false,
+  shortcutRegistered: true,
+  autostartEnabled: true,
+  problems: [
+    {
+      id: "manifest_missing",
+      severity: "warning",
+      title: "Native Messaging manifest отсутствует",
+      description: "Chrome-расширение не сможет подключиться к KitsuPin. Установите ID или используйте production .deb пакет.",
+      action: "configure_id"
+    }
+  ]
+};
 
 export const api = {
   bootstrap: (popup: boolean) => tauri ? invoke<Bootstrap>("bootstrap", { popup }) : Promise.resolve(mock),
@@ -63,6 +89,11 @@ export const api = {
     if (clip) { clip.categories = clip.categories.filter(c => c.id !== categoryId); }
     return Promise.resolve();
   })(),
-  saveSettings: (settings: Settings) => tauri ? invoke("save_settings", { settings }) : (mock.settings = settings, Promise.resolve())
+  saveSettings: (settings: Settings) => tauri ? invoke("save_settings", { settings }) : (mock.settings = settings, Promise.resolve()),
+  getIntegrationStatus: () => tauri ? invoke<IntegrationStatus>("get_integration_status") : Promise.resolve(mockStatus),
+  configureExtensionId: (extensionId: string) => tauri ? invoke<IntegrationStatus>("configure_extension_id", { extensionId }) : Promise.resolve({ ...mockStatus, extensionId, nativeManifestExists: true, nativeManifestValid: true, problems: [] }),
+  openExtensionDir: () => tauri ? invoke<string>("open_extension_dir") : Promise.resolve("chrome-extension"),
+  openChromeExtensionsPage: () => tauri ? invoke("open_chrome_extensions_page") : Promise.resolve()
 };
+
 export const isTauri = tauri;

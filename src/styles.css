@@ -4,3 +4,19 @@
 .clip-details-meta{display:flex;gap:16px;font-size:12px;color:var(--muted);border-bottom:1px dashed var(--line);padding-bottom:8px}
 .clip-details-content{font:400 13px/1.6 monospace;background:#f4f0e7;padding:14px;border:1px solid var(--line);max-height:350px;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0}
 
+.settings-tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-top:16px;margin-bottom:18px}
+.tab-btn{border:none;background:transparent;padding:8px 16px;font-size:13px;font-weight:600;color:var(--muted);border-bottom:2px solid transparent}
+.tab-btn.active{color:var(--ink);border-bottom-color:var(--sage)}
+.diag-group{margin-bottom:14px;background:var(--paper);border:1px solid var(--line);padding:12px;border-radius:4px}
+.diag-group h4{margin:0 0 10px 0;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+.diag-item{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px dashed #eee9df;font-size:12px}
+.diag-item:last-child{border-bottom:none}
+.status-ok{color:#2e7d32;font-weight:600}
+.status-warn{color:#d84315;font-weight:600}
+.status-err{color:#c62828;font-weight:600}
+.status-info{color:#558b2f;font-weight:600}
+.problem-card{margin-top:10px;padding:10px 12px;border-left:4px solid var(--coral);background:#fae2dc;color:#92463a;border-radius:2px;font-size:12px}
+.problem-card.warning{border-left-color:var(--sun);background:#fbf4df;color:#87651e}
+.problem-card h5{margin:0 0 4px 0;font-size:13px;font-weight:700}
+.problem-card p{margin:0;line-height:1.4}
+

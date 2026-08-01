@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  release:
+    name: Release Build & Debian Package
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install system dependencies (Ubuntu 24.04)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libx11-dev \
+            libxi-dev \
+            libxtst-dev \
+            libxfixes-dev \
+            pkg-config \
+            patchelf \
+            build-essential
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Frontend Lint
+        run: npm run lint
+
+      - name: Frontend Test
+        run: npm test
+
+      - name: Frontend Build
+        run: npm run build
+
+      - name: Cargo fmt check
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Cargo clippy (main crate)
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Cargo test (main crate)
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Cargo test (core tests)
+        run: cargo test --manifest-path src-tauri/core-tests/Cargo.toml
+
+      - name: Verify Version Consistency
+        id: version
+        run: |
+          TAG_VER="${GITHUB_REF#refs/tags/v}"
+          PKG_VER=$(jq -r '.version' package.json)
+          TAURI_VER=$(jq -r '.version' src-tauri/tauri.conf.json)
+          CARGO_VER=$(grep '^version = ' src-tauri/Cargo.toml | head -n1 | cut -d '"' -f2)
+          EXT_VER=$(jq -r '.version' chrome-extension/manifest.json)
+
+          echo "Tag version: $TAG_VER"
+          echo "package.json version: $PKG_VER"
+          echo "tauri.conf.json version: $TAURI_VER"
+          echo "Cargo.toml version: $CARGO_VER"
+          echo "chrome-extension manifest version: $EXT_VER"
+
+          if [[ "$TAG_VER" != "$PKG_VER" || "$PKG_VER" != "$TAURI_VER" || "$PKG_VER" != "$CARGO_VER" || "$PKG_VER" != "$EXT_VER" ]]; then
+            echo "::error::Версии не совпадают между тегом и манифестами проекта!"
+            exit 1
+          fi
+          echo "version=$PKG_VER" >> "$GITHUB_OUTPUT"
+
+      - name: Build native host binary
+        run: cargo build --release --manifest-path src-tauri/Cargo.toml --bin kitsupin-native-host
+
+      - name: Prepare packaging files
+        run: ./scripts/prepare-release-packaging.sh prod
+        env:
+          KITSUPIN_CHROME_EXTENSION_ID: ${{ vars.KITSUPIN_CHROME_EXTENSION_ID }}
+
+      - name: Build Tauri .deb bundle
+        run: npm run tauri build -- --bundles deb -c staging/tauri.conf.json
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ""
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+
+      - name: Inspect and Verify .deb package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ORIG_DEB=$(ls src-tauri/target/release/bundle/deb/*.deb | head -n1)
+          FINAL_DEB="KitsuPin_${VERSION}_amd64.deb"
+          cp "$ORIG_DEB" "$FINAL_DEB"
+
+          echo "=== dpkg-deb --info ==="
+          dpkg-deb --info "$FINAL_DEB"
+
+          echo "=== dpkg-deb --contents ==="
+          dpkg-deb --contents "$FINAL_DEB"
+
+          CONTENTS=$(dpkg-deb --contents "$FINAL_DEB")
+          echo "$CONTENTS" | grep -q "./usr/bin/kitsupin" || (echo "Ошибка: /usr/bin/kitsupin отсутствует!" && exit 1)
+          echo "$CONTENTS" | grep -q "./usr/lib/kitsupin/kitsupin-native-host" || (echo "Ошибка: /usr/lib/kitsupin/kitsupin-native-host отсутствует!" && exit 1)
+          echo "$CONTENTS" | grep -q "./etc/xdg/autostart/kitsupin.desktop" || (echo "Ошибка: autostart файл отсутствует!" && exit 1)
+
+          if [[ -n "${{ vars.KITSUPIN_CHROME_EXTENSION_ID }}" ]]; then
+            echo "$CONTENTS" | grep -q "./etc/opt/chrome/native-messaging-hosts/io.github.mootxed.kitsupin.native.json" || (echo "Ошибка: system native manifest отсутствует в prod пакете!" && exit 1)
+          fi
+
+          sha256sum "$FINAL_DEB" > "${FINAL_DEB}.sha256"
+
+      - name: Test .deb installation and CLI diagnose
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          FINAL_DEB="KitsuPin_${VERSION}_amd64.deb"
+          sudo dpkg -i "$FINAL_DEB"
+          kitsupin --version
+          kitsupin --help
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            KitsuPin_${{ steps.version.outputs.version }}_amd64.deb
+            KitsuPin_${{ steps.version.outputs.version }}_amd64.deb.sha256
+          draft: false
+          prerelease: false
+          generate_release_notes: true

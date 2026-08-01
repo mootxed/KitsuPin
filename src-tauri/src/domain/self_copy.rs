@@ -59,9 +59,10 @@ impl OwnCopyGuard {
         let mut marks = self.marks.lock();
         let target_hash = content_hash(normalized);
         marks.retain(|m| m.created_at.elapsed() < Duration::from_secs(10));
-        if let Some(pos) = marks.iter().position(|m| {
-            m.created_at.elapsed() < Duration::from_secs(2) && m.hash == target_hash
-        }) {
+        if let Some(pos) = marks
+            .iter()
+            .position(|m| m.created_at.elapsed() < Duration::from_secs(2) && m.hash == target_hash)
+        {
             marks.remove(pos);
             true
         } else {

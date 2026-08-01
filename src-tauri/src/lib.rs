@@ -1,5 +1,6 @@
 pub mod browser_metadata;
 mod clipboard;
+pub mod diagnostics;
 mod domain;
 mod jobs;
 mod migration;
@@ -355,6 +356,77 @@ fn save_settings(
     Ok(())
 }
 
+#[tauri::command]
+fn get_integration_status(
+    state: tauri::State<AppState>,
+) -> CommandResult<diagnostics::IntegrationStatus> {
+    let project = settings::project_dirs().map_err(err)?;
+    let data_dir = project.data_dir();
+    let shortcut_registered = state.registered_shortcut.lock().is_some();
+    let autostart_enabled = state.settings.get().autostart;
+    Ok(diagnostics::get_integration_status(
+        data_dir,
+        shortcut_registered,
+        autostart_enabled,
+    ))
+}
+
+#[tauri::command]
+fn configure_extension_id(
+    state: tauri::State<AppState>,
+    extension_id: String,
+) -> CommandResult<diagnostics::IntegrationStatus> {
+    diagnostics::save_user_extension_manifest(&extension_id).map_err(err)?;
+    let project = settings::project_dirs().map_err(err)?;
+    let data_dir = project.data_dir();
+    let shortcut_registered = state.registered_shortcut.lock().is_some();
+    let autostart_enabled = state.settings.get().autostart;
+    Ok(diagnostics::get_integration_status(
+        data_dir,
+        shortcut_registered,
+        autostart_enabled,
+    ))
+}
+
+#[tauri::command]
+fn open_extension_dir() -> CommandResult<String> {
+    let candidates = [
+        PathBuf::from("/usr/lib/kitsupin/resources/chrome-extension"),
+        PathBuf::from("chrome-extension"),
+        PathBuf::from("../chrome-extension"),
+    ];
+    let mut target_dir = None;
+    for candidate in &candidates {
+        if candidate.exists() {
+            target_dir = Some(
+                candidate
+                    .canonicalize()
+                    .unwrap_or_else(|_| candidate.clone()),
+            );
+            break;
+        }
+    }
+    let path = target_dir.ok_or_else(|| "Каталог Chrome-расширения не найден.".to_string())?;
+    let path_str = path.to_string_lossy().to_string();
+    let _ = std::process::Command::new("xdg-open")
+        .arg(&path_str)
+        .spawn();
+    Ok(path_str)
+}
+
+#[tauri::command]
+fn open_chrome_extensions_page() -> CommandResult<()> {
+    let _ = std::process::Command::new("google-chrome")
+        .arg("chrome://extensions")
+        .spawn()
+        .or_else(|_| {
+            std::process::Command::new("xdg-open")
+                .arg("chrome://extensions")
+                .spawn()
+        });
+    Ok(())
+}
+
 fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
@@ -550,6 +622,83 @@ fn start_single_instance_listener(data_dir: &Path, app: AppHandle) {
 }
 
 pub fn run() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("KitsuPin — Локальная история буфера обмена для KDE X11");
+        println!();
+        println!("Использование:");
+        println!("  kitsupin [ОПЦИИ]");
+        println!();
+        println!("Опции:");
+        println!("  --version    Показать версию приложения и выйти");
+        println!("  --diagnose   Запустить без GUI и проверить состояние интеграции");
+        println!("  --background Запустить приложения в свёрнутом режиме (в системном трее)");
+        println!("  --help, -h   Показать эту справку");
+        return;
+    }
+    if args.iter().any(|arg| arg == "--version" || arg == "-v") {
+        println!("KitsuPin {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if args.iter().any(|arg| arg == "--diagnose") {
+        let project = match settings::project_dirs() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Ошибка при получении каталогов XDG: {e}");
+                std::process::exit(1);
+            }
+        };
+        let data_dir = project.data_dir();
+        let status = diagnostics::get_integration_status(data_dir, true, true);
+        println!("=== KitsuPin Integration Diagnostics ===");
+        println!("OS Linux: {}", status.is_linux);
+        println!(
+            "DE: {}",
+            status
+                .desktop_environment
+                .as_deref()
+                .unwrap_or("неизвестно")
+        );
+        println!(
+            "Session: {}",
+            status.session_type.as_deref().unwrap_or("неизвестно")
+        );
+        println!("X11 Supported: {}", status.is_supported_x11);
+        println!("Chrome Detected: {}", status.chrome_detected);
+        println!(
+            "Native Host Binary Exists: {}",
+            status.native_host_binary_exists
+        );
+        println!("Native Host Executable: {}", status.native_host_executable);
+        println!("Native Manifest Exists: {}", status.native_manifest_exists);
+        println!("Native Manifest Valid: {}", status.native_manifest_valid);
+        println!(
+            "Extension ID: {}",
+            status.extension_id.as_deref().unwrap_or("не задан")
+        );
+        println!(
+            "Native Socket Available: {}",
+            status.native_socket_available
+        );
+        println!("Problems Count: {}", status.problems.len());
+        for p in &status.problems {
+            println!(
+                "  [{}] {}: {}",
+                p.severity.to_uppercase(),
+                p.title,
+                p.description
+            );
+        }
+        let has_critical = status.problems.iter().any(|p| p.severity == "error");
+        if has_critical {
+            eprintln!("Диагностика завершилась с критическими ошибками.");
+            std::process::exit(1);
+        } else {
+            println!("Диагностика прошла успешно (или с предупреждениями).");
+            std::process::exit(0);
+        }
+    }
+
     let background = std::env::args().any(|value| value == "--background");
     let project = settings::project_dirs().expect("XDG directories");
     let data_dir = project.data_dir().to_path_buf();
@@ -638,7 +787,11 @@ pub fn run() {
             delete_category,
             assign_category,
             unassign_category,
-            save_settings
+            save_settings,
+            get_integration_status,
+            configure_extension_id,
+            open_extension_dir,
+            open_chrome_extensions_page
         ])
         .setup(move |app| {
             WebviewWindowBuilder::new(

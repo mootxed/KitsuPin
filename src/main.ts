@@ -468,24 +468,160 @@ function showCategoryModal() {
   );
 }
 
+async function renderIntegrationView(container: HTMLElement) {
+  container.innerHTML = `<div class="notice" style="margin-bottom:12px;">Загрузка диагностики...</div>`;
+  try {
+    const status = await api.getIntegrationStatus();
+    container.innerHTML = `
+      <div class="integration-view">
+        <div class="integration-actions" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+          <b style="font-size:13px;">Диагностика интеграции</b>
+          <button type="button" class="secondary" id="btn-refresh-diagnostics" style="font-size:11px;padding:4px 8px;">
+            <i data-lucide="refresh-cw"></i> Проверить снова
+          </button>
+        </div>
+
+        <div class="diag-group">
+          <h4>Система</h4>
+          <div class="diag-item"><span>Linux OS</span>${status.isLinux ? '<span class="status-ok">✓ Linux</span>' : '<span class="status-err">✗ Не Linux</span>'}</div>
+          <div class="diag-item"><span>Рабочее окружение</span><span>${status.desktopEnvironment ? esc(status.desktopEnvironment) : 'Не определено'}</span></div>
+          <div class="diag-item"><span>Тип сеанса</span>${status.isSupportedX11 ? '<span class="status-ok">✓ X11</span>' : '<span class="status-warn">⚠ Wayland (рекомендуется X11)</span>'}</div>
+        </div>
+
+        <div class="diag-group">
+          <h4>Приложение</h4>
+          <div class="diag-item"><span>Native host установлен</span>${status.nativeHostBinaryExists && status.nativeHostExecutable ? '<span class="status-ok">✓ Исполняемый файл найден</span>' : '<span class="status-err">✗ Отсутствует или нет прав +x</span>'}</div>
+          <div class="diag-item"><span>Native socket</span>${status.nativeSocketAvailable ? '<span class="status-ok">✓ Работает</span>' : '<span class="status-err">✗ Недоступен</span>'}</div>
+          <div class="diag-item"><span>Автозапуск</span>${status.autostartEnabled ? '<span class="status-ok">✓ Включён</span>' : '<span class="status-info">Отключён</span>'}</div>
+          <div class="diag-item"><span>Горячая клавиша</span>${status.shortcutRegistered ? '<span class="status-ok">✓ Зарегистрирована</span>' : '<span class="status-warn">⚠ Не доступна</span>'}</div>
+        </div>
+
+        <div class="diag-group">
+          <h4>Chrome и расширение</h4>
+          <div class="diag-item"><span>Google Chrome</span>${status.chromeDetected ? '<span class="status-ok">✓ Обнаружен</span>' : '<span class="status-warn">⚠ Не найден</span>'}</div>
+          <div class="diag-item"><span>Manifest и Extension ID</span>${status.nativeManifestValid ? `<span class="status-ok">✓ ${esc(status.extensionId || '')}</span>` : '<span class="status-warn">⚠ Не настроен</span>'}</div>
+          <div class="diag-item"><span>Native Messaging</span>${status.nativeMessagingConnected ? '<span class="status-ok">✓ Подключён</span>' : '<span class="status-warn">⚠ Не подключён</span>'}</div>
+        </div>
+
+        ${status.problems.map(p => `
+          <div class="problem-card ${p.severity}">
+            <h5>${esc(p.title)}</h5>
+            <p>${esc(p.description)}</p>
+          </div>
+        `).join('')}
+
+        <div style="margin-top:16px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:12px;">
+          <h4 style="margin:0 0 8px 0;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);">Настройка Chrome-расширения (Alpha / Unpacked)</h4>
+          <p style="margin:0 0 10px 0;font-size:11px;color:var(--muted);line-height:1.4;">
+            Если расширение ещё не установлено из Chrome Web Store, вы можете загрузить распакованную папку расширения:
+          </p>
+          <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;">
+            <button type="button" id="btn-open-ext-page" style="font-size:11px;padding:6px 10px;">Открыть chrome://extensions</button>
+            <button type="button" id="btn-open-ext-dir" style="font-size:11px;padding:6px 10px;">Открыть папку расширения</button>
+          </div>
+          <div class="id-input-group">
+            <label style="font-size:11px;font-weight:700;display:block;margin-bottom:4px;">ID расширения (32 символа a–p):</label>
+            <div style="display:flex;gap:8px;">
+              <input type="text" id="input-ext-id" placeholder="например, abcdefghijklmnopabcdefghijklmnop" value="${esc(status.extensionId || '')}" style="font-family:monospace;font-size:12px;flex:1;padding:6px 8px;" />
+              <button type="button" class="primary" id="btn-save-ext-id" style="font-size:11px;padding:6px 10px;white-space:nowrap;">Сохранить ID</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+    hydrateIcons(container);
+
+    container.querySelector("#btn-refresh-diagnostics")?.addEventListener("click", () => renderIntegrationView(container));
+    container.querySelector("#btn-open-ext-page")?.addEventListener("click", async () => {
+      try {
+        await api.openChromeExtensionsPage();
+        showToast("Открываем chrome://extensions", "info");
+      } catch {
+        showToast("Откройте chrome://extensions вручную в браузере", "info");
+      }
+    });
+    container.querySelector("#btn-open-ext-dir")?.addEventListener("click", async () => {
+      try {
+        const path = await api.openExtensionDir();
+        showToast(`Папка расширения: ${path}`, "info");
+      } catch (e) {
+        showToast(typeof e === "string" ? e : "Не удалось открыть папку расширения");
+      }
+    });
+    container.querySelector("#btn-save-ext-id")?.addEventListener("click", async () => {
+      const input = container.querySelector<HTMLInputElement>("#input-ext-id");
+      const id = input?.value.trim() || "";
+      if (!/^[a-p]{32}$/.test(id)) {
+        showToast("ID должен состоять из ровно 32 символов a–p");
+        return;
+      }
+      try {
+        await api.configureExtensionId(id);
+        showToast("Native Messaging manifest успешно обновлён", "info");
+        await renderIntegrationView(container);
+      } catch (e) {
+        showToast(typeof e === "string" ? e : "Не удалось настроить ID расширения");
+      }
+    });
+  } catch (e) {
+    container.innerHTML = `<div class="notice" style="border-left-color:var(--coral);background:#fae2dc;color:#92463a;padding:12px;">Не удалось выполнить диагностику: ${esc(String(e))}</div>`;
+  }
+}
+
 function showSettings() {
   const s = state.settings;
   if (!s) return;
   const root = modal(
     "Настройки",
-    `<form id="settings-form"><label class="switch-row"><span><b>Запись истории</b><small>Отслеживать обычный X11 Clipboard</small></span><input name="recording" type="checkbox" ${
-      s.paused ? "" : "checked"
-    }/></label><label class="switch-row"><span><b>Автозапуск</b><small>Запускать после входа в KDE</small></span><input name="autostart" type="checkbox" ${
-      s.autostart ? "checked" : ""
-    }/></label><label>Горячая клавиша<input name="shortcut" value="${esc(
-      s.shortcut
-    )}"/></label><label>Хранить незакреплённые карточки, дней<input name="retention" type="number" min="1" max="3650" value="${
-      s.retentionDays
-    }"/></label><div class="notice">Исключение приложений подготовлено архитектурно, но отключено в MVP: X11 не сообщает надёжно источник Clipboard во всех случаях.</div><button class="primary" type="submit">Сохранить</button><button class="danger" type="button" data-clear>Очистить незакреплённую историю</button></form>`
+    `<div class="settings-tabs">
+      <button type="button" class="tab-btn active" data-tab="general">Основные</button>
+      <button type="button" class="tab-btn" data-tab="integration">Интеграция</button>
+    </div>
+    <div id="tab-content-general">
+      <form id="settings-form">
+        <label class="switch-row"><span><b>Запись истории</b><small>Отслеживать обычный X11 Clipboard</small></span><input name="recording" type="checkbox" ${
+          s.paused ? "" : "checked"
+        }/></label>
+        <label class="switch-row"><span><b>Автозапуск</b><small>Запускать после входа в KDE</small></span><input name="autostart" type="checkbox" ${
+          s.autostart ? "checked" : ""
+        }/></label>
+        <label>Горячая клавиша<input name="shortcut" value="${esc(
+          s.shortcut
+        )}"/></label>
+        <label>Хранить незакреплённые карточки, дней<input name="retention" type="number" min="1" max="3650" value="${
+          s.retentionDays
+        }"/></label>
+        <div class="notice">Исключение приложений подготовлено архитектурно, но отключено в MVP: X11 не сообщает надёжно источник Clipboard во всех случаях.</div>
+        <button class="primary" type="submit">Сохранить</button>
+        <button class="danger" type="button" data-clear>Очистить незакреплённую историю</button>
+      </form>
+    </div>
+    <div id="tab-content-integration" style="display:none;"></div>`
   );
   if (!root) return;
 
-  // 6.7: confirm before clearing all history.
+  const tabGeneralBtn = root.querySelector<HTMLElement>('[data-tab="general"]');
+  const tabIntegrationBtn = root.querySelector<HTMLElement>('[data-tab="integration"]');
+  const contentGeneral = root.querySelector<HTMLElement>('#tab-content-general');
+  const contentIntegration = root.querySelector<HTMLElement>('#tab-content-integration');
+
+  tabGeneralBtn?.addEventListener('click', () => {
+    tabGeneralBtn.classList.add('active');
+    tabIntegrationBtn?.classList.remove('active');
+    if (contentGeneral) contentGeneral.style.display = 'block';
+    if (contentIntegration) contentIntegration.style.display = 'none';
+  });
+
+  tabIntegrationBtn?.addEventListener('click', () => {
+    tabIntegrationBtn.classList.add('active');
+    tabGeneralBtn?.classList.remove('active');
+    if (contentGeneral) contentGeneral.style.display = 'none';
+    if (contentIntegration) {
+      contentIntegration.style.display = 'block';
+      renderIntegrationView(contentIntegration);
+    }
+  });
+
   root.querySelector("[data-clear]")?.addEventListener("click", async () => {
     const confirmed = await confirmModal(
       "Очистить историю?",

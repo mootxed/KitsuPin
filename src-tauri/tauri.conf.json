@@ -33,7 +33,9 @@
     "linux": {
       "deb": {
         "files": {
-          "/etc/xdg/autostart/kitsupin.desktop": "../packaging/kitsupin-autostart.desktop"
+          "/usr/lib/kitsupin/kitsupin-native-host": "target/release/kitsupin-native-host",
+          "/etc/xdg/autostart/kitsupin.desktop": "../packaging/kitsupin-autostart.desktop",
+          "/usr/lib/kitsupin/resources/chrome-extension": "../chrome-extension"
         }
       }
     },
