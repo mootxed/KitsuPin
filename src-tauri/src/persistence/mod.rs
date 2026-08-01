@@ -525,6 +525,28 @@ impl Repository {
             )?;
         }
 
+        // ── Migration 9: legacy_imports ledger table ──────────────────────
+        let exists_9: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=9)",
+            [],
+            |r| r.get(0),
+        )?;
+        if !exists_9 {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS legacy_imports (
+                    id TEXT PRIMARY KEY,
+                    source_fingerprint TEXT NOT NULL UNIQUE,
+                    imported_at INTEGER NOT NULL,
+                    source_path TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );",
+            )?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(9, datetime('now'))",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -1096,11 +1118,15 @@ fn format_fts_query(search: &str) -> String {
     }
 }
 
+pub fn is_valid_hex_color(value: &str) -> bool {
+    value.len() == 7
+        && value.starts_with('#')
+        && value[1..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
 fn validate_color(value: &str) -> Result<()> {
     anyhow::ensure!(
-        value.len() == 7
-            && value.starts_with('#')
-            && value[1..].chars().all(|c| c.is_ascii_hexdigit()),
+        is_valid_hex_color(value),
         "цвет должен быть в формате #RRGGBB"
     );
     Ok(())

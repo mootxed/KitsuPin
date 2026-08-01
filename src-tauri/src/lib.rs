@@ -554,7 +554,10 @@ pub fn run() {
     let project = settings::project_dirs().expect("XDG directories");
     let data_dir = project.data_dir().to_path_buf();
     // ── Legacy migration (BEFORE creating target directory or locking single-instance) ──
-    migration::migrate_pastily_to_kitsupin();
+    if migration::migrate_pastily_to_kitsupin() == migration::LegacyMigrationResult::ConflictPreserved {
+        log::error!("KitsuPin startup aborted: migration lock active or migration conflict.");
+        return;
+    }
 
     std::fs::create_dir_all(&data_dir).expect("data directory");
     #[cfg(unix)]
@@ -666,40 +669,8 @@ pub fn run() {
             let repo_reconcile = repo.clone();
             let app_reconcile = app.handle().clone();
             let metadata_reconcile = metadata.clone();
-            let reconcile_callback = Arc::new(move |event: browser_metadata::BrowserCopyEvent| {
-                let event_ts_ms = match event.timestamp_millis() {
-                    Ok(ts) => ts,
-                    Err(_) => Utc::now().timestamp_millis(),
-                };
-                let receipt = metadata_reconcile.take_matching_receipt(
-                    &event.content_hash,
-                    event.content_length,
-                    event_ts_ms,
-                    browser_metadata::RECEIPT_MATCH_WINDOW_MS,
-                );
-                if let Some(receipt) = receipt {
-                    match repo_reconcile.attach_metadata_with_receipt(&event, receipt) {
-                        Ok(Some(id)) => {
-                            metadata_reconcile.remove_event(event.event_id);
-                            log::info!("Late reconciliation: metadata attached to clip {id}");
-                            let _ = app_reconcile.emit("clips-changed", ());
-                        }
-                        Ok(None) => {
-                            log::debug!(
-                                "Late reconciliation: receipt no longer matches DB for hash {}",
-                                event.content_hash
-                            );
-                        }
-                        Err(e) => {
-                            log::warn!("Late reconciliation error: {e}");
-                        }
-                    }
-                } else {
-                    log::debug!(
-                        "Late reconciliation: no receipt found for hash {}; retaining event in buffer",
-                        event.content_hash
-                    );
-                }
+            let reconcile_callback = Arc::new(move |_: browser_metadata::BrowserCopyEvent| {
+                metadata_reconcile.reconcile_pending(&repo_reconcile, Some(&app_reconcile));
             });
 
             if let Err(error) = browser_metadata::start_socket_server(
