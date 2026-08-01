@@ -2,7 +2,7 @@ import js from "@eslint/js";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
-  { ignores: ["dist", "**/target"] },
+  { ignores: ["dist", "**/target", "staging"] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   { files: ["src/**/*.ts"], languageOptions: { globals: { document: "readonly", window: "readonly", HTMLElement: "readonly", KeyboardEvent: "readonly", HTMLInputElement: "readonly", DragEvent: "readonly" } } },

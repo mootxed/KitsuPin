@@ -5,6 +5,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -98,9 +101,7 @@ jobs:
         run: cargo build --release --manifest-path src-tauri/Cargo.toml --bin kitsupin-native-host
 
       - name: Prepare packaging files
-        run: ./scripts/prepare-release-packaging.sh prod
-        env:
-          KITSUPIN_CHROME_EXTENSION_ID: ${{ vars.KITSUPIN_CHROME_EXTENSION_ID }}
+        run: ./scripts/prepare-release-packaging.sh dev
 
       - name: Build Tauri .deb bundle
         run: npm run tauri build -- --bundles deb -c staging/tauri.conf.json
@@ -147,5 +148,5 @@ jobs:
             KitsuPin_${{ steps.version.outputs.version }}_amd64.deb
             KitsuPin_${{ steps.version.outputs.version }}_amd64.deb.sha256
           draft: false
-          prerelease: false
+          prerelease: true
           generate_release_notes: true

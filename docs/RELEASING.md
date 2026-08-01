@@ -17,26 +17,58 @@
 
 ---
 
-## 2. Настройка Production Chrome Extension ID
+## 2. Первый alpha-релиз (v0.1.0)
 
-Для полноценного production-релиза Chrome-расширение публикуется в Chrome Web Store.
-После публикации браузер присваивает расширению постоянный ID (32 символа `a–p`).
+Первый релиз KitsuPin собирается в **alpha/dev packaging mode**, так как Chrome-расширение ещё не опубликовано в Chrome Web Store.
 
-### Настройка в GitHub Actions:
+### Особенности alpha-релиза:
+* Chrome Web Store Extension ID **не требуется** (`KITSUPIN_CHROME_EXTENSION_ID` не нужен).
+* Пассивные системные манифесты Chrome в `/etc/opt/chrome/native-messaging-hosts/` не создаются.
+* Chrome-расширение поставляется в виде распакованного каталога в `/usr/lib/kitsupin/resources/chrome-extension/`.
+* Установка и привязка Chrome-расширения выполняется пользователем через экран диагностики / alpha fallback в интерфейсе приложения (ручной ввод extension ID).
+* Workflow автоматически создает GitHub Release с флагом `prerelease: true`.
+* Кнопку **Create a new release** в графическом интерфейсе GitHub вручную нажимать **не требуется**.
 
-1. Перейдите в репозитории: **Settings → Secrets and variables → Actions → Variables**.
-2. Создайте переменную: `KITSUPIN_CHROME_EXTENSION_ID`.
-3. Укажите в качестве значения 32-значный ID опубликованного расширения (например, `abcdefghijklmnopabcdefghijklmnop`).
+### Команды для публикации первого alpha-релиза v0.1.0:
 
-Если эта переменная установлена, сборщик автоматически добавит в `.deb`:
-* `/etc/opt/chrome/native-messaging-hosts/io.github.mootxed.kitsupin.native.json`
-* `/usr/share/google-chrome/extensions/<EXTENSION_ID>.json`
+```bash
+git switch main
+git pull --ff-only
+git status
 
-Если переменная отсутствует (Alpha/Dev режим), пакет выйдет в режиме разработки, а пользователь сможет ввести ID в окне `Настройки → Интеграция`.
+git tag -a v0.1.0 -m "KitsuPin v0.1.0 alpha"
+git push origin v0.1.0
+```
+
+После отправки тега GitHub Actions автоматически запустит `.github/workflows/release.yml`, соберет `.deb` пакет и создаст prerelease.
 
 ---
 
-## 3. Проверка перед релизом (Pre-flight checks)
+## 3. Переход на Stable / Production релизы в будущем
+
+После публикации Chrome-расширения в Chrome Web Store необходимо перевести workflow в **production packaging mode**:
+
+1. **Опубликовать расширение в Chrome Web Store** и получить постоянный 32-символьный ID (буквы `a–p`).
+2. **Добавить переменную в GitHub**:
+   * Перейти в **Settings → Secrets and variables → Actions → Variables**.
+   * Создать переменную `KITSUPIN_CHROME_EXTENSION_ID` с полученным 32-значным ID.
+3. **Обновить workflow (`.github/workflows/release.yml`)**:
+   * Переключить подготовку пакета с dev на prod:
+     ```yaml
+     - name: Prepare packaging files
+       run: ./scripts/prepare-release-packaging.sh prod
+       env:
+         KITSUPIN_CHROME_EXTENSION_ID: ${{ vars.KITSUPIN_CHROME_EXTENSION_ID }}
+     ```
+   * Изменить флаг `prerelease` с `true` на `false`:
+     ```yaml
+     prerelease: false
+     ```
+4. Закоммитить изменения workflow в ветку `main`.
+
+---
+
+## 4. Проверка перед релизом (Pre-flight checks)
 
 Выполните в терминале перед созданием тега:
 
@@ -53,31 +85,13 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/core-tests/Cargo.toml
 
-# 3. Сборка хоста и подготовка packaging
+# 3. Сборка хоста и подготовка packaging (dev mode)
 cargo build --release --manifest-path src-tauri/Cargo.toml --bin kitsupin-native-host
 ./scripts/prepare-release-packaging.sh dev
 
 # 4. Пробная сборка deb пакета
 npm run tauri build -- --bundles deb -c staging/tauri.conf.json
 ```
-
----
-
-## 4. Публикация нового релиза
-
-1. Закоммитьте все изменения:
-   ```bash
-   git add .
-   git commit -m "chore: bump version to v0.1.0"
-   git push origin main
-   ```
-2. Создайте аннотированный тег версии и отправьте его на GitHub:
-   ```bash
-   git tag -a v0.1.0 -m "Release v0.1.0"
-   git push origin v0.1.0
-   ```
-3. GitHub Actions автоматически запустит `.github/workflows/release.yml`.
-4. После завершения workflow артефакты `KitsuPin_0.1.0_amd64.deb` и `KitsuPin_0.1.0_amd64.deb.sha256` будут прикреплены к созданному GitHub Release.
 
 ---
 
@@ -95,7 +109,7 @@ sudo apt install ./KitsuPin_0.1.0_amd64.deb
 
 # Проверка CLI диагностических флагов
 kitsupin --version
-kitsupin --diagnose
+kitsupin --help
 ```
 
 ---
@@ -119,3 +133,5 @@ kitsupin --diagnose
 * **Приватные ключи (`*.pem`, `*.key`, `*.crx`) строго запрещено коммитить в Git**. Они внесены в `.gitignore`.
 * В `allowed_origins` манифеста никогда не используется wildcard (`*`).
 * Права на бинарные файлы установлены как `0755`, на конфигурационные манифесты — `0644`.
+* При обновлении или повторной установке пакета пользовательские данные не удаляются.
+
