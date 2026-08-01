@@ -38,10 +38,11 @@ sha2 = "0.10"
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-log = "2"
+tempfile = "3"
 thiserror = "2"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 x11rb = { version = "0.13", features = ["xfixes"] }
 
 [dev-dependencies]
-tempfile = "3"
+

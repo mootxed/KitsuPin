@@ -29,10 +29,6 @@ export function mainWindowShell(): string {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 3v2m0 14v2M3 12h2m14 0h2M5.6 5.6 7 7m10 10 1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4"/></svg>
           <span>Настройки</span>
         </button>
-        <button class="navbtn" data-screen="about">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10h.01"/></svg>
-          <span>О приложении</span>
-        </button>
         <div class="sidebar-foot">
           <div class="rec-status" id="rec-status">
             <i class="dot" id="status-dot"></i>
@@ -96,22 +92,9 @@ export function mainWindowShell(): string {
           <nav class="settings-nav">
             <button class="navbtn active" data-tab="general"><span>Основные</span></button>
             <button class="navbtn" data-tab="integration"><span>Интеграция</span></button>
+            <button class="navbtn" data-tab="about"><span>О приложении</span></button>
           </nav>
           <div class="settings-body" id="settings-body"></div>
-        </div>
-      </main>
-
-      <!-- About screen -->
-      <main class="screen" id="about">
-        <div class="empty">
-          <svg class="fox" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
-            <path d="M4 5.5 8.2 8 12 6.5 15.8 8 20 5.5l-1.2 8.2C18.3 17.4 15.5 20 12 21c-3.5-1-6.3-3.6-6.8-7.3L4 5.5Z"/>
-            <path d="m8.5 13 3.5 2.5 3.5-2.5M12 15.5V21"/>
-          </svg>
-          <h1>KitsuPin</h1>
-          <p>Локальная история буфера обмена для KDE Plasma и X11.</p>
-          <div class="kbd" style="display:inline-block">Версия 0.1.1 · Tauri 2</div>
-          <p>Данные хранятся только на этом устройстве.<br>Без аккаунтов, облака и телеметрии.</p>
         </div>
       </main>
     </div>

@@ -43,7 +43,6 @@ const tag = (text: string, className = "", style = "") => `<span class="tag ${cl
 
 // ── Toast notifications ───────────────────────────────────────────────────────
 
-let toastTimer = 0;
 function showToast(message: string, type: "error" | "info" = "error") {
   let container = document.querySelector<HTMLElement>("#toast-container");
   if (!container) {
@@ -63,8 +62,7 @@ function showToast(message: string, type: "error" | "info" = "error") {
       ? "background:#b91c1c;color:#fff;"
       : "background:#1e293b;color:#e2e8f0;");
   container.appendChild(toast);
-  clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => {
+  window.setTimeout(() => {
     toast.remove();
   }, 4000);
 }
@@ -244,6 +242,12 @@ function updateRecordingStatus(paused: boolean) {
   const text = document.querySelector<HTMLElement>("#status-text");
   dot?.classList.toggle("paused", paused);
   if (text) text.textContent = paused ? "Запись приостановлена" : "История записывается";
+  const pauseBtn = document.querySelector<HTMLButtonElement>("#btn-pause");
+  if (pauseBtn) {
+    const span = pauseBtn.querySelector("span");
+    if (span) span.textContent = paused ? "Продолжить" : "Пауза";
+    pauseBtn.title = paused ? "Возобновить запись" : "Приостановить запись";
+  }
 }
 
 // ── Card rendering ────────────────────────────────────────────────────────────
@@ -276,7 +280,7 @@ function clipCard(c: ClipSummary, index: number) {
     : `<button class="iconbtn" data-action="pin" aria-label="Закрепить"><i data-lucide="pin"></i></button>`;
 
   return `<article class="clip ${c.pinned ? "pinned" : ""}" tabindex="0" data-clip="${c.id}" draggable="true" aria-label="Скопировать фрагмент">
-    <div class="clip-main" role="button" tabindex="0">
+    <div class="clip-main">
       <div class="clip-top">
         <strong>${esc(typeLabel)}</strong>
         ${c.domain ? `<span>${esc(c.domain)}</span>` : ""}
@@ -284,7 +288,6 @@ function clipCard(c: ClipSummary, index: number) {
       </div>
       <div class="clip-text">${esc(c.preview)}${isTruncated ? "…" : ""}</div>
       <div class="clip-meta">
-        ${tag(c.contentType, `type-${c.contentType.toLowerCase()}`)}
         ${categories}
         <span>${c.copyCount > 1 ? `скопировано ${c.copyCount} раз` : "одна копия"}${isTruncated ? ` · ${c.contentLength} симв.` : ""}</span>
         <span>· ${relativeTime(c.lastCopiedAt)}</span>
@@ -331,10 +334,11 @@ function renderCards() {
   const root = document.querySelector<HTMLElement>("#cards");
   if (!root) return;
   if (!state.clips.length) {
+    const hasFilter = !!(state.search || state.type || state.category || state.domain);
     root.innerHTML = `<div class="empty">
       <svg class="fox" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M4 5.5 8.2 8 12 6.5 15.8 8 20 5.5l-1.2 8.2C18.3 17.4 15.5 20 12 21c-3.5-1-6.3-3.6-6.8-7.3L4 5.5Z"/></svg>
-      <h2>${state.search ? "Лиса ничего не нашла" : "История пока пуста"}</h2>
-      <p>${state.search ? "Попробуйте другой запрос или сбросьте фильтры." : "Скопируйте текст через Ctrl+C — он появится здесь."}</p>
+      <h2>${hasFilter ? "Лиса ничего не нашла" : "История пока пуста"}</h2>
+      <p>${hasFilter ? "Попробуйте другой запрос или сбросьте фильтры." : "Скопируйте текст через Ctrl+C — он появится здесь."}</p>
     </div>`;
     return;
   }
@@ -378,8 +382,9 @@ function bindCards(root: HTMLElement) {
     });
 
     card.onkeydown = async (e) => {
-      if (e.key === "Enter") {
+      if (e.key === "Enter" || e.key === " ") {
         if (isInteractiveTarget(e.target)) return;
+        if (e.key === " ") e.preventDefault();
         try {
           let content: string | undefined;
           if (!isTauri) content = await api.getClipContent(clip.id);
@@ -564,6 +569,11 @@ function showCategoryModal() {
   root.querySelectorAll<HTMLElement>("[data-delete]").forEach(
     (button) =>
       (button.onclick = async () => {
+        const confirmed = await confirmModal(
+          "Удалить категорию?",
+          "Категория будет удалена из всех фрагментов. Продолжить?"
+        );
+        if (!confirmed) return;
         try {
           await api.deleteCategory(button.dataset.delete!);
           root.innerHTML = "";
@@ -759,11 +769,29 @@ function renderSettingsScreen() {
       btn.classList.add("active");
       if (btn.dataset.tab === "general") renderGeneralTab(body, s);
       else if (btn.dataset.tab === "integration") renderIntegrationView(body);
+      else if (btn.dataset.tab === "about") renderAboutTab(body);
     };
   });
 
   // Default: show general tab
   renderGeneralTab(body, s);
+}
+
+function renderAboutTab(body: HTMLElement) {
+  body.innerHTML = `
+    <div class="panel">
+      <div class="empty" style="padding: 20px 0;">
+        <svg class="fox" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+          <path d="M4 5.5 8.2 8 12 6.5 15.8 8 20 5.5l-1.2 8.2C18.3 17.4 15.5 20 12 21c-3.5-1-6.3-3.6-6.8-7.3L4 5.5Z"/>
+          <path d="m8.5 13 3.5 2.5 3.5-2.5M12 15.5V21"/>
+        </svg>
+        <h1>KitsuPin</h1>
+        <p>Локальная история буфера обмена для KDE Plasma и X11.</p>
+        <div class="kbd" style="display:inline-block">Версия 0.1.1 · Tauri 2</div>
+        <p style="margin-top:12px">Данные хранятся только на этом устройстве.<br>Без аккаунтов, облака и телеметрии.</p>
+      </div>
+    </div>
+  `;
 }
 
 function renderGeneralTab(body: HTMLElement, s: NonNullable<typeof state.settings>) {

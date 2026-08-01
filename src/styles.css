@@ -439,6 +439,7 @@ h3 { font-size: 14px; }
   color: var(--muted);
   font-size: 12px;
   flex-wrap: wrap;
+  padding-right: 136px;
 }
 
 .clip-actions {

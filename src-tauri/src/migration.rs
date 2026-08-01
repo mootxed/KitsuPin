@@ -210,37 +210,31 @@ fn normalize_db_names_in(dir: &Path) {
     let old_db = dir.join("pastily.sqlite3");
     let new_db = dir.join("kitsupin.sqlite3");
     if old_db.exists() && !new_db.exists() {
-        let _ = std::fs::rename(&old_db, &new_db);
-    }
-
-    let old_wal = dir.join("pastily.sqlite3-wal");
-    let new_wal = dir.join("kitsupin.sqlite3-wal");
-    if old_wal.exists() && !new_wal.exists() {
-        let _ = std::fs::rename(&old_wal, &new_wal);
-    }
-
-    let old_shm = dir.join("pastily.sqlite3-shm");
-    let new_shm = dir.join("kitsupin.sqlite3-shm");
-    if old_shm.exists() && !new_shm.exists() {
-        let _ = std::fs::rename(&old_shm, &new_shm);
+        let _ = rename_db_and_sidecars(&old_db, &new_db);
     }
 }
 
 fn rename_db_and_sidecars(src_db: &Path, dst_db: &Path) -> std::io::Result<()> {
-    std::fs::rename(src_db, dst_db)?;
     let src_str = src_db.to_string_lossy();
     let dst_str = dst_db.to_string_lossy();
 
-    let src_wal = PathBuf::from(format!("{src_str}-wal"));
-    let dst_wal = PathBuf::from(format!("{dst_str}-wal"));
-    if src_wal.exists() {
-        let _ = std::fs::rename(&src_wal, &dst_wal);
-    }
+    let pairs = vec![
+        (src_db.to_path_buf(), dst_db.to_path_buf()),
+        (PathBuf::from(format!("{src_str}-wal")), PathBuf::from(format!("{dst_str}-wal"))),
+        (PathBuf::from(format!("{src_str}-shm")), PathBuf::from(format!("{dst_str}-shm"))),
+    ];
 
-    let src_shm = PathBuf::from(format!("{src_str}-shm"));
-    let dst_shm = PathBuf::from(format!("{dst_str}-shm"));
-    if src_shm.exists() {
-        let _ = std::fs::rename(&src_shm, &dst_shm);
+    let mut moved = Vec::new();
+    for (src, dst) in pairs {
+        if src.exists() {
+            if let Err(e) = std::fs::rename(&src, &dst) {
+                for (m_src, m_dst) in moved.into_iter().rev() {
+                    let _ = std::fs::rename(&m_dst, &m_src);
+                }
+                return Err(e);
+            }
+            moved.push((src, dst));
+        }
     }
     Ok(())
 }
@@ -370,33 +364,20 @@ fn backup_database_file(src_db_path: &Path, dst_backup_path: &Path) -> anyhow::R
 
 fn compute_db_fingerprint(db_path: &Path) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
-    let temp_dir = std::env::temp_dir();
-    let temp_snapshot = temp_dir.join(format!("kitsupin_fp_{}.tmp", uuid::Uuid::new_v4()));
+    let temp_dir = tempfile::tempdir()?;
+    let temp_snapshot = temp_dir.path().join(format!("kitsupin_fp_{}.tmp", uuid::Uuid::new_v4()));
 
     let src_conn = Connection::open_with_flags(
         db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    );
+    )?;
 
-    if let Ok(src_conn) = src_conn {
-        if let Ok(mut dst_conn) = Connection::open(&temp_snapshot) {
-            let backup_res =
-                rusqlite::backup::Backup::new(&src_conn, &mut dst_conn).and_then(|b| b.step(-1));
-            drop(dst_conn);
-            drop(src_conn);
-            if backup_res.is_ok() {
-                if let Ok(bytes) = std::fs::read(&temp_snapshot) {
-                    let _ = std::fs::remove_file(&temp_snapshot);
-                    let mut hasher = Sha256::new();
-                    hasher.update(&bytes);
-                    return Ok(format!("{:x}", hasher.finalize()));
-                }
-            }
-        }
-    }
+    let mut dst_conn = Connection::open(&temp_snapshot)?;
+    rusqlite::backup::Backup::new(&src_conn, &mut dst_conn).and_then(|b| b.step(-1))?;
+    drop(dst_conn);
+    drop(src_conn);
 
-    let _ = std::fs::remove_file(&temp_snapshot);
-    let bytes = std::fs::read(db_path)?;
+    let bytes = std::fs::read(&temp_snapshot)?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     Ok(format!("{:x}", hasher.finalize()))
@@ -431,7 +412,13 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
     }
 
     // Compute fingerprint of legacy DB before closing / restoring
-    let fp = compute_db_fingerprint(old_db_path).ok();
+    let fp = match compute_db_fingerprint(old_db_path) {
+        Ok(f) => f,
+        Err(e) => {
+            log::error!("Failed to compute fingerprint of legacy DB {:?}: {e}", old_db_path);
+            return LegacyMigrationResult::ConflictPreserved;
+        }
+    };
 
     // Step 1: Open source DB read-only
     let src_conn = match Connection::open_with_flags(
@@ -482,16 +469,22 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
         return LegacyMigrationResult::ConflictPreserved;
     }
 
-    // Write ledger record to restored database
-    if let Some(fp) = fp {
-        if ensure_legacy_imports_table(&dst_conn).is_ok() {
-            let import_id = uuid::Uuid::new_v4().to_string();
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let _ = dst_conn.execute(
-                "INSERT OR IGNORE INTO legacy_imports(id, source_fingerprint, imported_at, source_path, status) VALUES(?1, ?2, ?3, ?4, 'completed')",
-                params![import_id, fp, now_ms, old_db_path.to_string_lossy()],
-            );
-        }
+    // Write ledger record to restored database — mandatory post-condition
+    if let Err(e) = ensure_legacy_imports_table(&dst_conn) {
+        log::error!("Failed to ensure legacy_imports table in imported DB: {e}");
+        let _ = std::fs::remove_file(&importing_path);
+        return LegacyMigrationResult::ConflictPreserved;
+    }
+
+    let import_id = uuid::Uuid::new_v4().to_string();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    if let Err(e) = dst_conn.execute(
+        "INSERT OR IGNORE INTO legacy_imports(id, source_fingerprint, imported_at, source_path, status) VALUES(?1, ?2, ?3, ?4, 'completed')",
+        params![import_id, fp, now_ms, old_db_path.to_string_lossy()],
+    ) {
+        log::error!("Failed to record ledger entry in imported DB: {e}");
+        let _ = std::fs::remove_file(&importing_path);
+        return LegacyMigrationResult::ConflictPreserved;
     }
 
     drop(dst_conn);
