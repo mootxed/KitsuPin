@@ -110,6 +110,9 @@ jobs:
       - name: Prepare packaging files
         run: ./scripts/prepare-release-packaging.sh dev
 
+      - name: Remove stale bundles
+        run: rm -rf src-tauri/target/release/bundle
+
       - name: Build Tauri .deb bundle
         run: npm run tauri build -- --bundles deb -c staging/tauri.conf.json
         env:
@@ -119,7 +122,17 @@ jobs:
       - name: Inspect and Verify .deb package
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          ORIG_DEB=$(ls src-tauri/target/release/bundle/deb/*.deb | head -n1)
+          ORIG_DEB=$(find src-tauri/target/release/bundle/deb \
+            -maxdepth 1 \
+            -type f \
+            -name "*_${VERSION}_*.deb" \
+            -print -quit)
+
+          if [[ -z "$ORIG_DEB" ]]; then
+            echo "::error::Debian package for version $VERSION was not found"
+            exit 1
+          fi
+
           FINAL_DEB="KitsuPin_${VERSION}_amd64.deb"
           cp "$ORIG_DEB" "$FINAL_DEB"
 
@@ -137,6 +150,11 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           FINAL_DEB="KitsuPin_${VERSION}_amd64.deb"
+
+          if [[ ! -f "$FINAL_DEB" ]]; then
+            echo "::error::Debian package file $FINAL_DEB was not found for testing"
+            exit 1
+          fi
 
           # Simulate legacy /usr/lib/KitsuPin directory to verify preinst cleanup
           sudo mkdir -p /usr/lib/KitsuPin/chrome-extension /usr/lib/KitsuPin/scripts
