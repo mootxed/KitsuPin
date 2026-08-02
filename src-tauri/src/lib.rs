@@ -610,8 +610,11 @@ impl PopupManager {
                 let _ = w.set_focus();
                 #[cfg(target_os = "linux")]
                 if let Ok(gtk_w) = w.gtk_window() {
-                    use gtk::prelude::GtkWindowExt;
-                    gtk_w.present();
+                    // Schedule present() on the GTK main loop via invoke_local—safe from any thread.
+                    glib::MainContext::default().invoke_local(move || {
+                        use gtk::prelude::GtkWindowExt;
+                        gtk_w.present();
+                    });
                 }
 
                 self.schedule_focus_check(app.clone(), generation, 1);
@@ -625,8 +628,11 @@ impl PopupManager {
                 let _ = w.set_focus();
                 #[cfg(target_os = "linux")]
                 if let Ok(gtk_w) = w.gtk_window() {
-                    use gtk::prelude::GtkWindowExt;
-                    gtk_w.present();
+                    // Schedule present() on the GTK main loop via invoke_local—safe from any thread.
+                    glib::MainContext::default().invoke_local(move || {
+                        use gtk::prelude::GtkWindowExt;
+                        gtk_w.present();
+                    });
                 }
 
                 self.schedule_focus_check(app.clone(), generation, attempt);

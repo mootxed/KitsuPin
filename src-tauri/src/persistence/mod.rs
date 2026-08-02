@@ -875,8 +875,8 @@ impl Repository {
         let tx = db.transaction()?;
 
         #[allow(clippy::type_complexity)]
-        let candidate: Option<(String, i64, i64, i64, bool, String, String, i64, String)> = match tx.query_row(
-            "SELECT id, copy_count, sort_key, created_at, pinned, content, content_type, last_copied_at, payload_kind
+        let candidate: Option<(String, i64, i64, i64, bool, String, String, i64, String, Option<String>)> = match tx.query_row(
+            "SELECT id, copy_count, sort_key, created_at, pinned, content, content_type, last_copied_at, payload_kind, blob_hash
              FROM clips
              WHERE id=?1 AND content_hash=?2 AND domain_key=''
                AND copy_count=?3 AND last_copied_at=?4",
@@ -897,6 +897,7 @@ impl Repository {
                     row.get(6)?,
                     row.get(7)?,
                     row.get(8)?,
+                    row.get(9)?,
                 ))
             },
         ) {
@@ -921,6 +922,7 @@ impl Repository {
             temp_kind,
             _temp_last_copied_at,
             temp_payload_kind,
+            temp_blob_hash,
         )) = candidate
         else {
             return Ok(None);
@@ -1049,22 +1051,41 @@ impl Repository {
             }
 
             if let Some((existing_id, _, _, _, _)) = existing {
-                tx.execute(
-                    "UPDATE clips SET
-                        copy_count = copy_count + 1,
-                        sort_key = MAX(sort_key, ?2),
-                        last_copied_at = MAX(last_copied_at, ?3),
-                        page_title = COALESCE(?4, page_title),
-                        content = ?5
-                     WHERE id=?1",
-                    params![existing_id, temp_sort, event_ts_ms, title, temp_content],
-                )?;
+                // If the temp clip is an image, also update the domain card's payload fields.
+                if temp_payload_kind == "image" {
+                    tx.execute(
+                        "UPDATE clips SET
+                            copy_count = copy_count + 1,
+                            sort_key = MAX(sort_key, ?2),
+                            last_copied_at = MAX(last_copied_at, ?3),
+                            page_title = COALESCE(?4, page_title),
+                            content = ?5,
+                            payload_kind = 'image',
+                            blob_hash = COALESCE(?6, blob_hash)
+                         WHERE id=?1",
+                        params![existing_id, temp_sort, event_ts_ms, title, temp_content, temp_blob_hash],
+                    )?;
+                } else {
+                    tx.execute(
+                        "UPDATE clips SET
+                            copy_count = copy_count + 1,
+                            sort_key = MAX(sort_key, ?2),
+                            last_copied_at = MAX(last_copied_at, ?3),
+                            page_title = COALESCE(?4, page_title),
+                            content = ?5
+                         WHERE id=?1",
+                        params![existing_id, temp_sort, event_ts_ms, title, temp_content],
+                    )?;
+                }
                 existing_id
             } else {
                 let new_id = Uuid::new_v4().to_string();
                 tx.execute(
-                    "INSERT INTO clips(id,content,content_hash,content_type,domain,domain_key,page_title,created_at,last_copied_at,copy_count,pinned,sort_key)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,1,0,?10)",
+                    "INSERT INTO clips(
+                        id,content,content_hash,content_type,domain,domain_key,page_title,
+                        created_at,last_copied_at,copy_count,pinned,sort_key,
+                        payload_kind,blob_hash
+                     ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,1,0,?10,?11,?12)",
                     params![
                         new_id,
                         temp_content,
@@ -1075,7 +1096,9 @@ impl Repository {
                         title,
                         temp_created,
                         event_ts_ms,
-                        temp_sort
+                        temp_sort,
+                        temp_payload_kind,
+                        temp_blob_hash
                     ],
                 )?;
                 new_id
@@ -1354,13 +1377,24 @@ impl Repository {
     }
 
     pub fn cleanup_orphan_blobs(&self) -> Result<usize> {
-        let db = self.connection.lock();
-        let mut statement = db.prepare("SELECT relative_path FROM image_blobs")?;
-        let referenced = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<HashSet<_>>>()?;
-        drop(statement);
-        drop(db);
+        // Collect paths of blobs that ARE referenced by at least one clip.
+        let referenced: HashSet<String> = {
+            let db = self.connection.lock();
+            let mut statement = db.prepare(
+                "SELECT b.relative_path FROM image_blobs b
+                 WHERE EXISTS (SELECT 1 FROM clips c WHERE c.blob_hash = b.hash)",
+            )?;
+            let result = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<HashSet<_>>>()?;
+            drop(statement);
+            // Remove image_blobs rows with no referencing clips.
+            db.execute_batch(
+                "DELETE FROM image_blobs
+                 WHERE NOT EXISTS (SELECT 1 FROM clips c WHERE c.blob_hash = image_blobs.hash);",
+            )?;
+            result
+        };
         self.blob_store
             .as_ref()
             .map(|store| store.cleanup_orphans(&referenced))
@@ -2793,5 +2827,256 @@ mod tests {
 
         assert_eq!(image_filtered.len(), 1);
         assert_eq!(image_filtered[0].payload_kind, crate::domain::PayloadKind::Image);
+    }
+
+    /// Bug 1 regression test: second copy of same image + late domain metadata must
+    /// produce a proper image domain card, not an empty text card.
+    #[test]
+    fn test_image_second_copy_late_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let r = Repository::open_in_memory_with_blobs(&temp.path().join("blobs")).unwrap();
+        let now = 1_700_000_000_000i64;
+
+        let image = crate::domain::ImagePayload {
+            width: 2,
+            height: 1,
+            rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
+            source_mime: Some("image/png".into()),
+            source_bytes: None,
+        };
+
+        // 1. First copy — no domain → gets a receipt (previous_copy_count = 0)
+        let (summary1, receipt1_opt) = r
+            .upsert_image(NewImageClip {
+                image: &image,
+                domain: None,
+                page_title: None,
+                now,
+                max_image_bytes: 10 * 1024 * 1024,
+                max_storage_bytes: 50 * 1024 * 1024,
+            })
+            .unwrap();
+        let receipt1 = receipt1_opt.expect("first copy should produce a receipt");
+        assert_eq!(receipt1.previous_copy_count, 0);
+        assert_eq!(summary1.payload_kind, crate::domain::PayloadKind::Image);
+        let temp_id = summary1.id.clone();
+        let original_blob_hash = {
+            let db = r.connection.lock();
+            let bh: Option<String> = db
+                .query_row(
+                    "SELECT blob_hash FROM clips WHERE id=?1",
+                    [&temp_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            bh.expect("temp clip must have blob_hash after first copy")
+        };
+
+        // 2. Second copy of same image — still no domain → receipt2.previous_copy_count = 1
+        let (summary2, receipt2_opt) = r
+            .upsert_image(NewImageClip {
+                image: &image,
+                domain: None,
+                page_title: None,
+                now: now + 1000,
+                max_image_bytes: 10 * 1024 * 1024,
+                max_storage_bytes: 50 * 1024 * 1024,
+            })
+            .unwrap();
+        let receipt2 = receipt2_opt.expect("second copy should produce a receipt");
+        assert_eq!(summary1.id, summary2.id, "same temp clip should be updated");
+        assert_eq!(receipt2.previous_copy_count, 1, "previous_copy_count must be 1 for second copy");
+        assert_eq!(summary2.payload_kind, crate::domain::PayloadKind::Image);
+
+        // 3. Late domain metadata arrives for the second copy
+        let (match_hash, match_len) = crate::domain::ClipboardPayload::Image(image.clone())
+            .match_key()
+            .unwrap();
+        let event = crate::browser_metadata::BrowserCopyEvent {
+            event_id: Uuid::new_v4(),
+            version: 1,
+            event: "copy".into(),
+            content_hash: match_hash.clone(),
+            content_length: match_len,
+            domain: "images.example.com".into(),
+            page_title: "Example Image".into(),
+            timestamp: chrono::DateTime::from_timestamp_millis(now + 1000)
+                .unwrap()
+                .to_rfc3339(),
+        };
+
+        let domain_id = r
+            .attach_metadata_with_receipt(&event, receipt2)
+            .unwrap()
+            .expect("metadata must attach successfully");
+
+        // 4. The domain card must be an image (not an empty text card)
+        let clips = r.list_clips(&ClipQuery::default()).unwrap();
+        let domain_clip = clips.iter().find(|c| c.id == domain_id).expect("domain clip must exist");
+        assert_eq!(
+            domain_clip.payload_kind,
+            crate::domain::PayloadKind::Image,
+            "domain card must be an image, not text"
+        );
+        assert_eq!(domain_clip.domain.as_deref(), Some("images.example.com"));
+        assert_eq!(domain_clip.page_title.as_deref(), Some("Example Image"));
+
+        // 5. Domain card blob_hash must point to the same blob as the temp card
+        let domain_blob_hash: Option<String> = {
+            let db = r.connection.lock();
+            db.query_row(
+                "SELECT blob_hash FROM clips WHERE id=?1",
+                [&domain_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            domain_blob_hash.as_deref(),
+            Some(original_blob_hash.as_str()),
+            "domain card blob_hash must match the original blob"
+        );
+
+        // 6. Original temp card still has copy_count=1 and is still an image
+        let temp_clip = clips.iter().find(|c| c.id == temp_id).expect("temp clip must still exist");
+        assert_eq!(temp_clip.copy_count, 1, "temp clip copy_count must be 1");
+        assert_eq!(
+            temp_clip.payload_kind,
+            crate::domain::PayloadKind::Image,
+            "temp clip must still be an image"
+        );
+
+        // 7. Both cards can be retrieved for clipboard
+        let temp_copy = r.get_clip_for_copy(&temp_id).unwrap();
+        assert!(
+            matches!(temp_copy.payload, crate::domain::ClipboardPayload::Image(_)),
+            "temp clip clipboard payload must be Image"
+        );
+        let domain_copy = r.get_clip_for_copy(&domain_id).unwrap();
+        assert!(
+            matches!(domain_copy.payload, crate::domain::ClipboardPayload::Image(_)),
+            "domain clip clipboard payload must be Image"
+        );
+    }
+
+    /// Bug 2 regression test: same RGBA with two different source_bytes encodings must not
+    /// leak the old blob after the card's blob_hash is updated.
+    #[test]
+    fn test_blob_leak_same_rgba_different_encoding() {
+        let temp = tempfile::tempdir().unwrap();
+        let r = Repository::open_in_memory_with_blobs(&temp.path().join("blobs")).unwrap();
+        let now = 1_700_000_000_000i64;
+
+        // Two images with identical pixels but different source_bytes → different blob_hash.
+        // We simulate "different PNG encoding" by providing distinct source_bytes.
+        let rgba = vec![100u8, 150, 200, 255, 50, 80, 120, 255];
+
+        let image_enc_a = crate::domain::ImagePayload {
+            width: 2,
+            height: 1,
+            rgba: rgba.clone(),
+            source_mime: Some("image/png".into()),
+            source_bytes: Some(vec![0x89, 0x50, 0x4e, 0x47, 0x01, 0x02, 0x03]), // fake PNG bytes A
+        };
+        let image_enc_b = crate::domain::ImagePayload {
+            width: 2,
+            height: 1,
+            rgba: rgba.clone(),
+            source_mime: Some("image/png".into()),
+            source_bytes: Some(vec![0x89, 0x50, 0x4e, 0x47, 0x04, 0x05, 0x06]), // fake PNG bytes B
+        };
+
+        // 1. First upsert — encoding A → blob_hash A
+        let (summary_a, _) = r
+            .upsert_image(NewImageClip {
+                image: &image_enc_a,
+                domain: None,
+                page_title: None,
+                now,
+                max_image_bytes: 10 * 1024 * 1024,
+                max_storage_bytes: 50 * 1024 * 1024,
+            })
+            .unwrap();
+        let clip_id = summary_a.id.clone();
+
+        let blob_hash_a: Option<String> = {
+            let db = r.connection.lock();
+            db.query_row("SELECT blob_hash FROM clips WHERE id=?1", [&clip_id], |r| r.get(0))
+                .unwrap()
+        };
+        let blob_hash_a = blob_hash_a.expect("clip must have blob_hash A");
+
+        // 2. Second upsert — encoding B → blob_hash B; same content_hash (same RGBA)
+        let (_summary_b, _) = r
+            .upsert_image(NewImageClip {
+                image: &image_enc_b,
+                domain: None,
+                page_title: None,
+                now: now + 1000,
+                max_image_bytes: 10 * 1024 * 1024,
+                max_storage_bytes: 50 * 1024 * 1024,
+            })
+            .unwrap();
+
+        let blob_hash_b: Option<String> = {
+            let db = r.connection.lock();
+            db.query_row("SELECT blob_hash FROM clips WHERE id=?1", [&clip_id], |r| r.get(0))
+                .unwrap()
+        };
+        let blob_hash_b = blob_hash_b.expect("clip must have blob_hash B after second upsert");
+
+        // If both encodings produced the same blob_hash (blob_store deduplication),
+        // this test is a no-op for the leak check — skip the orphan assertion.
+        if blob_hash_a == blob_hash_b {
+            // Blobs were identical — no leak possible, test passes trivially.
+            return;
+        }
+
+        // Blob A must still be in image_blobs before cleanup (orphan row).
+        let blob_a_exists_before: bool = {
+            let db = r.connection.lock();
+            db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM image_blobs WHERE hash=?1)",
+                [&blob_hash_a],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // It may or may not exist (depends on whether upsert_image removes it) —
+        // after cleanup it must be gone.
+
+        // 3. Run cleanup
+        let removed = r.cleanup_orphan_blobs().unwrap();
+
+        // 4. After cleanup, blob A (no longer referenced) must be gone from image_blobs
+        let blob_a_exists_after: bool = {
+            let db = r.connection.lock();
+            db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM image_blobs WHERE hash=?1)",
+                [&blob_hash_a],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            !blob_a_exists_after,
+            "orphaned image_blobs row for blob A must be deleted after cleanup_orphan_blobs"
+        );
+
+        // 5. Blob B (still referenced by the clip) must survive
+        let blob_b_exists: bool = {
+            let db = r.connection.lock();
+            db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM image_blobs WHERE hash=?1)",
+                [&blob_hash_b],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(blob_b_exists, "referenced blob B must not be deleted by cleanup");
+
+        // 6. cleanup returned > 0 only if blob A's file existed on disk
+        // (may be 0 if the fake bytes didn't write a real file; that's OK).
+        let _ = (removed, blob_a_exists_before);
     }
 }

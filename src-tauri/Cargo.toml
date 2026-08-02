@@ -50,5 +50,6 @@ x11rb = { version = "0.13", features = ["xfixes"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 gdk = "0.18"
 gtk = "0.18"
+glib = "0.18"
 
 [dev-dependencies]

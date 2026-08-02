@@ -1849,6 +1849,7 @@ dependencies = [
  "directories",
  "fs2",
  "gdk",
+ "glib",
  "gtk",
  "hex",
  "image",
