@@ -62,18 +62,56 @@ impl BrowserCopyEvent {
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
-static LAST_NATIVE_MESSAGE_AT: AtomicI64 = AtomicI64::new(0);
+static LAST_EXTENSION_HANDSHAKE_AT: AtomicI64 = AtomicI64::new(0);
 
-pub fn record_native_message_received() {
-    LAST_NATIVE_MESSAGE_AT.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
+static LAST_BROWSER_COPY_METADATA_AT: AtomicI64 = AtomicI64::new(0);
+
+pub const HANDSHAKE_TTL_MS: i64 = 45_000;
+
+pub fn record_extension_handshake_received() {
+    LAST_EXTENSION_HANDSHAKE_AT.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
 }
 
-pub fn get_last_message_at() -> Option<i64> {
-    let ts = LAST_NATIVE_MESSAGE_AT.load(Ordering::Relaxed);
+pub fn record_copy_metadata_received() {
+    LAST_BROWSER_COPY_METADATA_AT.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
+}
+
+pub fn get_last_extension_handshake_at() -> Option<i64> {
+    let ts = LAST_EXTENSION_HANDSHAKE_AT.load(Ordering::Relaxed);
     if ts > 0 {
         Some(ts)
     } else {
         None
+    }
+}
+
+pub fn get_last_browser_copy_metadata_at() -> Option<i64> {
+    let ts = LAST_BROWSER_COPY_METADATA_AT.load(Ordering::Relaxed);
+    if ts > 0 {
+        Some(ts)
+    } else {
+        None
+    }
+}
+
+pub fn get_last_message_at() -> Option<i64> {
+    match (
+        get_last_extension_handshake_at(),
+        get_last_browser_copy_metadata_at(),
+    ) {
+        (Some(h), Some(c)) => Some(h.max(c)),
+        (Some(h), None) => Some(h),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    }
+}
+
+pub fn is_handshake_active() -> bool {
+    let now = chrono::Utc::now().timestamp_millis();
+    if let Some(ts) = get_last_extension_handshake_at() {
+        (now - ts).abs() <= HANDSHAKE_TTL_MS
+    } else {
+        false
     }
 }
 
@@ -110,7 +148,7 @@ impl MetadataBuffer {
     pub fn push(&self, event: BrowserCopyEvent) -> Result<()> {
         let event = event.validate()?;
         let at = DateTime::parse_from_rfc3339(&event.timestamp)?.with_timezone(&Utc);
-        record_native_message_received();
+        record_copy_metadata_received();
         let mut events = self.events.lock();
         events.push_back(BufferedEvent {
             at,
@@ -364,12 +402,34 @@ fn read_stream(
     for line in BufReader::new(stream).lines().take(8) {
         match line {
             Ok(line) if line.len() <= 16_384 => {
-                match serde_json::from_str::<BrowserCopyEvent>(&line) {
-                    Ok(event) => match buffer.push(event.clone()) {
-                        Ok(()) => reconcile(event),
-                        Err(e) => log::warn!("Отклонено сообщение Chrome: {e}"),
-                    },
-                    Err(e) => log::warn!("Отклонён некорректный JSON Chrome: {e}"),
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                    let event_type = val.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                    if event_type == "status" {
+                        record_extension_handshake_received();
+                        log::info!("Extension handshake accepted via Native Host socket");
+                    } else if event_type == "copy" {
+                        record_copy_metadata_received();
+                        match serde_json::from_value::<BrowserCopyEvent>(val) {
+                            Ok(event) => {
+                                let hash_prefix = if event.content_hash.len() >= 8 {
+                                    &event.content_hash[..8]
+                                } else {
+                                    &event.content_hash
+                                };
+                                log::info!(
+                                    "Browser copy event accepted: id={}, domain={}, hash_prefix={}, len={}",
+                                    event.event_id, event.domain, hash_prefix, event.content_length
+                                );
+                                match buffer.push(event.clone()) {
+                                    Ok(()) => reconcile(event),
+                                    Err(e) => log::warn!("Отклонено событие Chrome: {e}"),
+                                }
+                            }
+                            Err(e) => log::warn!("Отклонён некорректный JSON copy Chrome: {e}"),
+                        }
+                    } else {
+                        log::warn!("Неизвестный тип события Chrome: {event_type}");
+                    }
                 }
             }
             _ => break,

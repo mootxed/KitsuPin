@@ -22,6 +22,9 @@ pub struct IntegrationStatus {
     pub native_messaging_configured: bool,
     pub native_messaging_connected: bool,
     pub last_native_message_at: Option<i64>,
+    pub last_extension_handshake_at: Option<i64>,
+    pub last_browser_copy_metadata_at: Option<i64>,
+    pub handshake_active: bool,
     pub shortcut_registered: Option<bool>,
     pub autostart_enabled: bool,
     pub problems: Vec<IntegrationProblem>,
@@ -282,10 +285,19 @@ pub fn get_integration_status(
     let native_manifest_valid = chrome_manifest_valid || chromium_manifest_valid;
     let socket_path = crate::browser_metadata::socket_path(data_dir);
     let native_socket_available = socket_path.exists();
-    let last_native_message_at = crate::browser_metadata::get_last_message_at();
+    let last_extension_handshake_at = crate::browser_metadata::get_last_extension_handshake_at();
+    let last_browser_copy_metadata_at =
+        crate::browser_metadata::get_last_browser_copy_metadata_at();
+    let handshake_active = crate::browser_metadata::is_handshake_active();
+    let last_native_message_at = match (last_extension_handshake_at, last_browser_copy_metadata_at)
+    {
+        (Some(h), Some(c)) => Some(h.max(c)),
+        (Some(h), None) => Some(h),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    };
     let native_messaging_configured = native_socket_available && native_manifest_valid;
-    let native_messaging_connected =
-        native_messaging_configured && last_native_message_at.is_some();
+    let native_messaging_connected = native_messaging_configured && handshake_active;
 
     let mut problems = Vec::new();
 
@@ -408,6 +420,9 @@ pub fn get_integration_status(
         native_messaging_configured,
         native_messaging_connected,
         last_native_message_at,
+        last_extension_handshake_at,
+        last_browser_copy_metadata_at,
+        handshake_active,
         shortcut_registered,
         autostart_enabled,
         problems,

@@ -40,7 +40,28 @@ const app = document.querySelector<HTMLElement>("#app")!;
 const esc = (value: string) =>
   value.replace(/[&<>'"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[c]!));
 
+function showDragHintBanner(message: string) {
+  let banner = document.querySelector<HTMLElement>("#drag-hint-banner");
+  if (!banner) {
+    banner = document.createElement("div");
+    banner.id = "drag-hint-banner";
+    document.body.appendChild(banner);
+  }
+  banner.textContent = message;
+}
+
+function removeDragHintBanner() {
+  document.querySelector("#drag-hint-banner")?.remove();
+}
+
+function cleanupDragState() {
+  document.body.classList.remove("is-dragging-card");
+  removeDragHintBanner();
+  document.querySelectorAll(".chip.user-chip.drop-over").forEach((el) => el.classList.remove("drop-over"));
+}
+
 // ── Toast notifications ───────────────────────────────────────────────────────
+
 
 function showToast(message: string, type: "error" | "info" = "error") {
   let container = document.querySelector<HTMLElement>("#toast-container");
@@ -129,13 +150,37 @@ function bindFilters(root: HTMLElement) {
       state.type = state.domain = null;
       refresh();
     };
-    el.ondragover = (e) => e.preventDefault();
+    el.ondragover = (e) => {
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+      el.classList.add("drop-over");
+    };
+    el.ondragleave = () => {
+      el.classList.remove("drop-over");
+    };
     el.ondrop = (e) => {
       e.preventDefault();
-      const id = e.dataTransfer?.getData("text/kitsupin");
-      if (id) api.assign(id, el.dataset.category!).then(reload).catch(() => showToast("Не удалось назначить категорию"));
+      el.classList.remove("drop-over");
+      cleanupDragState();
+      const clipId = e.dataTransfer?.getData("text/kitsupin");
+      const catId = el.dataset.category;
+      if (!clipId || !catId) return;
+      const targetCat = state.categories.find((c) => c.id === catId);
+      const targetClip = state.clips.find((c) => c.id === clipId);
+      const catName = targetCat ? targetCat.name : "";
+      if (targetClip && targetClip.categories.some((c) => c.id === catId)) {
+        showToast(`Карточка уже в категории «${catName}»`, "info");
+        return;
+      }
+      api.assign(clipId, catId)
+        .then(() => {
+          showToast(`Добавлено в категорию «${catName}»`, "info");
+          reload();
+        })
+        .catch(() => showToast("Не удалось назначить категорию"));
     };
   });
+
   root.querySelectorAll<HTMLElement>("[data-domain]").forEach(
     (el) =>
       (el.onclick = () => {
@@ -257,7 +302,10 @@ function clipCard(c: ClipSummary, index: number) {
 
   if (popup) {
     // Compact popup style — popitem
-    const metaLabel = c.domain ? `${typeLabel} · ${c.domain}` : typeLabel;
+    const metaParts: string[] = [typeLabel];
+    if (c.domain) metaParts.push(esc(c.domain));
+    if (c.pageTitle) metaParts.push(esc(c.pageTitle));
+    const metaLabel = metaParts.join(" · ");
     const isSelected = index === state.selected;
     return `<button class="popitem ${isSelected ? "selected" : ""}" tabindex="0" data-clip="${c.id}" id="clip-item-${index}" role="option" aria-selected="${isSelected}" aria-label="Скопировать фрагмент ${index + 1}: ${esc(c.preview)}">
       <span class="popnum">${index + 1 <= 9 ? index + 1 : "·"}</span>
@@ -277,12 +325,21 @@ function clipCard(c: ClipSummary, index: number) {
     ? `<button class="iconbtn" data-action="pin" aria-label="Открепить"><i data-lucide="pin-off"></i></button>`
     : `<button class="iconbtn" data-action="pin" aria-label="Закрепить"><i data-lucide="pin"></i></button>`;
 
-  return `<article class="clip ${c.pinned ? "pinned" : ""}" data-clip="${c.id}" draggable="true">
+  const dragHandleHtml = state.categories.length > 0
+    ? `<button class="drag-handle" data-clip-drag="${c.id}" draggable="true" title="Перетащить в категорию" aria-label="Перетащить в категорию"><i data-lucide="grip-vertical"></i></button>`
+    : "";
+
+  const headerSource = [
+    c.domain ? `<span>${esc(c.domain)}</span>` : "",
+    c.pageTitle ? `<span>${esc(c.pageTitle)}</span>` : ""
+  ].filter(Boolean).join("<span>·</span>");
+
+  return `<article class="clip ${c.pinned ? "pinned" : ""}" data-clip="${c.id}">
+    ${dragHandleHtml}
     <div class="clip-main" tabindex="0" role="button" aria-label="Скопировать фрагмент">
       <div class="clip-top">
         <strong>${esc(typeLabel)}</strong>
-        ${c.domain ? `<span>${esc(c.domain)}</span>` : ""}
-        ${c.pageTitle ? `<span>·</span><span>${esc(c.pageTitle)}</span>` : ""}
+        ${headerSource ? `<span>·</span>${headerSource}` : ""}
       </div>
       <div class="clip-text">${esc(c.preview)}${isTruncated ? "…" : ""}</div>
       <div class="clip-meta">
@@ -299,6 +356,7 @@ function clipCard(c: ClipSummary, index: number) {
     </div>
   </article>`;
 }
+
 
 function groups(): [string, ClipSummary[]][] {
   if (state.grouping === "none") return [["", state.clips]];
@@ -416,16 +474,19 @@ function bindCards(root: HTMLElement) {
       }
     });
 
-    card.ondragstart = (e) => {
-      if (e.target instanceof Element) {
-        const closestInteractive = e.target.closest('button, .clip-actions, input, a, .tag');
-        if (closestInteractive && closestInteractive !== card) {
-          e.preventDefault();
-          return;
-        }
-      }
-      e.dataTransfer?.setData("text/kitsupin", clip.id);
-    };
+    const dragBtn = card.querySelector<HTMLElement>("[data-clip-drag]");
+    if (dragBtn) {
+      dragBtn.ondragstart = (e) => {
+        e.dataTransfer?.setData("text/kitsupin", clip.id);
+        if (e.dataTransfer) e.dataTransfer.effectAllowed = "copy";
+        document.body.classList.add("is-dragging-card");
+        showDragHintBanner("Перетащите карточку на пользовательскую категорию");
+      };
+      dragBtn.ondragend = () => {
+        cleanupDragState();
+      };
+    }
+
 
     card.querySelector<HTMLElement>("[data-action=details]")?.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -694,12 +755,28 @@ async function renderIntegrationView(container: HTMLElement) {
   container.innerHTML = `<div class="notice" style="margin-bottom:12px;">Загрузка диагностики...</div>`;
   try {
     const status = await api.getIntegrationStatus();
+    const handshakeText = status.lastExtensionHandshakeAt ? relativeTime(status.lastExtensionHandshakeAt) : "нет данных";
+    const copyMetaText = status.lastBrowserCopyMetadataAt ? relativeTime(status.lastBrowserCopyMetadataAt) : "нет данных";
+
+    let extStatusLabel = "Не подключено";
+    let extStatusClass = "status-warn";
+    if (status.nativeMessagingConnected) {
+      extStatusLabel = "✓ Подключено (Связь активна)";
+      extStatusClass = "status-ok";
+    } else if (status.nativeMessagingConfigured) {
+      extStatusLabel = "ℹ Установлено, но связь ещё не подтверждена";
+      extStatusClass = "status-info";
+    } else if (!status.nativeSocketAvailable) {
+      extStatusLabel = "✗ KitsuPin недоступен";
+      extStatusClass = "status-err";
+    }
+
     container.innerHTML = `
       <div class="integration-view">
         <div class="integration-actions" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
           <b style="font-size:13px;">Диагностика интеграции</b>
           <button type="button" class="secondary" id="btn-refresh-diagnostics" style="font-size:11px;padding:4px 8px;">
-            <i data-lucide="refresh-cw"></i> Проверить снова
+            <i data-lucide="refresh-cw"></i> Обновить статус
           </button>
         </div>
 
@@ -723,8 +800,11 @@ async function renderIntegrationView(container: HTMLElement) {
           <div class="diag-item"><span>Браузер</span>${status.chromeDetected ? '<span class="status-ok">✓ Обнаружен</span>' : '<span class="status-warn">⚠ Не найден</span>'}</div>
           <div class="diag-item"><span>Chrome Manifest</span>${status.chromeManifestValid ? `<span class="status-ok">✓ ${esc(status.extensionId || '')}</span>` : '<span class="status-warn">⚠ Не настроен</span>'}</div>
           <div class="diag-item"><span>Chromium Manifest</span>${status.chromiumManifestValid ? `<span class="status-ok">✓ ${esc(status.extensionId || '')}</span>` : '<span class="status-warn">⚠ Не настроен</span>'}</div>
-          <div class="diag-item"><span>Native Messaging</span>${status.nativeMessagingConnected ? '<span class="status-ok">✓ Подключён</span>' : status.nativeMessagingConfigured ? '<span class="status-info">ℹ Настроено</span>' : '<span class="status-warn">⚠ Не подключён</span>'}</div>
+          <div class="diag-item"><span>Native Messaging</span><span class="${extStatusClass}">${extStatusLabel}</span></div>
+          <div class="diag-item"><span>Последний handshake</span><span>${handshakeText}</span></div>
+          <div class="diag-item"><span>Последняя передача метаданных</span><span>${copyMetaText}</span></div>
         </div>
+
 
         ${status.problems.map(p => `
           <div class="problem-card ${p.severity}">
@@ -877,10 +957,11 @@ function renderGeneralTab(body: HTMLElement) {
         <i class="dot" id="ext-dot"></i>
         <div>
           <strong id="ext-status-label">Проверка…</strong>
-          <span>Передаются только домен и заголовок вкладки. Полный URL не сохраняется.</span>
+          <span id="ext-status-subtext">Передаются только домен и заголовок вкладки. Полный URL не сохраняется.</span>
         </div>
-        <button class="btn" style="margin-left:auto" id="btn-check-ext">Проверить</button>
+        <button class="btn" style="margin-left:auto" id="btn-check-ext">Обновить статус</button>
       </div>
+
     </div>
   `;
   hydrateIcons(body);
@@ -974,13 +1055,26 @@ function renderGeneralTab(body: HTMLElement) {
       const status = await api.getIntegrationStatus();
       const label = body.querySelector<HTMLElement>("#ext-status-label");
       const dot = body.querySelector<HTMLElement>("#ext-dot");
-      if (label) label.textContent = status.nativeMessagingConnected ? "Подключено" : "Не подключено";
-      if (dot) dot.classList.toggle("paused", !status.nativeMessagingConnected);
+      const subtext = body.querySelector<HTMLElement>("#ext-status-subtext");
+      if (status.nativeMessagingConnected) {
+        if (label) label.textContent = "Подключено";
+        if (dot) dot.className = "dot";
+        if (subtext) subtext.textContent = "Связь с расширением активно подтверждена.";
+      } else if (status.nativeMessagingConfigured) {
+        if (label) label.textContent = "Расширение установлено, но связь не подтверждена";
+        if (dot) dot.className = "dot paused";
+        if (subtext) subtext.textContent = "Откройте или обновите обычную веб-страницу или нажмите кнопку в расширении.";
+      } else {
+        if (label) label.textContent = "Не подключено";
+        if (dot) dot.className = "dot paused";
+        if (subtext) subtext.textContent = "KitsuPin сейчас недоступен или манифест не настроен.";
+      }
       showToast("Статус расширения обновлён", "info");
     } catch {
       showToast("Не удалось проверить расширение");
     }
   });
+
 }
 
 // ── Reload / bootstrap ────────────────────────────────────────────────────────

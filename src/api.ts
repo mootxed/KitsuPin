@@ -29,8 +29,12 @@ const mockStatus: IntegrationStatus = {
   nativeMessagingConfigured: false,
   nativeMessagingConnected: false,
   lastNativeMessageAt: null,
+  lastExtensionHandshakeAt: null,
+  lastBrowserCopyMetadataAt: null,
+  handshakeActive: false,
   shortcutRegistered: true,
   autostartEnabled: true,
+
   problems: [
     {
       id: "manifest_missing",

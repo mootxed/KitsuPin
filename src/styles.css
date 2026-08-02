@@ -964,3 +964,66 @@ h3 { font-size: 14px; }
   .settings-layout { grid-template-columns: 52px 1fr; }
   .settings-nav .navbtn span { display: none; }
 }
+
+/* ── Drag & Drop UX ──────────────────────────────────────────────────────── */
+.drag-handle {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: grab;
+  padding: 6px 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  opacity: 0.6;
+  transition: opacity 0.15s, background 0.15s, color 0.15s;
+  flex-shrink: 0;
+}
+.drag-handle:hover {
+  opacity: 1;
+  color: var(--fg);
+  background: color-mix(in oklch, var(--fg) 6%, transparent);
+}
+.drag-handle:active {
+  cursor: grabbing;
+}
+.drag-handle svg {
+  width: 16px;
+  height: 16px;
+}
+
+body.is-dragging-card .chip.user-chip {
+  border: 2px dashed var(--accent) !important;
+  box-shadow: 0 0 0 2px color-mix(in oklch, var(--accent) 30%, transparent);
+  transition: transform 0.15s, background 0.15s, border-color 0.15s;
+}
+.chip.user-chip.drop-over {
+  background: var(--accent) !important;
+  color: #fff !important;
+  transform: scale(1.08);
+  border-style: solid !important;
+}
+
+#drag-hint-banner {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10000;
+  background: var(--accent);
+  color: #fff;
+  padding: 8px 18px;
+  border-radius: 20px;
+  font-weight: 600;
+  font-size: 13px;
+  box-shadow: 0 4px 16px var(--shadow);
+  pointer-events: none;
+  animation: slideDown 0.2s ease-out;
+}
+
+@keyframes slideDown {
+  from { transform: translate(-50%, -10px); opacity: 0; }
+  to { transform: translate(-50%, 0); opacity: 1; }
+}
+

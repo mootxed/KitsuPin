@@ -32,7 +32,11 @@ export interface IntegrationStatus {
   nativeMessagingConfigured: boolean;
   nativeMessagingConnected: boolean;
   lastNativeMessageAt: number | null;
+  lastExtensionHandshakeAt: number | null;
+  lastBrowserCopyMetadataAt: number | null;
+  handshakeActive: boolean;
   shortcutRegistered: boolean | null;
   autostartEnabled: boolean;
   problems: IntegrationProblem[];
 }
+

@@ -3,8 +3,10 @@
   "name": "KitsuPin для Chrome",
   "version": "0.1.1",
   "description": "Добавляет к локальной истории KitsuPin домен и заголовок страницы.",
-  "permissions": ["nativeMessaging", "storage"],
+  "permissions": ["nativeMessaging", "storage", "scripting"],
+  "host_permissions": ["http://*/*", "https://*/*"],
   "background": { "service_worker": "service-worker.js" },
   "content_scripts": [{ "matches": ["http://*/*", "https://*/*"], "js": ["content-script.js"], "run_at": "document_start" }],
   "action": { "default_title": "Состояние KitsuPin", "default_popup": "status.html" }
 }
+

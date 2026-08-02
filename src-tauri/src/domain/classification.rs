@@ -31,8 +31,12 @@ pub fn classify(content: &str) -> ContentType {
     if email.is_match(value) {
         return ContentType::Email;
     }
-    if Url::parse(value).is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host().is_some())
-    {
+    if Url::parse(value).is_ok_and(|u| {
+        matches!(
+            u.scheme(),
+            "http" | "https" | "chrome" | "edge" | "about" | "file" | "ftp"
+        )
+    }) {
         return ContentType::Links;
     }
     if number.is_match(value) {
@@ -51,5 +55,23 @@ mod tests {
         assert_eq!(classify(" -12.50 "), ContentType::Numbers);
         assert_eq!(classify("echo 42"), ContentType::Text);
         assert_eq!(classify("read example.com"), ContentType::Text);
+    }
+
+    #[test]
+    fn classifies_extended_url_schemes() {
+        assert_eq!(
+            classify("https://github.com/mootxed/KitsuPin"),
+            ContentType::Links
+        );
+        assert_eq!(classify("chrome://extensions/?id=abc"), ContentType::Links);
+        assert_eq!(classify("edge://extensions/"), ContentType::Links);
+        assert_eq!(classify("about:blank"), ContentType::Links);
+        assert_eq!(classify("file:///home/user/file.txt"), ContentType::Links);
+        assert_eq!(classify("ftp://example.com/file"), ContentType::Links);
+
+        assert_eq!(classify("example.com"), ContentType::Text);
+        assert_eq!(classify("read example.com"), ContentType::Text);
+        assert_eq!(classify("C:\\Users\\Test"), ContentType::Text);
+        assert_eq!(classify("text: value"), ContentType::Text);
     }
 }
