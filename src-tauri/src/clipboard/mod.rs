@@ -73,10 +73,7 @@ impl ClipboardAccess {
     ) -> Result<T, arboard::Error> {
         let mut clipboard = self.clipboard.lock();
         if clipboard.is_none() {
-            match Clipboard::new() {
-                Ok(c) => *clipboard = Some(c),
-                Err(e) => return Err(e),
-            }
+            *clipboard = Some(Clipboard::new()?);
         }
         let result = operation(clipboard.as_mut().expect("clipboard initialized"));
         if matches!(result, Err(arboard::Error::ClipboardNotSupported)) {
@@ -180,10 +177,7 @@ pub fn read_payload_with_reader<R: ClipboardReader>(
 
     // file_list missing or unavailable -> inspect raw Clipboard image
     if let Ok(image) = reader.get_image() {
-        if let (Ok(width), Ok(height)) = (
-            u32::try_from(image.width),
-            u32::try_from(image.height),
-        ) {
+        if let (Ok(width), Ok(height)) = (u32::try_from(image.width), u32::try_from(image.height)) {
             let payload = ImagePayload {
                 width,
                 height,
@@ -262,11 +256,7 @@ pub fn set_clipboard_payload(
     guard: &OwnCopyGuard,
     access: &ClipboardAccess,
 ) -> anyhow::Result<()> {
-    let token = guard.mark_pending_with_details(
-        fingerprint,
-        ClipboardEventOrigin::KitsuPin,
-        None,
-    );
+    let token = guard.mark_pending_with_details(fingerprint, ClipboardEventOrigin::KitsuPin, None);
     let result = match payload {
         ClipboardPayload::Text(content) => {
             access.with(|clipboard| clipboard.set_text(content.to_owned()))
@@ -559,10 +549,9 @@ pub fn start(
                     let current_owner_before_republish =
                         access.inspect_x11_clipboard("immediately before republish");
 
-                    let owner_changed_before_republish =
-                        captured_owner_after.is_some()
-                            && current_owner_before_republish.is_some()
-                            && captured_owner_after != current_owner_before_republish;
+                    let owner_changed_before_republish = captured_owner_after.is_some()
+                        && current_owner_before_republish.is_some()
+                        && captured_owner_after != current_owner_before_republish;
 
                     let decision = evaluate_republish(
                         captured_gen,
@@ -648,9 +637,7 @@ mod tests {
         }
 
         fn get_text(&self) -> Result<String, arboard::Error> {
-            self.text
-                .clone()
-                .ok_or(arboard::Error::ContentNotAvailable)
+            self.text.clone().ok_or(arboard::Error::ContentNotAvailable)
         }
 
         fn get_selection_owner(&self) -> Option<u32> {
@@ -785,7 +772,9 @@ mod tests {
             1,
             image::Rgb([200, 10, 20]),
         ));
-        source.save_with_format(&path, image::ImageFormat::Png).unwrap();
+        source
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
 
         let mock = MockClipboardReader {
             file_list: Some(vec![path]),
@@ -898,8 +887,10 @@ mod tests {
             1,
             image::Rgb([0, 0, 0]),
         ));
-        img.save_with_format(&path1, image::ImageFormat::Png).unwrap();
-        img.save_with_format(&path2, image::ImageFormat::Png).unwrap();
+        img.save_with_format(&path1, image::ImageFormat::Png)
+            .unwrap();
+        img.save_with_format(&path2, image::ImageFormat::Png)
+            .unwrap();
 
         let mock = MockClipboardReader {
             file_list: Some(vec![path1, path2]),
@@ -971,7 +962,8 @@ mod tests {
             10,
             image::Rgb([0, 0, 0]),
         ));
-        img.save_with_format(&path, image::ImageFormat::Png).unwrap();
+        img.save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
 
         let mock = MockClipboardReader {
             file_list: Some(vec![path]),
