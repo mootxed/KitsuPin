@@ -613,7 +613,9 @@ fn start_single_instance_listener(data_dir: &Path, app: AppHandle) {
                 &socket_path,
                 std::os::unix::fs::PermissionsExt::from_mode(0o600),
             ) {
-                log::error!("Single-instance listener: не удалось установить права 0600 на socket: {e}");
+                log::error!(
+                    "Single-instance listener: не удалось установить права 0600 на socket: {e}"
+                );
             }
             std::thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
@@ -685,7 +687,10 @@ pub fn run() {
         println!("Native Manifest Exists: {}", status.native_manifest_exists);
         println!("Native Manifest Valid: {}", status.native_manifest_valid);
         println!("Chrome Manifest Valid: {}", status.chrome_manifest_valid);
-        println!("Chromium Manifest Valid: {}", status.chromium_manifest_valid);
+        println!(
+            "Chromium Manifest Valid: {}",
+            status.chromium_manifest_valid
+        );
         println!(
             "Extension ID: {}",
             status.extension_id.as_deref().unwrap_or("не задан")

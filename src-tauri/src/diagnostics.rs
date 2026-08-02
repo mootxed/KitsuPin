@@ -102,10 +102,14 @@ pub fn validate_manifest_content(content: &str) -> Result<String, String> {
     }
     let target_path = Path::new(path_str);
     if !target_path.exists() {
-        return Err(format!("Указанный в манифесте путь '{path_str}' не существует"));
+        return Err(format!(
+            "Указанный в манифесте путь '{path_str}' не существует"
+        ));
     }
     if !is_file_executable(target_path) {
-        return Err(format!("Указанный в манифесте файл '{path_str}' не является исполняемым"));
+        return Err(format!(
+            "Указанный в манифесте файл '{path_str}' не является исполняемым"
+        ));
     }
 
     let origins = val.get("allowed_origins").and_then(|v| v.as_array());
@@ -177,7 +181,11 @@ pub fn get_user_manifest_paths() -> Vec<PathBuf> {
 
     USER_MANIFEST_DIRS
         .iter()
-        .map(|dir| config_dir.join(dir).join(format!("{NATIVE_HOST_NAME}.json")))
+        .map(|dir| {
+            config_dir
+                .join(dir)
+                .join(format!("{NATIVE_HOST_NAME}.json"))
+        })
         .collect()
 }
 
@@ -258,10 +266,16 @@ pub fn get_integration_status(
         chromium_manifest_valid = true;
     }
 
-    if !user_manifest_paths.is_empty() && !chrome_manifest_valid && check_path(&user_manifest_paths[0]) {
+    if !user_manifest_paths.is_empty()
+        && !chrome_manifest_valid
+        && check_path(&user_manifest_paths[0])
+    {
         chrome_manifest_valid = true;
     }
-    if user_manifest_paths.len() > 1 && !chromium_manifest_valid && check_path(&user_manifest_paths[1]) {
+    if user_manifest_paths.len() > 1
+        && !chromium_manifest_valid
+        && check_path(&user_manifest_paths[1])
+    {
         chromium_manifest_valid = true;
     }
 
@@ -270,7 +284,8 @@ pub fn get_integration_status(
     let native_socket_available = socket_path.exists();
     let last_native_message_at = crate::browser_metadata::get_last_message_at();
     let native_messaging_configured = native_socket_available && native_manifest_valid;
-    let native_messaging_connected = native_messaging_configured && last_native_message_at.is_some();
+    let native_messaging_connected =
+        native_messaging_configured && last_native_message_at.is_some();
 
     let mut problems = Vec::new();
 
@@ -436,21 +451,29 @@ pub fn save_user_extension_manifest(extension_id: &str) -> Result<PathBuf, Strin
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    if let Err(e) = fs::set_permissions(manifest_path, fs::Permissions::from_mode(0o600)) {
-                        last_err = Some(format!("Не удалось установить права на {manifest_path:?}: {e}"));
+                    if let Err(e) =
+                        fs::set_permissions(manifest_path, fs::Permissions::from_mode(0o600))
+                    {
+                        last_err = Some(format!(
+                            "Не удалось установить права на {manifest_path:?}: {e}"
+                        ));
                         continue;
                     }
                 }
                 written_paths.push(manifest_path.clone());
             }
             Err(e) => {
-                last_err = Some(format!("Не удалось записать манифест {manifest_path:?}: {e}"));
+                last_err = Some(format!(
+                    "Не удалось записать манифест {manifest_path:?}: {e}"
+                ));
             }
         }
     }
 
     if written_paths.is_empty() {
-        return Err(last_err.unwrap_or_else(|| "Не удалось записать ни один manifest-файл".to_string()));
+        return Err(
+            last_err.unwrap_or_else(|| "Не удалось записать ни один manifest-файл".to_string())
+        );
     }
 
     Ok(written_paths[0].clone())
@@ -555,14 +578,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let status_none = get_integration_status(dir.path(), None, true);
         assert_eq!(status_none.shortcut_registered, None);
-        assert!(!status_none.problems.iter().any(|p| p.id == "shortcut_conflict"));
+        assert!(!status_none
+            .problems
+            .iter()
+            .any(|p| p.id == "shortcut_conflict"));
 
         let status_false = get_integration_status(dir.path(), Some(false), true);
         assert_eq!(status_false.shortcut_registered, Some(false));
-        assert!(status_false.problems.iter().any(|p| p.id == "shortcut_conflict"));
+        assert!(status_false
+            .problems
+            .iter()
+            .any(|p| p.id == "shortcut_conflict"));
 
         let status_true = get_integration_status(dir.path(), Some(true), true);
         assert_eq!(status_true.shortcut_registered, Some(true));
-        assert!(!status_true.problems.iter().any(|p| p.id == "shortcut_conflict"));
+        assert!(!status_true
+            .problems
+            .iter()
+            .any(|p| p.id == "shortcut_conflict"));
     }
 }

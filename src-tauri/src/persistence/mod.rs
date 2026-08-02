@@ -14,6 +14,8 @@ const MIGRATION_1: &str = include_str!("../../migrations/001_initial.sql");
 #[allow(dead_code)]
 pub const METADATA_RECONCILE_WINDOW_MS: i64 = 5_000;
 
+type PriorClipState = (String, Option<i64>, Option<i64>, i64, String);
+
 pub struct Repository {
     connection: Mutex<Connection>,
 }
@@ -578,8 +580,7 @@ impl Repository {
         let mut db = self.connection.lock();
         let tx = db.transaction()?;
 
-        let prior_state: Option<(String, Option<i64>, Option<i64>, i64, String)> = if domain_key.is_empty()
-        {
+        let prior_state: Option<PriorClipState> = if domain_key.is_empty() {
             match tx.query_row(
                 "SELECT id, last_copied_at, sort_key, copy_count, content FROM clips WHERE content_hash=?1 AND domain_key=''",
                 params![hash],
@@ -886,7 +887,13 @@ impl Repository {
         let like = if search.is_empty() {
             String::new()
         } else {
-            format!("%{}%", search.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+            format!(
+                "%{}%",
+                search
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            )
         };
 
         let mut statement = db.prepare(
@@ -2060,13 +2067,27 @@ mod tests {
     #[test]
     fn search_escapes_backslashes_properly() {
         let r = Repository::open_in_memory().unwrap();
-        let clip1 = add(&r, "path\\to\\file", Some("example.com"), None, 1_700_000_000_000);
-        let clip2 = add(&r, "unrelated content", Some("example.com"), None, 1_700_000_001_000);
+        let clip1 = add(
+            &r,
+            "path\\to\\file",
+            Some("example.com"),
+            None,
+            1_700_000_000_000,
+        );
+        let clip2 = add(
+            &r,
+            "unrelated content",
+            Some("example.com"),
+            None,
+            1_700_000_001_000,
+        );
 
-        let res = r.list_clips(&ClipQuery {
-            search: Some("path\\to".into()),
-            ..Default::default()
-        }).unwrap();
+        let res = r
+            .list_clips(&ClipQuery {
+                search: Some("path\\to".into()),
+                ..Default::default()
+            })
+            .unwrap();
 
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].id, clip1.id);

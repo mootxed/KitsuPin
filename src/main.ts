@@ -68,13 +68,6 @@ function showToast(message: string, type: "error" | "info" = "error") {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
-/** Returns true if the event target is an interactive element that should receive
- *  keyboard events exclusively (button, input, select, textarea, [role=button]).
- *  Use to prevent card-level Enter handler from firing when focus is on a control. */
-function isInteractiveTarget(el: EventTarget | null): boolean {
-  if (!(el instanceof HTMLElement)) return false;
-  return !!el.closest('button, input, select, textarea, [role="button"], a');
-}
 
 function query(): ClipQuery {
   return {

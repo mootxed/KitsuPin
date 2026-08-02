@@ -65,8 +65,13 @@ pub fn migrate_pastily_to_kitsupin_at_with_hook(
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                if let Err(e) = std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600)) {
-                    log::warn!("Failed to set permissions on migration lock file {:?}: {e}", lock_path);
+                if let Err(e) =
+                    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
+                {
+                    log::warn!(
+                        "Failed to set permissions on migration lock file {:?}: {e}",
+                        lock_path
+                    );
                     return LegacyMigrationResult::ConflictPreserved;
                 }
             }
@@ -193,7 +198,10 @@ fn migrate_data_dir_at_with_hook(
         }
         (DatabaseDataState::Empty, _) => {
             // Scenario C: kitsupin.sqlite3 is empty
-            let backup_empty = new_dir.join(format!("kitsupin.sqlite3.empty.{}.bak", uuid::Uuid::new_v4()));
+            let backup_empty = new_dir.join(format!(
+                "kitsupin.sqlite3.empty.{}.bak",
+                uuid::Uuid::new_v4()
+            ));
             if let Err(e) = rename_db_and_sidecars(&new_db, &backup_empty) {
                 log::error!("Failed to backup empty kitsupin DB: {e}");
                 return LegacyMigrationResult::ConflictPreserved;
@@ -209,7 +217,10 @@ fn migrate_data_dir_at_with_hook(
         }
         (_, DatabaseDataState::Empty) => {
             // Old database is empty, nothing useful to import
-            let backup_old = old_dir.join(format!("pastily.sqlite3.empty.{}.bak", uuid::Uuid::new_v4()));
+            let backup_old = old_dir.join(format!(
+                "pastily.sqlite3.empty.{}.bak",
+                uuid::Uuid::new_v4()
+            ));
             let _ = backup_database_file(&old_db_path, &backup_old);
             LegacyMigrationResult::NothingToMigrate
         }
@@ -250,8 +261,14 @@ fn rename_db_and_sidecars(src_db: &Path, dst_db: &Path) -> std::io::Result<()> {
 
     let pairs = vec![
         (src_db.to_path_buf(), dst_db.to_path_buf()),
-        (PathBuf::from(format!("{src_str}-wal")), PathBuf::from(format!("{dst_str}-wal"))),
-        (PathBuf::from(format!("{src_str}-shm")), PathBuf::from(format!("{dst_str}-shm"))),
+        (
+            PathBuf::from(format!("{src_str}-wal")),
+            PathBuf::from(format!("{dst_str}-wal")),
+        ),
+        (
+            PathBuf::from(format!("{src_str}-shm")),
+            PathBuf::from(format!("{dst_str}-shm")),
+        ),
     ];
 
     for (_, dst) in &pairs {
@@ -270,7 +287,12 @@ fn rename_db_and_sidecars(src_db: &Path, dst_db: &Path) -> std::io::Result<()> {
                 let mut rollback_err = None;
                 for (m_src, m_dst) in moved.into_iter().rev() {
                     if let Err(rb_e) = std::fs::rename(&m_dst, &m_src) {
-                        log::error!("CRITICAL: Failed to rollback rename from {} to {}: {}", m_dst.display(), m_src.display(), rb_e);
+                        log::error!(
+                            "CRITICAL: Failed to rollback rename from {} to {}: {}",
+                            m_dst.display(),
+                            m_src.display(),
+                            rb_e
+                        );
                         rollback_err = Some(rb_e);
                     }
                 }
@@ -430,7 +452,9 @@ fn compute_db_fingerprint(db_path: &Path) -> anyhow::Result<String> {
     use std::io::{BufReader, Read};
 
     let temp_dir = tempfile::tempdir()?;
-    let temp_snapshot = temp_dir.path().join(format!("kitsupin_fp_{}.tmp", uuid::Uuid::new_v4()));
+    let temp_snapshot = temp_dir
+        .path()
+        .join(format!("kitsupin_fp_{}.tmp", uuid::Uuid::new_v4()));
 
     let src_conn = Connection::open_with_flags(
         db_path,
@@ -498,7 +522,10 @@ fn restore_legacy_db_with_hook(
     let fp = match compute_db_fingerprint(old_db_path) {
         Ok(f) => f,
         Err(e) => {
-            log::error!("Failed to compute fingerprint of legacy DB {:?}: {e}", old_db_path);
+            log::error!(
+                "Failed to compute fingerprint of legacy DB {:?}: {e}",
+                old_db_path
+            );
             return LegacyMigrationResult::ConflictPreserved;
         }
     };
@@ -526,8 +553,13 @@ fn restore_legacy_db_with_hook(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&importing_path, std::fs::Permissions::from_mode(0o600)) {
-            log::error!("Failed to set permissions 0600 on {:?}: {e}", importing_path);
+        if let Err(e) =
+            std::fs::set_permissions(&importing_path, std::fs::Permissions::from_mode(0o600))
+        {
+            log::error!(
+                "Failed to set permissions 0600 on {:?}: {e}",
+                importing_path
+            );
             let _ = remove_file_if_exists(&importing_path);
             return LegacyMigrationResult::ConflictPreserved;
         }
@@ -595,8 +627,13 @@ fn restore_legacy_db_with_hook(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(target_db_path, std::fs::Permissions::from_mode(0o600)) {
-            log::error!("Failed to set permissions 0600 on target DB {:?}: {e}", target_db_path);
+        if let Err(e) =
+            std::fs::set_permissions(target_db_path, std::fs::Permissions::from_mode(0o600))
+        {
+            log::error!(
+                "Failed to set permissions 0600 on target DB {:?}: {e}",
+                target_db_path
+            );
             let _ = remove_db_and_sidecars(target_db_path);
             return LegacyMigrationResult::ConflictPreserved;
         }
@@ -1843,8 +1880,12 @@ mod tests {
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
-        assert!(entries.iter().any(|n| n.starts_with("kitsupin.sqlite3.empty.") && n.ends_with(".bak")));
-        assert!(entries.iter().any(|n| n.starts_with("kitsupin.sqlite3.empty.") && n.ends_with(".bak-wal")));
+        assert!(entries
+            .iter()
+            .any(|n| n.starts_with("kitsupin.sqlite3.empty.") && n.ends_with(".bak")));
+        assert!(entries
+            .iter()
+            .any(|n| n.starts_with("kitsupin.sqlite3.empty.") && n.ends_with(".bak-wal")));
 
         // Restored kitsupin.sqlite3 should exist and not have old leftover WAL
         assert!(new_db.exists());
@@ -2014,7 +2055,18 @@ mod tests {
         let new_db = new_dir.join("kitsupin.sqlite3");
 
         // First create a valid old_db with clips table so inspect_database_data_state sees ContainsData
-        create_real_pastily_v1_db(&old_db, &[("1", "hello", "", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", 1, 0)]);
+        create_real_pastily_v1_db(
+            &old_db,
+            &[(
+                "1",
+                "hello",
+                "",
+                "2024-01-01T00:00:00Z",
+                "2024-01-01T00:00:00Z",
+                1,
+                0,
+            )],
+        );
 
         // Create empty new_db
         {
@@ -2026,12 +2078,18 @@ mod tests {
 
         // Run scenario C: new_db is Empty, old_db ContainsData.
         // We use fault injection RestoreFaultHook::FailAfterFinalRename to test failure after final rename reliably.
-        let res = migrate_pastily_to_kitsupin_at_with_hook(data_home, None, Some(RestoreFaultHook::FailAfterFinalRename));
+        let res = migrate_pastily_to_kitsupin_at_with_hook(
+            data_home,
+            None,
+            Some(RestoreFaultHook::FailAfterFinalRename),
+        );
 
         // It should return ConflictPreserved, and the empty new_db must be restored back!
         assert_eq!(res, LegacyMigrationResult::ConflictPreserved);
         assert!(new_db.exists(), "new_db must exist after rollback");
-        assert_eq!(inspect_database_data_state(&new_db), DatabaseDataState::Empty);
+        assert_eq!(
+            inspect_database_data_state(&new_db),
+            DatabaseDataState::Empty
+        );
     }
 }
-
