@@ -144,7 +144,7 @@ function bindFilters(root: HTMLElement) {
     (el) =>
       (el.onclick = () => {
         state.type = state.type === el.dataset.type ? null : (el.dataset.type as ContentType);
-        state.payloadKind = null;
+        state.payloadKind = state.type ? "text" : null;
         state.category = state.domain = null;
         refresh();
       })

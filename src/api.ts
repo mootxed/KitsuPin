@@ -52,8 +52,9 @@ export const api = {
   list: (query: ClipQuery) => tauri ? invoke<ClipSummary[]>("list_clips", { query }) : Promise.resolve(
     demoClips.filter(c => {
       if (query.search && !JSON.stringify(c).toLowerCase().includes(query.search.toLowerCase())) return false;
+      const effectivePayloadKind = query.payloadKind || (query.contentType ? "text" : undefined);
       if (query.contentType && c.contentType !== query.contentType) return false;
-      if (query.payloadKind && c.payloadKind !== query.payloadKind) return false;
+      if (effectivePayloadKind && c.payloadKind !== effectivePayloadKind) return false;
       if (query.domain && c.domain !== query.domain) return false;
       if (query.categoryId && !c.categories.some(cat => cat.id === query.categoryId)) return false;
       return true;

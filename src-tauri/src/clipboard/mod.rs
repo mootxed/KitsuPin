@@ -319,7 +319,17 @@ pub fn start(
                         max_image_bytes: limits.max_image_size_mb as u64 * 1024 * 1024,
                         max_storage_bytes: limits.max_storage_size_mb as u64 * 1024 * 1024,
                     })
-                    .map(|_| ())
+                    .map(|(_summary, receipt)| {
+                        if let Some(receipt) = receipt {
+                            metadata.push_receipt(&image_hash, image_length, receipt);
+                            metadata.reconcile_pending(
+                                &repo,
+                                Some(&|| {
+                                    let _ = app.emit("clips-changed", ());
+                                }),
+                            );
+                        }
+                    })
                 }
             };
             match save_result {

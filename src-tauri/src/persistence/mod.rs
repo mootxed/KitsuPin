@@ -706,7 +706,13 @@ impl Repository {
         Ok((clip, receipt))
     }
 
-    pub fn upsert_image(&self, input: NewImageClip<'_>) -> Result<ClipSummary> {
+    pub fn upsert_image(
+        &self,
+        input: NewImageClip<'_>,
+    ) -> Result<(
+        ClipSummary,
+        Option<crate::browser_metadata::ClipUpsertReceipt>,
+    )> {
         let store = self
             .blob_store
             .as_ref()
@@ -741,8 +747,28 @@ impl Repository {
             );
         }
 
+        let (match_hash, match_len) = crate::domain::ClipboardPayload::Image(input.image.clone())
+            .match_key()
+            .expect("image payload match key");
         let created_file = store.persist(&prepared)?;
-        let db_result = (|| -> Result<ClipSummary> {
+        let db_result = (|| -> Result<(
+            ClipSummary,
+            Option<crate::browser_metadata::ClipUpsertReceipt>,
+        )> {
+            let prior_state: Option<PriorClipState> = if domain_key.is_empty() {
+                match tx.query_row(
+                    "SELECT id, last_copied_at, sort_key, copy_count, content FROM clips WHERE content_hash=?1 AND domain_key=''",
+                    params![match_hash],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                ) {
+                    Ok(row) => Some(row),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(e) => return Err(e.into()),
+                }
+            } else {
+                None
+            };
+
             tx.execute(
                 "INSERT OR IGNORE INTO image_blobs(
                     hash,relative_path,mime_type,width,height,size_bytes,thumbnail_data_url,created_at
@@ -759,14 +785,18 @@ impl Repository {
                 ],
             )?;
 
-            let existing_id: Option<String> = match tx.query_row(
-                "SELECT id FROM clips WHERE content_hash=?1 AND domain_key=?2",
-                params![prepared.hash, domain_key],
-                |row| row.get(0),
-            ) {
-                Ok(id) => Some(id),
-                Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                Err(error) => return Err(error.into()),
+            let existing_id: Option<String> = if domain_key.is_empty() {
+                prior_state.as_ref().map(|(id, _, _, _, _)| id.clone())
+            } else {
+                match tx.query_row(
+                    "SELECT id FROM clips WHERE content_hash=?1 AND domain_key=?2",
+                    params![match_hash, domain_key],
+                    |row| row.get(0),
+                ) {
+                    Ok(id) => Some(id),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(error) => return Err(error.into()),
+                }
             };
             let id = existing_id.unwrap_or_else(|| Uuid::new_v4().to_string());
             let changed = tx.execute(
@@ -781,18 +811,46 @@ impl Repository {
                     "INSERT INTO clips(
                         id,content,content_hash,content_type,domain,domain_key,page_title,
                         created_at,last_copied_at,copy_count,pinned,sort_key,payload_kind,blob_hash
-                     ) VALUES(?1,'',?2,'Text',?3,?4,?5,?6,?6,1,0,0,'image',?2)",
-                    params![id, prepared.hash, domain, domain_key, title, input.now],
+                     ) VALUES(?1,'',?2,'Text',?3,?4,?5,?6,?6,1,0,0,'image',?7)",
+                    params![id, match_hash, domain, domain_key, title, input.now, prepared.hash],
                 )?;
             }
             let summary = load_clip_summary(&tx, &id)?;
+
+            let (clip_id, prev_last, prev_sort, prev_count, prev_content) = match prior_state {
+                Some((cid, last, sort, count, content)) => (cid, last, sort, count, Some(content)),
+                None => (id.clone(), None, None, 0, None),
+            };
+
+            let resulting_sort = prev_sort.unwrap_or(0) + if prev_count > 0 { 1 } else { 0 };
+
+            let receipt = if domain_key.is_empty() {
+                Some(crate::browser_metadata::ClipUpsertReceipt {
+                    receipt_id: Uuid::new_v4(),
+                    clip_id,
+                    content_hash: match_hash,
+                    normalized_length_bytes: match_len,
+                    previous_last_copied_at: prev_last,
+                    previous_sort_key: prev_sort,
+                    previous_copy_count: prev_count,
+                    previous_content: prev_content,
+                    resulting_last_copied_at: summary.last_copied_at,
+                    resulting_sort_key: resulting_sort,
+                    resulting_copy_count: summary.copy_count,
+                    copy_timestamp: input.now,
+                })
+            } else {
+                None
+            };
+
             tx.commit()?;
-            Ok(summary)
+            Ok((summary, receipt))
         })();
 
         if db_result.is_err() && created_file {
             let _ = store.remove(&prepared.relative_path);
         }
+
         db_result
     }
 
@@ -817,8 +875,8 @@ impl Repository {
         let tx = db.transaction()?;
 
         #[allow(clippy::type_complexity)]
-        let candidate: Option<(String, i64, i64, i64, bool, String, String, i64)> = match tx.query_row(
-            "SELECT id, copy_count, sort_key, created_at, pinned, content, content_type, last_copied_at
+        let candidate: Option<(String, i64, i64, i64, bool, String, String, i64, String)> = match tx.query_row(
+            "SELECT id, copy_count, sort_key, created_at, pinned, content, content_type, last_copied_at, payload_kind
              FROM clips
              WHERE id=?1 AND content_hash=?2 AND domain_key=''
                AND copy_count=?3 AND last_copied_at=?4",
@@ -838,6 +896,7 @@ impl Repository {
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
                 ))
             },
         ) {
@@ -861,19 +920,31 @@ impl Repository {
             temp_content,
             temp_kind,
             _temp_last_copied_at,
+            temp_payload_kind,
         )) = candidate
         else {
             return Ok(None);
         };
 
-        let normalized_len = normalize_content(&temp_content).len();
-        if normalized_len != event.content_length {
-            log::warn!(
-                "attach_metadata_with_receipt: hash match but normalized length mismatch ({} vs {}), skipping",
-                normalized_len,
-                event.content_length
-            );
-            return Ok(None);
+        if temp_payload_kind == "image" {
+            if receipt.normalized_length_bytes != event.content_length {
+                log::warn!(
+                    "attach_metadata_with_receipt: image length mismatch ({} vs {}), skipping",
+                    receipt.normalized_length_bytes,
+                    event.content_length
+                );
+                return Ok(None);
+            }
+        } else {
+            let normalized_len = normalize_content(&temp_content).len();
+            if normalized_len != event.content_length {
+                log::warn!(
+                    "attach_metadata_with_receipt: hash match but normalized length mismatch ({} vs {}), skipping",
+                    normalized_len,
+                    event.content_length
+                );
+                return Ok(None);
+            }
         }
 
         let existing: Option<(String, i64, i64, i64, bool)> = match tx.query_row(
@@ -1021,7 +1092,10 @@ impl Repository {
         let _ = Self::SHORT_SEARCH_FALLBACK_LIMIT;
         let fts_formatted = format_fts_query(&search);
         let kind = query.content_type.map(ContentType::as_str);
-        let payload_kind = query.payload_kind.map(PayloadKind::as_str);
+        let payload_kind = query
+            .payload_kind
+            .or_else(|| if query.content_type.is_some() { Some(PayloadKind::Text) } else { None })
+            .map(PayloadKind::as_str);
         let limit = query.limit.unwrap_or(100).clamp(1, 200);
         let offset = query.offset.unwrap_or(0);
 
@@ -1639,6 +1713,7 @@ mod tests {
             max_storage_bytes: 10 * 1024 * 1024,
         })
         .unwrap()
+        .0
     }
 
     #[test]
@@ -2598,5 +2673,125 @@ mod tests {
         // 5. Verify temp clip was rolled back to original content "foo"
         let temp_content = r.get_clip_content(&c1.id).unwrap();
         assert_eq!(temp_content, "foo");
+    }
+
+    #[test]
+    fn test_image_clip_late_reconciliation_via_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let r = Repository::open_in_memory_with_blobs(&temp.path().join("blobs")).unwrap();
+        let now = 1_700_000_000_000;
+        let image = crate::domain::ImagePayload {
+            width: 2,
+            height: 1,
+            rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
+            source_mime: Some("image/png".into()),
+            source_bytes: None,
+        };
+        let (hash, len) = crate::domain::ClipboardPayload::Image(image.clone())
+            .match_key()
+            .unwrap();
+
+        // Save image without domain metadata -> creates receipt
+        let (summary, receipt_opt) = r
+            .upsert_image(NewImageClip {
+                image: &image,
+                domain: None,
+                page_title: None,
+                now,
+                max_image_bytes: 10 * 1024 * 1024,
+                max_storage_bytes: 50 * 1024 * 1024,
+            })
+            .unwrap();
+
+        assert_eq!(summary.domain, None);
+        assert_eq!(summary.payload_kind, crate::domain::PayloadKind::Image);
+        let receipt = receipt_opt.expect("missing domain image upsert generates a receipt");
+        assert_eq!(receipt.normalized_length_bytes, len);
+
+        // Delayed Chrome metadata event arrives
+        let event = crate::browser_metadata::BrowserCopyEvent {
+            event_id: Uuid::new_v4(),
+            version: 1,
+            event: "copy".into(),
+            content_hash: hash,
+            content_length: len,
+            domain: "chrome.org".into(),
+            page_title: "Chrome Image".into(),
+            timestamp: chrono::DateTime::from_timestamp_millis(now).unwrap().to_rfc3339(),
+        };
+
+        let attached_id = r
+            .attach_metadata_with_receipt(&event, receipt)
+            .unwrap()
+            .expect("metadata successfully attached");
+
+        let updated = r
+            .list_clips(&ClipQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == attached_id)
+            .unwrap();
+
+        assert_eq!(updated.domain.as_deref(), Some("chrome.org"));
+        assert_eq!(updated.page_title.as_deref(), Some("Chrome Image"));
+        assert_eq!(updated.payload_kind, crate::domain::PayloadKind::Image);
+    }
+
+    #[test]
+    fn test_text_filter_excludes_image_clips() {
+        let temp = tempfile::tempdir().unwrap();
+        let r = Repository::open_in_memory_with_blobs(&temp.path().join("blobs")).unwrap();
+        let now = 1_700_000_000_000;
+
+        // Save a text clip
+        r.upsert_clip(NewClip {
+            content: "Hello World",
+            domain: None,
+            page_title: None,
+            now,
+        })
+        .unwrap();
+
+        // Save an image clip
+        let image = crate::domain::ImagePayload {
+            width: 2,
+            height: 1,
+            rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
+            source_mime: Some("image/png".into()),
+            source_bytes: None,
+        };
+        r.upsert_image(NewImageClip {
+            image: &image,
+            domain: None,
+            page_title: None,
+            now: now + 100,
+            max_image_bytes: 10 * 1024 * 1024,
+            max_storage_bytes: 50 * 1024 * 1024,
+        })
+        .unwrap();
+
+        // Query with contentType = Text (payload_kind not specified)
+        let text_filtered = r
+            .list_clips(&ClipQuery {
+                content_type: Some(crate::domain::ContentType::Text),
+                payload_kind: None,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(text_filtered.len(), 1);
+        assert_eq!(text_filtered[0].payload_kind, crate::domain::PayloadKind::Text);
+        assert_eq!(text_filtered[0].preview, "Hello World");
+
+        // Query with payload_kind = Image
+        let image_filtered = r
+            .list_clips(&ClipQuery {
+                payload_kind: Some(crate::domain::PayloadKind::Image),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(image_filtered.len(), 1);
+        assert_eq!(image_filtered[0].payload_kind, crate::domain::PayloadKind::Image);
     }
 }

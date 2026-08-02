@@ -608,6 +608,11 @@ impl PopupManager {
                 let _ = w.show();
                 let _ = w.unminimize();
                 let _ = w.set_focus();
+                #[cfg(target_os = "linux")]
+                if let Ok(gtk_w) = w.gtk_window() {
+                    use gtk::prelude::GtkWindowExt;
+                    gtk_w.present();
+                }
 
                 self.schedule_focus_check(app.clone(), generation, 1);
             }
@@ -618,6 +623,11 @@ impl PopupManager {
                 log::info!("focus request attempt {attempt} for generation {generation}");
                 let _ = w.unminimize();
                 let _ = w.set_focus();
+                #[cfg(target_os = "linux")]
+                if let Ok(gtk_w) = w.gtk_window() {
+                    use gtk::prelude::GtkWindowExt;
+                    gtk_w.present();
+                }
 
                 self.schedule_focus_check(app.clone(), generation, attempt);
             }

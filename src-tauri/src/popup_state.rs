@@ -11,6 +11,8 @@ pub enum PopupState {
     },
     /// Window is visible and system focus has been confirmed at least once for this generation.
     VisibleAndFocused { generation: u64 },
+    /// Focus attempts exhausted without focus confirmation; window remains visible until blur or user action.
+    VisibleWithoutFocus { generation: u64 },
 }
 
 /// Inputs/events received by the popup state machine.
@@ -86,9 +88,11 @@ impl PopupStateMachine {
                 };
                 PopupAction::ShowAndRequestFocus { generation: gen }
             }
-            // ToggleRequested: visible/opening -> hide
+            // ToggleRequested: visible/opening/unfocused -> hide
             (
-                PopupState::Opening { .. } | PopupState::VisibleAndFocused { .. },
+                PopupState::Opening { .. }
+                | PopupState::VisibleAndFocused { .. }
+                | PopupState::VisibleWithoutFocus { .. },
                 PopupEvent::ToggleRequested,
             ) => {
                 self.state = PopupState::Hidden;
@@ -113,6 +117,12 @@ impl PopupStateMachine {
                     PopupAction::NoAction
                 }
             }
+            // FocusGained while VisibleWithoutFocus
+            (PopupState::VisibleWithoutFocus { generation }, PopupEvent::FocusGained) => {
+                let gen = *generation;
+                self.state = PopupState::VisibleAndFocused { generation: gen };
+                PopupAction::NotifyFrontendFocused { generation: gen }
+            }
             // FocusGained while already VisibleAndFocused -> duplicate event, ignore
             (PopupState::VisibleAndFocused { .. }, PopupEvent::FocusGained) => {
                 PopupAction::NoAction
@@ -128,13 +138,16 @@ impl PopupStateMachine {
                     PopupAction::NoAction
                 }
             }
-            // FocusLost while VisibleAndFocused -> hide window
-            (PopupState::VisibleAndFocused { .. }, PopupEvent::FocusLost) => {
+            // FocusLost while VisibleAndFocused or VisibleWithoutFocus -> hide window
+            (
+                PopupState::VisibleAndFocused { .. } | PopupState::VisibleWithoutFocus { .. },
+                PopupEvent::FocusLost,
+            ) => {
                 self.state = PopupState::Hidden;
                 PopupAction::HideWindow
             }
 
-            // FocusCheckResult
+            // FocusCheckResult while Opening
             (
                 PopupState::Opening {
                     generation,
@@ -178,8 +191,28 @@ impl PopupStateMachine {
                         attempt: next_att,
                     }
                 } else {
-                    // Reached max attempts; stop retrying
+                    // Reached max attempts; transition to VisibleWithoutFocus so external blur or click can hide window
+                    self.state = PopupState::VisibleWithoutFocus {
+                        generation: cur_gen,
+                    };
                     PopupAction::NoAction
+                }
+            }
+
+            // Late FocusCheckResult while VisibleWithoutFocus
+            (
+                PopupState::VisibleWithoutFocus { generation },
+                PopupEvent::FocusCheckResult {
+                    generation: gen_check,
+                    is_focused: true,
+                },
+            ) if *generation == gen_check => {
+                let cur_gen = *generation;
+                self.state = PopupState::VisibleAndFocused {
+                    generation: cur_gen,
+                };
+                PopupAction::NotifyFrontendFocused {
+                    generation: cur_gen,
                 }
             }
 
@@ -333,11 +366,7 @@ mod tests {
         assert_eq!(action, PopupAction::NoAction);
         assert_eq!(
             sm.state(),
-            &PopupState::Opening {
-                generation: 1,
-                attempts: 3,
-                focused_once: false,
-            }
+            &PopupState::VisibleWithoutFocus { generation: 1 }
         );
 
         // Subsequent check results still return NoAction
@@ -346,6 +375,29 @@ mod tests {
             is_focused: false,
         });
         assert_eq!(action2, PopupAction::NoAction);
+    }
+
+    #[test]
+    fn test_max_attempts_exhausted_allows_focus_lost_to_hide_window() {
+        let mut sm = PopupStateMachine::new(3);
+        sm.handle_event(PopupEvent::ToggleRequested);
+
+        for _ in 0..3 {
+            sm.handle_event(PopupEvent::FocusCheckResult {
+                generation: 1,
+                is_focused: false,
+            });
+        }
+        assert_eq!(
+            sm.state(),
+            &PopupState::VisibleWithoutFocus { generation: 1 }
+        );
+        assert!(sm.is_visible());
+
+        // FocusLost after exhaustion hides the window cleanly
+        let action = sm.handle_event(PopupEvent::FocusLost);
+        assert_eq!(action, PopupAction::HideWindow);
+        assert_eq!(sm.state(), &PopupState::Hidden);
     }
 
     #[test]
