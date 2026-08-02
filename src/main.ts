@@ -485,6 +485,17 @@ function bindCards(root: HTMLElement) {
       dragBtn.ondragend = () => {
         cleanupDragState();
       };
+      dragBtn.onclick = (e) => {
+        e.stopPropagation();
+        showAssignCategoryModal(clip);
+      };
+      dragBtn.onkeydown = (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          e.stopPropagation();
+          showAssignCategoryModal(clip);
+        }
+      };
     }
 
 

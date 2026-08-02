@@ -35,15 +35,41 @@ fn respond(value: Value) {
 fn handle() -> anyhow::Result<()> {
     let body = read_message()?;
     let value: Value = serde_json::from_slice(&body)?;
+
+    if is_status_probe(&value) {
+        // Valid status probe
+    } else if is_copy_event(&value) {
+        let copy_event: crate::browser_metadata::BrowserCopyEvent =
+            serde_json::from_value(value.clone()).map_err(|e| anyhow::anyhow!("invalid_message: {e}"))?;
+        copy_event.validate().map_err(|e| anyhow::anyhow!("invalid_message: {e}"))?;
+    } else {
+        anyhow::bail!("invalid_message");
+    }
+
     let path = data_dir().ok_or_else(|| anyhow::anyhow!("data directory unavailable"))?;
     let mut socket =
         UnixStream::connect(path).map_err(|e| anyhow::anyhow!("app_not_running: {e}"))?;
-    if is_status_probe(&value) || is_copy_event(&value) {
-        serde_json::to_writer(&mut socket, &value)?;
-        socket.write_all(b"\n")?;
+
+    socket.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+    socket.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+
+    serde_json::to_writer(&mut socket, &value)?;
+    socket.write_all(b"\n")?;
+    socket.flush()?;
+
+    use std::io::BufRead;
+    let mut response_line = String::new();
+    let mut reader = std::io::BufReader::new(socket);
+    reader.read_line(&mut response_line)?;
+
+    let resp_val: Value = serde_json::from_str(&response_line)
+        .map_err(|_| anyhow::anyhow!("app_response_invalid"))?;
+
+    if resp_val.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(())
     } else {
-        anyhow::bail!("invalid_message");
+        let err = resp_val.get("error").and_then(Value::as_str).unwrap_or("app_rejected");
+        anyhow::bail!("app_rejected: {err}");
     }
 }
 

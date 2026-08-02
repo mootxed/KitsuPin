@@ -74,17 +74,23 @@ chrome.runtime.onMessage.addListener((message, _sender, respond) => {
   }
 
   if (message?.event === "copy") {
-    chrome.runtime.sendNativeMessage(HOST, message)
-      .then((res) => {
+    (async () => {
+      try {
+        const data = await chrome.storage.local.get(["checkedAt", "nativeStatus"]);
+        const age = Date.now() - (data.checkedAt || 0);
+        if (age > 30000 || data.nativeStatus !== "connected") {
+          await performHandshake();
+        }
+        const res = await chrome.runtime.sendNativeMessage(HOST, message);
         if (res?.ok === true) {
-          chrome.storage.local.set({ nativeStatus: "connected", checkedAt: Date.now() });
+          await chrome.storage.local.set({ nativeStatus: "connected", checkedAt: Date.now(), errorDetail: null });
         }
         respond(res);
-      })
-      .catch((err) => {
-        performHandshake();
+      } catch (err) {
+        await performHandshake();
         respond({ ok: false, error: String(err) });
-      });
+      }
+    })();
     return true;
   }
 

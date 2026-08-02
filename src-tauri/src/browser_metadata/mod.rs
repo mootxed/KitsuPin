@@ -108,11 +108,13 @@ pub fn get_last_message_at() -> Option<i64> {
 
 pub fn is_handshake_active() -> bool {
     let now = chrono::Utc::now().timestamp_millis();
-    if let Some(ts) = get_last_extension_handshake_at() {
-        (now - ts).abs() <= HANDSHAKE_TTL_MS
-    } else {
-        false
-    }
+    let handshake_recent = get_last_extension_handshake_at()
+        .map(|ts| (now - ts).abs() <= HANDSHAKE_TTL_MS)
+        .unwrap_or(false);
+    let copy_recent = get_last_browser_copy_metadata_at()
+        .map(|ts| (now - ts).abs() <= HANDSHAKE_TTL_MS)
+        .unwrap_or(false);
+    handshake_recent || copy_recent
 }
 
 #[derive(Debug, Clone)]
@@ -385,7 +387,13 @@ pub fn start_socket_server(
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
-                Ok(s) => read_stream(s, &buffer, &*reconcile_callback),
+                Ok(s) => {
+                    let buffer = Arc::clone(&buffer);
+                    let reconcile_callback = Arc::clone(&reconcile_callback);
+                    std::thread::spawn(move || {
+                        read_stream(s, &buffer, &*reconcile_callback);
+                    });
+                }
                 Err(e) => log::warn!("native socket: {e}"),
             }
         }
@@ -394,12 +402,18 @@ pub fn start_socket_server(
 }
 
 fn read_stream(
-    stream: UnixStream,
+    mut stream: UnixStream,
     buffer: &MetadataBuffer,
     reconcile: &(impl Fn(BrowserCopyEvent) + ?Sized),
 ) {
+    use std::io::Write;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    for line in BufReader::new(stream).lines().take(8) {
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let reader_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    for line in BufReader::new(reader_stream).lines().take(8) {
         match line {
             Ok(line) if line.len() <= 16_384 => {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -407,8 +421,9 @@ fn read_stream(
                     if event_type == "status" {
                         record_extension_handshake_received();
                         log::info!("Extension handshake accepted via Native Host socket");
+                        let _ = stream.write_all(b"{\"ok\":true,\"accepted\":true}\n");
+                        let _ = stream.flush();
                     } else if event_type == "copy" {
-                        record_copy_metadata_received();
                         match serde_json::from_value::<BrowserCopyEvent>(val) {
                             Ok(event) => {
                                 let hash_prefix = if event.content_hash.len() >= 8 {
@@ -421,14 +436,28 @@ fn read_stream(
                                     event.event_id, event.domain, hash_prefix, event.content_length
                                 );
                                 match buffer.push(event.clone()) {
-                                    Ok(()) => reconcile(event),
-                                    Err(e) => log::warn!("Отклонено событие Chrome: {e}"),
+                                    Ok(()) => {
+                                        reconcile(event);
+                                        let _ = stream.write_all(b"{\"ok\":true,\"accepted\":true}\n");
+                                        let _ = stream.flush();
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Отклонено событие Chrome: {e}");
+                                        let _ = stream.write_all(b"{\"ok\":false,\"error\":\"validation_failed\"}\n");
+                                        let _ = stream.flush();
+                                    }
                                 }
                             }
-                            Err(e) => log::warn!("Отклонён некорректный JSON copy Chrome: {e}"),
+                            Err(e) => {
+                                log::warn!("Отклонён некорректный JSON copy Chrome: {e}");
+                                let _ = stream.write_all(b"{\"ok\":false,\"error\":\"invalid_payload\"}\n");
+                                let _ = stream.flush();
+                            }
                         }
                     } else {
                         log::warn!("Неизвестный тип события Chrome: {event_type}");
+                        let _ = stream.write_all(b"{\"ok\":false,\"error\":\"unknown_event\"}\n");
+                        let _ = stream.flush();
                     }
                 }
             }
@@ -663,5 +692,104 @@ mod tests {
         let (e2, r2) = b.reserve_matching_pair(RECEIPT_MATCH_WINDOW_MS).unwrap();
         assert_eq!(e2.event_id, e.event_id);
         assert_eq!(r2.receipt_id, r_fresh.receipt_id);
+    }
+
+    #[test]
+    fn copy_event_activates_connection_status_and_socket_acknowledges() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("test_ack.sock");
+        let buffer = Arc::new(MetadataBuffer::default());
+        let cb = Arc::new(|_: BrowserCopyEvent| {});
+
+        start_socket_server(sock_path.clone(), buffer, cb).expect("start server");
+
+        let mut client = UnixStream::connect(&sock_path).expect("connect to server");
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+        // 1. Send status probe
+        let status_json = serde_json::json!({
+            "version": 1,
+            "event": "status",
+            "timestamp": Utc::now().to_rfc3339()
+        }).to_string() + "\n";
+
+        client.write_all(status_json.as_bytes()).unwrap();
+        client.flush().unwrap();
+
+        let mut reader = BufReader::new(&client);
+        let mut resp_line = String::new();
+        reader.read_line(&mut resp_line).unwrap();
+
+        let resp: serde_json::Value = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(resp.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(resp.get("accepted").and_then(|v| v.as_bool()), Some(true));
+
+        // 2. Send copy event
+        let copy_json = serde_json::json!({
+            "eventId": Uuid::new_v4().to_string(),
+            "version": 1,
+            "event": "copy",
+            "contentHash": "a".repeat(64),
+            "contentLength": 10,
+            "domain": "example.com",
+            "pageTitle": "Test",
+            "timestamp": Utc::now().to_rfc3339()
+        }).to_string() + "\n";
+
+        let mut client2 = UnixStream::connect(&sock_path).expect("connect client 2");
+        client2.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        client2.write_all(copy_json.as_bytes()).unwrap();
+        client2.flush().unwrap();
+
+        let mut reader2 = BufReader::new(&client2);
+        let mut resp_line2 = String::new();
+        reader2.read_line(&mut resp_line2).unwrap();
+
+        let resp2: serde_json::Value = serde_json::from_str(&resp_line2).unwrap();
+        assert_eq!(resp2.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(resp2.get("accepted").and_then(|v| v.as_bool()), Some(true));
+
+        // Verify connection active
+        assert!(is_handshake_active());
+    }
+
+    #[test]
+    fn socket_server_rejects_invalid_copy_payload() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("test_invalid.sock");
+        let buffer = Arc::new(MetadataBuffer::default());
+        let cb = Arc::new(|_: BrowserCopyEvent| {});
+
+        start_socket_server(sock_path.clone(), buffer, cb).unwrap();
+
+        let mut client = UnixStream::connect(&sock_path).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+        // Send invalid copy payload (bad hash)
+        let invalid_copy = serde_json::json!({
+            "version": 1,
+            "event": "copy",
+            "contentHash": "short",
+            "contentLength": 10,
+            "domain": "example.com",
+            "pageTitle": "Test",
+            "timestamp": Utc::now().to_rfc3339()
+        }).to_string() + "\n";
+
+        client.write_all(invalid_copy.as_bytes()).unwrap();
+        client.flush().unwrap();
+
+        let mut reader = BufReader::new(&client);
+        let mut resp_line = String::new();
+        reader.read_line(&mut resp_line).unwrap();
+
+        let resp: serde_json::Value = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(resp.get("ok").and_then(|v| v.as_bool()), Some(false));
     }
 }
