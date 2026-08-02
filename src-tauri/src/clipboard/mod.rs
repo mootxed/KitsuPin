@@ -472,7 +472,7 @@ pub fn start(
             }
 
             let captured_owner_after = access.inspect_x11_clipboard("watcher after read");
-            let post_read_gen = generation.current();
+            let _post_read_gen = generation.current();
             let owner_changed = captured_owner_before.is_some()
                 && captured_owner_after.is_some()
                 && captured_owner_before != captured_owner_after;
@@ -555,12 +555,21 @@ pub fn start(
                         _ => None,
                     };
 
+                    let current_gen_before_republish = generation.current();
+                    let current_owner_before_republish =
+                        access.inspect_x11_clipboard("immediately before republish");
+
+                    let owner_changed_before_republish =
+                        captured_owner_after.is_some()
+                            && current_owner_before_republish.is_some()
+                            && captured_owner_after != current_owner_before_republish;
+
                     let decision = evaluate_republish(
                         captured_gen,
-                        post_read_gen,
+                        current_gen_before_republish,
                         image_source,
-                        is_own_event,
-                        owner_changed,
+                        false,
+                        owner_changed || owner_changed_before_republish,
                     );
 
                     match decision {
@@ -582,10 +591,10 @@ pub fn start(
                         }
                         RepublishDecision::SkipNewerClipboard => {
                             log::info!(
-                                "Skipping re-publication of image: newer clipboard activity detected (captured gen: {}, post-read gen: {}, owner_changed: {}).",
+                                "Skipping re-publication of image: newer clipboard activity detected (captured gen: {}, current gen: {}, owner_changed: {}).",
                                 captured_gen,
-                                post_read_gen,
-                                owner_changed
+                                current_gen_before_republish,
+                                owner_changed || owner_changed_before_republish
                             );
                         }
                         RepublishDecision::SkipFilePayload => {
