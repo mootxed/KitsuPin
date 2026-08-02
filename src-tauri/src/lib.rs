@@ -527,6 +527,7 @@ fn show_main(app: &AppHandle) {
 
 pub struct PopupManager {
     sm: Mutex<popup_state::PopupStateMachine>,
+    last_toggle: Mutex<std::time::Instant>,
 }
 
 impl Default for PopupManager {
@@ -539,20 +540,52 @@ impl PopupManager {
     pub fn new() -> Self {
         Self {
             sm: Mutex::new(popup_state::PopupStateMachine::new(3)),
+            last_toggle: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(10)),
         }
     }
 
     pub fn toggle(&self, app: &AppHandle) {
-        log::info!("popup toggle requested");
-        let action = self
-            .sm
-            .lock()
-            .handle_event(popup_state::PopupEvent::ToggleRequested);
+        let mut last = self.last_toggle.lock();
+        if last.elapsed() < std::time::Duration::from_millis(150) {
+            log::info!("popup toggle requested but debounced (<150ms)");
+            return;
+        }
+        *last = std::time::Instant::now();
+
+        let real_visible = app
+            .get_webview_window("popup")
+            .and_then(|w| w.is_visible().ok())
+            .unwrap_or(false);
+
+        log::info!(
+            "popup toggle requested. SM state: {:?}, actual window visible: {}",
+            self.sm.lock().state(),
+            real_visible
+        );
+
+        let mut sm = self.sm.lock();
+        if !real_visible && sm.is_visible() {
+            log::warn!("Popup state machine is out of sync with actual window visibility; resetting state to Hidden");
+            let _ = sm.handle_event(popup_state::PopupEvent::SyncVisibility { is_visible: false });
+        }
+
+        let action = sm.handle_event(popup_state::PopupEvent::ToggleRequested);
+        drop(sm);
+
         self.execute_action(app, action);
     }
 
     pub fn focus_gained(&self, app: &AppHandle) {
-        log::info!("Focused(true)");
+        let real_visible = app
+            .get_webview_window("popup")
+            .and_then(|w| w.is_visible().ok())
+            .unwrap_or(false);
+        log::info!(
+            "Focused(true). SM state: {:?}, actual window visible: {}",
+            self.sm.lock().state(),
+            real_visible
+        );
+
         let action = self
             .sm
             .lock()
@@ -561,24 +594,58 @@ impl PopupManager {
     }
 
     pub fn focus_lost(&self, app: &AppHandle) {
+        let real_visible = app
+            .get_webview_window("popup")
+            .and_then(|w| w.is_visible().ok())
+            .unwrap_or(false);
+        log::info!(
+            "Focused(false). SM state: {:?}, actual window visible: {}",
+            self.sm.lock().state(),
+            real_visible
+        );
+
         let action = self
             .sm
             .lock()
             .handle_event(popup_state::PopupEvent::FocusLost);
         if matches!(action, popup_state::PopupAction::HideWindow) {
-            log::info!("popup hidden after blur");
+            log::info!("popup hide scheduled after focus lost");
         } else {
-            log::info!("blur ignored because popup is still opening");
+            log::info!("focus lost event ignored by state machine");
         }
         self.execute_action(app, action);
     }
 
     pub fn hide(&self, app: &AppHandle) {
+        log::info!("popup hide requested");
         let action = self
             .sm
             .lock()
             .handle_event(popup_state::PopupEvent::HideRequested);
         self.execute_action(app, action);
+    }
+
+    pub fn handle_show_failed(&self) {
+        log::error!("Handling show failure: resetting state machine state to Hidden");
+        let _ = self
+            .sm
+            .lock()
+            .handle_event(popup_state::PopupEvent::WindowShowFailed);
+    }
+
+    pub fn handle_hide_failed(&self) {
+        log::error!("Handling hide failure: resetting state machine state to Hidden");
+        let _ = self
+            .sm
+            .lock()
+            .handle_event(popup_state::PopupEvent::WindowHideFailed);
+    }
+
+    pub fn confirm_hidden(&self) {
+        let _ = self
+            .sm
+            .lock()
+            .handle_event(popup_state::PopupEvent::WindowHidden);
     }
 
     fn handle_check_result(&self, app: &AppHandle, generation: u64, is_focused: bool) {
@@ -594,57 +661,89 @@ impl PopupManager {
     }
 
     fn execute_action(&self, app: &AppHandle, action: popup_state::PopupAction) {
-        let Some(w) = app.get_webview_window("popup") else {
-            return;
-        };
-        match action {
-            popup_state::PopupAction::ShowAndRequestFocus { generation } => {
-                log::info!("popup show completed for generation {generation}");
-                let _ = app.emit("clips-changed", ());
-                let _ = app.emit("categories-changed", ());
-                let _ = app.emit("settings-changed", ());
-                let _ = app.emit_to("popup", "popup-opened", ());
-                let _ = w.center();
-                let _ = w.show();
-                let _ = w.unminimize();
-                let _ = w.set_focus();
-                #[cfg(target_os = "linux")]
-                if let Ok(gtk_w) = w.gtk_window() {
-                    // Schedule present() on the GTK main loop via invoke_local—safe from any thread.
-                    glib::MainContext::default().invoke_local(move || {
+        let app_handle = app.clone();
+        if let Err(e) = app.run_on_main_thread(move || {
+            let Some(w) = app_handle.get_webview_window("popup") else {
+                log::warn!("popup webview window not found during execute_action");
+                return;
+            };
+            match action {
+                popup_state::PopupAction::ShowAndRequestFocus { generation } => {
+                    log::info!("Executing ShowAndRequestFocus on main thread for generation {generation}");
+                    let _ = app_handle.emit("clips-changed", ());
+                    let _ = app_handle.emit("categories-changed", ());
+                    let _ = app_handle.emit("settings-changed", ());
+                    let _ = app_handle.emit_to("popup", "popup-opened", ());
+
+                    if let Err(e) = w.center() {
+                        log::warn!("w.center() error: {e}");
+                    }
+                    if let Err(e) = w.show() {
+                        log::error!("w.show() error: {e}");
+                        if let Some(mgr) = app_handle.try_state::<Arc<PopupManager>>() {
+                            mgr.handle_show_failed();
+                        }
+                        return;
+                    }
+                    if let Err(e) = w.unminimize() {
+                        log::warn!("w.unminimize() error: {e}");
+                    }
+                    if let Err(e) = w.set_focus() {
+                        log::warn!("w.set_focus() error: {e}");
+                    }
+                    #[cfg(target_os = "linux")]
+                    if let Ok(gtk_w) = w.gtk_window() {
                         use gtk::prelude::GtkWindowExt;
                         gtk_w.present();
-                    });
-                }
+                    }
 
-                self.schedule_focus_check(app.clone(), generation, 1);
-            }
-            popup_state::PopupAction::RetryFocus {
-                generation,
-                attempt,
-            } => {
-                log::info!("focus request attempt {attempt} for generation {generation}");
-                let _ = w.unminimize();
-                let _ = w.set_focus();
-                #[cfg(target_os = "linux")]
-                if let Ok(gtk_w) = w.gtk_window() {
-                    // Schedule present() on the GTK main loop via invoke_local—safe from any thread.
-                    glib::MainContext::default().invoke_local(move || {
+                    if let Some(mgr) = app_handle.try_state::<Arc<PopupManager>>() {
+                        mgr.schedule_focus_check(app_handle.clone(), generation, 1);
+                    }
+                }
+                popup_state::PopupAction::RetryFocus {
+                    generation,
+                    attempt,
+                } => {
+                    log::info!("Executing RetryFocus attempt {attempt} on main thread for generation {generation}");
+                    if let Err(e) = w.unminimize() {
+                        log::warn!("w.unminimize() error: {e}");
+                    }
+                    if let Err(e) = w.set_focus() {
+                        log::warn!("w.set_focus() error: {e}");
+                    }
+                    #[cfg(target_os = "linux")]
+                    if let Ok(gtk_w) = w.gtk_window() {
                         use gtk::prelude::GtkWindowExt;
                         gtk_w.present();
-                    });
-                }
+                    }
 
-                self.schedule_focus_check(app.clone(), generation, attempt);
+                    if let Some(mgr) = app_handle.try_state::<Arc<PopupManager>>() {
+                        mgr.schedule_focus_check(app_handle.clone(), generation, attempt);
+                    }
+                }
+                popup_state::PopupAction::HideWindow => {
+                    log::info!("Executing HideWindow on main thread");
+                    if let Err(e) = w.hide() {
+                        log::error!("w.hide() error: {e}");
+                        if let Some(mgr) = app_handle.try_state::<Arc<PopupManager>>() {
+                            mgr.handle_hide_failed();
+                        }
+                    } else {
+                        log::info!("w.hide() succeeded, confirming state Hidden");
+                        if let Some(mgr) = app_handle.try_state::<Arc<PopupManager>>() {
+                            mgr.confirm_hidden();
+                        }
+                    }
+                }
+                popup_state::PopupAction::NotifyFrontendFocused { generation } => {
+                    log::info!("Executing NotifyFrontendFocused for generation {generation}");
+                    let _ = app_handle.emit_to("popup", "popup-focused", ());
+                }
+                popup_state::PopupAction::NoAction => {}
             }
-            popup_state::PopupAction::HideWindow => {
-                let _ = w.hide();
-            }
-            popup_state::PopupAction::NotifyFrontendFocused { generation } => {
-                log::info!("focus confirmed for generation {generation}");
-                let _ = app.emit_to("popup", "popup-focused", ());
-            }
-            popup_state::PopupAction::NoAction => {}
+        }) {
+            log::error!("Failed to dispatch UI action to main thread: {e}");
         }
     }
 
@@ -656,14 +755,17 @@ impl PopupManager {
                 _ => 120,
             };
             std::thread::sleep(std::time::Duration::from_millis(delay));
-            let is_focused = app
-                .get_webview_window("popup")
-                .and_then(|w| w.is_focused().ok())
-                .unwrap_or(false);
+            let app_handle = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                let is_focused = app_handle
+                    .get_webview_window("popup")
+                    .and_then(|w| w.is_focused().ok())
+                    .unwrap_or(false);
 
-            if let Some(mgr) = app.try_state::<Arc<PopupManager>>() {
-                mgr.handle_check_result(&app, generation, is_focused);
-            }
+                if let Some(mgr) = app_handle.try_state::<Arc<PopupManager>>() {
+                    mgr.handle_check_result(&app_handle, generation, is_focused);
+                }
+            });
         });
     }
 }
@@ -1015,7 +1117,8 @@ pub fn run() {
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _, event| {
-                    if event.state() == ShortcutState::Pressed {
+                    log::info!("Global shortcut event received: state={:?}", event.state());
+                    if event.state() == ShortcutState::Released {
                         if let Some(mgr) = app.try_state::<Arc<PopupManager>>() {
                             mgr.toggle(app);
                         }

@@ -1696,7 +1696,9 @@ fn load_clip_summary(db: &Connection, id: &str) -> Result<ClipSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{ClipboardPayload, ImagePayload, NewImageClip, PayloadKind};
+    use crate::domain::{
+        CapturedImageSource, ClipboardPayload, ImagePayload, NewImageClip, PayloadKind,
+    };
     use rusqlite::Connection;
 
     fn add<'a>(
@@ -1742,6 +1744,7 @@ mod tests {
             rgba: vec![red, 0, 0, 255, 0, 255, 0, 255],
             source_mime: None,
             source_bytes: None,
+            image_source: CapturedImageSource::ClipboardImage,
         }
     }
 
@@ -2733,6 +2736,7 @@ mod tests {
             rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
             source_mime: Some("image/png".into()),
             source_bytes: None,
+            image_source: CapturedImageSource::ClipboardImage,
         };
         let (hash, len) = crate::domain::ClipboardPayload::Image(image.clone())
             .match_key()
@@ -2808,6 +2812,7 @@ mod tests {
             rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
             source_mime: Some("image/png".into()),
             source_bytes: None,
+            image_source: CapturedImageSource::ClipboardImage,
         };
         r.upsert_image(NewImageClip {
             image: &image,
@@ -2864,6 +2869,7 @@ mod tests {
             rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
             source_mime: Some("image/png".into()),
             source_bytes: None,
+            image_source: CapturedImageSource::ClipboardImage,
         };
 
         // 1. First copy — no domain → gets a receipt (previous_copy_count = 0)
@@ -3010,6 +3016,7 @@ mod tests {
             rgba: rgba.clone(),
             source_mime: Some("image/png".into()),
             source_bytes: Some(vec![0x89, 0x50, 0x4e, 0x47, 0x01, 0x02, 0x03]), // fake PNG bytes A
+            image_source: CapturedImageSource::ClipboardImage,
         };
         let image_enc_b = crate::domain::ImagePayload {
             width: 2,
@@ -3017,6 +3024,7 @@ mod tests {
             rgba: rgba.clone(),
             source_mime: Some("image/png".into()),
             source_bytes: Some(vec![0x89, 0x50, 0x4e, 0x47, 0x04, 0x05, 0x06]), // fake PNG bytes B
+            image_source: CapturedImageSource::ClipboardImage,
         };
 
         // 1. First upsert — encoding A → blob_hash A

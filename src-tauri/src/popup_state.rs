@@ -28,6 +28,14 @@ pub enum PopupEvent {
     FocusCheckResult { generation: u64, is_focused: bool },
     /// Explicit request to hide window (Escape key, clip copied, explicit command).
     HideRequested,
+    /// Window was actually hidden by system or w.hide().
+    WindowHidden,
+    /// Window show operation failed.
+    WindowShowFailed,
+    /// Window hide operation failed.
+    WindowHideFailed,
+    /// Synchronization of real window visibility status.
+    SyncVisibility { is_visible: bool },
 }
 
 /// Output side-effects produced by the popup state machine.
@@ -77,6 +85,24 @@ impl PopupStateMachine {
 
     pub fn handle_event(&mut self, event: PopupEvent) -> PopupAction {
         match (&self.state, event) {
+            // Error recovery and explicit sync events reset state machine to Hidden
+            (
+                _,
+                PopupEvent::WindowHidden
+                | PopupEvent::WindowShowFailed
+                | PopupEvent::WindowHideFailed,
+            ) => {
+                self.state = PopupState::Hidden;
+                PopupAction::NoAction
+            }
+
+            (_, PopupEvent::SyncVisibility { is_visible }) => {
+                if !is_visible {
+                    self.state = PopupState::Hidden;
+                }
+                PopupAction::NoAction
+            }
+
             // ToggleRequested: hidden -> start opening
             (PopupState::Hidden, PopupEvent::ToggleRequested) => {
                 let gen = self.next_generation;
@@ -433,5 +459,52 @@ mod tests {
         let action = sm.handle_event(PopupEvent::HideRequested);
         assert_eq!(action, PopupAction::HideWindow);
         assert_eq!(sm.state(), &PopupState::Hidden);
+    }
+
+    #[test]
+    fn test_show_or_hide_failure_resets_state_to_hidden() {
+        let mut sm = PopupStateMachine::new(3);
+        sm.handle_event(PopupEvent::ToggleRequested);
+        assert!(sm.is_visible());
+
+        sm.handle_event(PopupEvent::WindowShowFailed);
+        assert_eq!(sm.state(), &PopupState::Hidden);
+
+        sm.handle_event(PopupEvent::ToggleRequested);
+        sm.handle_event(PopupEvent::FocusGained);
+        assert!(sm.is_visible());
+
+        sm.handle_event(PopupEvent::WindowHideFailed);
+        assert_eq!(sm.state(), &PopupState::Hidden);
+    }
+
+    #[test]
+    fn test_sync_visibility_resets_out_of_sync_state() {
+        let mut sm = PopupStateMachine::new(3);
+        sm.handle_event(PopupEvent::ToggleRequested);
+        assert!(sm.is_visible());
+
+        sm.handle_event(PopupEvent::SyncVisibility { is_visible: false });
+        assert_eq!(sm.state(), &PopupState::Hidden);
+    }
+
+    #[test]
+    fn test_twenty_toggle_cycles_remain_consistent() {
+        let mut sm = PopupStateMachine::new(3);
+        for i in 1..=20 {
+            // Open
+            let action_open = sm.handle_event(PopupEvent::ToggleRequested);
+            assert_eq!(
+                action_open,
+                PopupAction::ShowAndRequestFocus { generation: i }
+            );
+            sm.handle_event(PopupEvent::FocusGained);
+            assert_eq!(sm.state(), &PopupState::VisibleAndFocused { generation: i });
+
+            // Close
+            let action_close = sm.handle_event(PopupEvent::ToggleRequested);
+            assert_eq!(action_close, PopupAction::HideWindow);
+            assert_eq!(sm.state(), &PopupState::Hidden);
+        }
     }
 }

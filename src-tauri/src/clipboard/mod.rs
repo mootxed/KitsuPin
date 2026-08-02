@@ -1,8 +1,8 @@
 use crate::{
     browser_metadata::MetadataBuffer,
     domain::{
-        content_hash, normalize_content, ClipboardPayload, ImagePayload, NewClip, NewImageClip,
-        OwnCopyGuard,
+        content_hash, normalize_content, CapturedImageSource, ClipboardPayload, ImagePayload,
+        NewClip, NewImageClip, OwnCopyGuard,
     },
     persistence::Repository,
     settings::SettingsStore,
@@ -35,6 +35,30 @@ pub struct ClipboardAccess {
 }
 
 impl ClipboardAccess {
+    fn inspect_x11_clipboard(&self, context: &str) -> Option<u32> {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok((conn, screen_num)) = x11rb::connect(None) {
+                if let Ok(clipboard_reply) = conn.intern_atom(false, b"CLIPBOARD") {
+                    if let Ok(clipboard_atom) = clipboard_reply.reply() {
+                        if let Ok(owner_reply) = conn.get_selection_owner(clipboard_atom.atom) {
+                            if let Ok(owner) = owner_reply.reply() {
+                                log::info!(
+                                    "X11 CLIPBOARD diagnostic [{context}]: selection owner window ID = {}",
+                                    owner.owner
+                                );
+                                return Some(owner.owner);
+                            }
+                        }
+                    }
+                }
+                let _ = screen_num;
+            }
+        }
+        let _ = context;
+        None
+    }
+
     fn with<T>(
         &self,
         operation: impl FnOnce(&mut Clipboard) -> Result<T, arboard::Error>,
@@ -63,6 +87,7 @@ impl ClipboardAccess {
     }
 
     fn read_payload(&self, max_image_bytes: u64) -> Option<ClipboardPayload> {
+        let _owner_before = self.inspect_x11_clipboard("before read_payload");
         for attempt in 0..3 {
             if let Ok(image) = self.with(Clipboard::get_image) {
                 let payload = ImagePayload {
@@ -71,8 +96,16 @@ impl ClipboardAccess {
                     rgba: image.bytes.into_owned(),
                     source_mime: None,
                     source_bytes: None,
+                    image_source: CapturedImageSource::ClipboardImage,
                 };
                 if payload.validate().is_ok() {
+                    let _owner_after = self.inspect_x11_clipboard("after Clipboard::get_image");
+                    log::info!(
+                        "Captured ClipboardImage: {}x{}, fingerprint: {}",
+                        payload.width,
+                        payload.height,
+                        ClipboardPayload::Image(payload.clone()).fingerprint()
+                    );
                     return Some(ClipboardPayload::Image(payload));
                 }
             }
@@ -81,6 +114,13 @@ impl ClipboardAccess {
             }
         }
         if let Some(image) = self.read_file_image(max_image_bytes) {
+            log::info!(
+                "Captured CopiedImageFile: {}x{}, mime: {:?}, fingerprint: {}",
+                image.width,
+                image.height,
+                image.source_mime,
+                ClipboardPayload::Image(image.clone()).fingerprint()
+            );
             return Some(ClipboardPayload::Image(image));
         }
         self.read_text().map(ClipboardPayload::Text)
@@ -134,6 +174,7 @@ fn decode_image_file(path: &std::path::Path, max_image_bytes: u64) -> Option<Ima
         rgba: decoded.into_raw(),
         source_mime: Some(expected_mime.to_owned()),
         source_bytes: Some(bytes),
+        image_source: CapturedImageSource::CopiedImageFile,
     };
     payload.validate().ok()?;
     Some(payload)
@@ -335,6 +376,29 @@ pub fn start(
             match save_result {
                 Ok(()) => {
                     let _ = app.emit("clips-changed", ());
+
+                    if let ClipboardPayload::Image(ref image_payload) = payload {
+                        if image_payload.image_source == CapturedImageSource::ClipboardImage {
+                            log::info!(
+                                "ClipboardImage saved to DB successfully. Re-publishing PNG image to X11 CLIPBOARD to maintain selection ownership for immediate Ctrl+V..."
+                            );
+                            if let Err(error) =
+                                set_clipboard_payload(&payload, &fingerprint, &guard, &access)
+                            {
+                                log::error!(
+                                    "Failed to re-publish ClipboardImage to X11 CLIPBOARD: {error}"
+                                );
+                            } else {
+                                log::info!(
+                                    "Successfully re-published ClipboardImage to X11 CLIPBOARD."
+                                );
+                            }
+                        } else {
+                            log::info!(
+                                "CopiedImageFile detected. Preserving file-list semantics (no set_image re-publication)."
+                            );
+                        }
+                    }
                 }
                 Err(error) => {
                     log::error!("Не удалось сохранить Clipboard: {error}");
@@ -368,6 +432,7 @@ mod tests {
             assert_eq!(decoded.width, 2);
             assert_eq!(decoded.height, 1);
             assert_eq!(decoded.source_mime.as_deref(), Some(mime));
+            assert_eq!(decoded.image_source, CapturedImageSource::CopiedImageFile);
             assert!(decoded
                 .source_bytes
                 .as_ref()
@@ -401,6 +466,7 @@ mod tests {
             rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
             source_mime: None,
             source_bytes: None,
+            image_source: CapturedImageSource::ClipboardImage,
         });
         let fingerprint = payload.fingerprint();
         set_clipboard_payload(&payload, &fingerprint, &guard, &access).unwrap();

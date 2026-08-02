@@ -24,6 +24,14 @@ impl PayloadKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CapturedImageSource {
+    #[default]
+    ClipboardImage,
+    CopiedImageFile,
+}
+
 #[derive(Debug, Clone)]
 pub struct ImagePayload {
     pub width: u32,
@@ -31,6 +39,7 @@ pub struct ImagePayload {
     pub rgba: Vec<u8>,
     pub source_mime: Option<String>,
     pub source_bytes: Option<Vec<u8>>,
+    pub image_source: CapturedImageSource,
 }
 
 impl ImagePayload {

@@ -1,4 +1,4 @@
-use crate::domain::ImagePayload;
+use crate::domain::{CapturedImageSource, ImagePayload};
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use sha2::{Digest, Sha256};
@@ -131,6 +131,7 @@ impl BlobStore {
             rgba: decoded.into_raw(),
             source_mime: None,
             source_bytes: None,
+            image_source: CapturedImageSource::ClipboardImage,
         };
         image.validate()?;
         Ok(image)
@@ -240,6 +241,7 @@ fn make_thumbnail(image: &ImagePayload) -> Result<ImagePayload> {
         rgba,
         source_mime: None,
         source_bytes: None,
+        image_source: image.image_source,
     })
 }
 
@@ -281,6 +283,7 @@ mod tests {
             rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
             source_mime: None,
             source_bytes: None,
+            image_source: CapturedImageSource::ClipboardImage,
         };
         let prepared = store.prepare(&payload, 1024 * 1024).unwrap();
         assert!(store.persist(&prepared).unwrap());
