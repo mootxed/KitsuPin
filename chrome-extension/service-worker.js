@@ -83,7 +83,22 @@ chrome.runtime.onMessage.addListener((message, _sender, respond) => {
         }
         const res = await chrome.runtime.sendNativeMessage(HOST, message);
         if (res?.ok === true) {
-          await chrome.storage.local.set({ nativeStatus: "connected", checkedAt: Date.now(), errorDetail: null });
+          await chrome.storage.local.set({
+            nativeStatus: "connected",
+            checkedAt: Date.now(),
+            errorDetail: null
+          });
+        } else {
+          const nativeStatus =
+            res?.error === "app_not_running"
+              ? "app-not-running"
+              : "unknown-error";
+
+          await chrome.storage.local.set({
+            nativeStatus,
+            checkedAt: Date.now(),
+            errorDetail: res?.error ?? "unknown-error"
+          });
         }
         respond(res);
       } catch (err) {

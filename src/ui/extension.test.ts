@@ -116,9 +116,21 @@ describe("Chrome Extension - Content Script Execution & Data Formatting", () => 
   });
 });
 
+type LifecycleListener = () => void | Promise<void>;
+
+type MessageListener = (
+  message: unknown,
+  sender: unknown,
+  respond: (response: unknown) => void
+) => boolean | void;
+
 describe("Chrome Extension - Service Worker Lifecycle & Messaging", () => {
   function createSWEnvironment() {
-    const listeners: Record<string, Function> = {};
+    const listeners: {
+      onInstalled?: LifecycleListener;
+      onStartup?: LifecycleListener;
+      onMessage?: MessageListener;
+    } = {};
     const storageData: Record<string, unknown> = {};
     const nativeMessagesSent: Array<{ host: string; msg: unknown }> = [];
     const scriptExecutions: Array<{ target: unknown; files: string[] }> = [];
@@ -126,17 +138,17 @@ describe("Chrome Extension - Service Worker Lifecycle & Messaging", () => {
     const mockChrome = {
       runtime: {
         onInstalled: {
-          addListener: (fn: Function) => {
+          addListener: (fn: LifecycleListener) => {
             listeners.onInstalled = fn;
           },
         },
         onStartup: {
-          addListener: (fn: Function) => {
+          addListener: (fn: LifecycleListener) => {
             listeners.onStartup = fn;
           },
         },
         onMessage: {
-          addListener: (fn: Function) => {
+          addListener: (fn: MessageListener) => {
             listeners.onMessage = fn;
           },
         },
@@ -245,6 +257,40 @@ describe("Chrome Extension - Service Worker Lifecycle & Messaging", () => {
 
     expect(copyResponse).toEqual({ ok: true, version: 1 });
     expect(env.storageData.nativeStatus).toBe("connected");
+  });
+
+  it("updates storage status to app-not-running when copy returns ok: false", async () => {
+    const env = createSWEnvironment();
+    env.storageData.checkedAt = Date.now();
+    env.storageData.nativeStatus = "connected";
+
+    env.mockChrome.runtime.sendNativeMessage.mockResolvedValueOnce({
+      ok: false,
+      error: "app_not_running",
+    });
+
+    const copyMsg = {
+      version: 1,
+      event: "copy",
+      contentHash: "b".repeat(64),
+      contentLength: 5,
+      domain: "example.com",
+      pageTitle: "Example",
+      timestamp: new Date().toISOString(),
+    };
+
+    let copyResponse: unknown = null;
+    await new Promise<void>((resolve) => {
+      const respond = (res: unknown) => {
+        copyResponse = res;
+        resolve();
+      };
+      env.listeners.onMessage!(copyMsg, {}, respond);
+    });
+
+    expect(copyResponse).toEqual({ ok: false, error: "app_not_running" });
+    expect(env.storageData.nativeStatus).toBe("app-not-running");
+    expect(env.storageData.errorDetail).toBe("app_not_running");
   });
 });
 

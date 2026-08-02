@@ -40,8 +40,11 @@ fn handle() -> anyhow::Result<()> {
         // Valid status probe
     } else if is_copy_event(&value) {
         let copy_event: crate::browser_metadata::BrowserCopyEvent =
-            serde_json::from_value(value.clone()).map_err(|e| anyhow::anyhow!("invalid_message: {e}"))?;
-        copy_event.validate().map_err(|e| anyhow::anyhow!("invalid_message: {e}"))?;
+            serde_json::from_value(value.clone())
+                .map_err(|e| anyhow::anyhow!("invalid_message: {e}"))?;
+        copy_event
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid_message: {e}"))?;
     } else {
         anyhow::bail!("invalid_message");
     }
@@ -68,7 +71,10 @@ fn handle() -> anyhow::Result<()> {
     if resp_val.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(())
     } else {
-        let err = resp_val.get("error").and_then(Value::as_str).unwrap_or("app_rejected");
+        let err = resp_val
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("app_rejected");
         anyhow::bail!("app_rejected: {err}");
     }
 }

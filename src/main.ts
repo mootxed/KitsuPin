@@ -1061,7 +1061,7 @@ function renderGeneralTab(body: HTMLElement) {
   });
 
   // Check extension
-  body.querySelector("#btn-check-ext")?.addEventListener("click", async () => {
+  async function refreshExtensionStatus() {
     try {
       const status = await api.getIntegrationStatus();
       const label = body.querySelector<HTMLElement>("#ext-status-label");
@@ -1080,11 +1080,16 @@ function renderGeneralTab(body: HTMLElement) {
         if (dot) dot.className = "dot paused";
         if (subtext) subtext.textContent = "KitsuPin сейчас недоступен или манифест не настроен.";
       }
-      showToast("Статус расширения обновлён", "info");
     } catch {
-      showToast("Не удалось проверить расширение");
+      // ignore
     }
-  });
+  }
+
+  body
+    .querySelector("#btn-check-ext")
+    ?.addEventListener("click", refreshExtensionStatus);
+
+  void refreshExtensionStatus();
 
 }
 

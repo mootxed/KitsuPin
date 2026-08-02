@@ -438,19 +438,23 @@ fn read_stream(
                                 match buffer.push(event.clone()) {
                                     Ok(()) => {
                                         reconcile(event);
-                                        let _ = stream.write_all(b"{\"ok\":true,\"accepted\":true}\n");
+                                        let _ =
+                                            stream.write_all(b"{\"ok\":true,\"accepted\":true}\n");
                                         let _ = stream.flush();
                                     }
                                     Err(e) => {
                                         log::warn!("Отклонено событие Chrome: {e}");
-                                        let _ = stream.write_all(b"{\"ok\":false,\"error\":\"validation_failed\"}\n");
+                                        let _ = stream.write_all(
+                                            b"{\"ok\":false,\"error\":\"validation_failed\"}\n",
+                                        );
                                         let _ = stream.flush();
                                     }
                                 }
                             }
                             Err(e) => {
                                 log::warn!("Отклонён некорректный JSON copy Chrome: {e}");
-                                let _ = stream.write_all(b"{\"ok\":false,\"error\":\"invalid_payload\"}\n");
+                                let _ = stream
+                                    .write_all(b"{\"ok\":false,\"error\":\"invalid_payload\"}\n");
                                 let _ = stream.flush();
                             }
                         }
@@ -707,14 +711,18 @@ mod tests {
         start_socket_server(sock_path.clone(), buffer, cb).expect("start server");
 
         let mut client = UnixStream::connect(&sock_path).expect("connect to server");
-        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
 
         // 1. Send status probe
         let status_json = serde_json::json!({
             "version": 1,
             "event": "status",
             "timestamp": Utc::now().to_rfc3339()
-        }).to_string() + "\n";
+        })
+        .to_string()
+            + "\n";
 
         client.write_all(status_json.as_bytes()).unwrap();
         client.flush().unwrap();
@@ -737,10 +745,14 @@ mod tests {
             "domain": "example.com",
             "pageTitle": "Test",
             "timestamp": Utc::now().to_rfc3339()
-        }).to_string() + "\n";
+        })
+        .to_string()
+            + "\n";
 
         let mut client2 = UnixStream::connect(&sock_path).expect("connect client 2");
-        client2.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        client2
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         client2.write_all(copy_json.as_bytes()).unwrap();
         client2.flush().unwrap();
 
@@ -769,7 +781,9 @@ mod tests {
         start_socket_server(sock_path.clone(), buffer, cb).unwrap();
 
         let mut client = UnixStream::connect(&sock_path).unwrap();
-        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
 
         // Send invalid copy payload (bad hash)
         let invalid_copy = serde_json::json!({
@@ -780,7 +794,9 @@ mod tests {
             "domain": "example.com",
             "pageTitle": "Test",
             "timestamp": Utc::now().to_rfc3339()
-        }).to_string() + "\n";
+        })
+        .to_string()
+            + "\n";
 
         client.write_all(invalid_copy.as_bytes()).unwrap();
         client.flush().unwrap();
