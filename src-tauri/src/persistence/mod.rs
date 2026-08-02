@@ -1063,7 +1063,14 @@ impl Repository {
                             payload_kind = 'image',
                             blob_hash = COALESCE(?6, blob_hash)
                          WHERE id=?1",
-                        params![existing_id, temp_sort, event_ts_ms, title, temp_content, temp_blob_hash],
+                        params![
+                            existing_id,
+                            temp_sort,
+                            event_ts_ms,
+                            title,
+                            temp_content,
+                            temp_blob_hash
+                        ],
                     )?;
                 } else {
                     tx.execute(
@@ -1117,7 +1124,13 @@ impl Repository {
         let kind = query.content_type.map(ContentType::as_str);
         let payload_kind = query
             .payload_kind
-            .or_else(|| if query.content_type.is_some() { Some(PayloadKind::Text) } else { None })
+            .or_else(|| {
+                if query.content_type.is_some() {
+                    Some(PayloadKind::Text)
+                } else {
+                    None
+                }
+            })
             .map(PayloadKind::as_str);
         let limit = query.limit.unwrap_or(100).clamp(1, 200);
         let offset = query.offset.unwrap_or(0);
@@ -2751,7 +2764,9 @@ mod tests {
             content_length: len,
             domain: "chrome.org".into(),
             page_title: "Chrome Image".into(),
-            timestamp: chrono::DateTime::from_timestamp_millis(now).unwrap().to_rfc3339(),
+            timestamp: chrono::DateTime::from_timestamp_millis(now)
+                .unwrap()
+                .to_rfc3339(),
         };
 
         let attached_id = r
@@ -2814,7 +2829,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(text_filtered.len(), 1);
-        assert_eq!(text_filtered[0].payload_kind, crate::domain::PayloadKind::Text);
+        assert_eq!(
+            text_filtered[0].payload_kind,
+            crate::domain::PayloadKind::Text
+        );
         assert_eq!(text_filtered[0].preview, "Hello World");
 
         // Query with payload_kind = Image
@@ -2826,7 +2844,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(image_filtered.len(), 1);
-        assert_eq!(image_filtered[0].payload_kind, crate::domain::PayloadKind::Image);
+        assert_eq!(
+            image_filtered[0].payload_kind,
+            crate::domain::PayloadKind::Image
+        );
     }
 
     /// Bug 1 regression test: second copy of same image + late domain metadata must
@@ -2885,7 +2906,10 @@ mod tests {
             .unwrap();
         let receipt2 = receipt2_opt.expect("second copy should produce a receipt");
         assert_eq!(summary1.id, summary2.id, "same temp clip should be updated");
-        assert_eq!(receipt2.previous_copy_count, 1, "previous_copy_count must be 1 for second copy");
+        assert_eq!(
+            receipt2.previous_copy_count, 1,
+            "previous_copy_count must be 1 for second copy"
+        );
         assert_eq!(summary2.payload_kind, crate::domain::PayloadKind::Image);
 
         // 3. Late domain metadata arrives for the second copy
@@ -2912,7 +2936,10 @@ mod tests {
 
         // 4. The domain card must be an image (not an empty text card)
         let clips = r.list_clips(&ClipQuery::default()).unwrap();
-        let domain_clip = clips.iter().find(|c| c.id == domain_id).expect("domain clip must exist");
+        let domain_clip = clips
+            .iter()
+            .find(|c| c.id == domain_id)
+            .expect("domain clip must exist");
         assert_eq!(
             domain_clip.payload_kind,
             crate::domain::PayloadKind::Image,
@@ -2938,7 +2965,10 @@ mod tests {
         );
 
         // 6. Original temp card still has copy_count=1 and is still an image
-        let temp_clip = clips.iter().find(|c| c.id == temp_id).expect("temp clip must still exist");
+        let temp_clip = clips
+            .iter()
+            .find(|c| c.id == temp_id)
+            .expect("temp clip must still exist");
         assert_eq!(temp_clip.copy_count, 1, "temp clip copy_count must be 1");
         assert_eq!(
             temp_clip.payload_kind,
@@ -2954,7 +2984,10 @@ mod tests {
         );
         let domain_copy = r.get_clip_for_copy(&domain_id).unwrap();
         assert!(
-            matches!(domain_copy.payload, crate::domain::ClipboardPayload::Image(_)),
+            matches!(
+                domain_copy.payload,
+                crate::domain::ClipboardPayload::Image(_)
+            ),
             "domain clip clipboard payload must be Image"
         );
     }
@@ -3001,8 +3034,10 @@ mod tests {
 
         let blob_hash_a: Option<String> = {
             let db = r.connection.lock();
-            db.query_row("SELECT blob_hash FROM clips WHERE id=?1", [&clip_id], |r| r.get(0))
-                .unwrap()
+            db.query_row("SELECT blob_hash FROM clips WHERE id=?1", [&clip_id], |r| {
+                r.get(0)
+            })
+            .unwrap()
         };
         let blob_hash_a = blob_hash_a.expect("clip must have blob_hash A");
 
@@ -3020,8 +3055,10 @@ mod tests {
 
         let blob_hash_b: Option<String> = {
             let db = r.connection.lock();
-            db.query_row("SELECT blob_hash FROM clips WHERE id=?1", [&clip_id], |r| r.get(0))
-                .unwrap()
+            db.query_row("SELECT blob_hash FROM clips WHERE id=?1", [&clip_id], |r| {
+                r.get(0)
+            })
+            .unwrap()
         };
         let blob_hash_b = blob_hash_b.expect("clip must have blob_hash B after second upsert");
 
@@ -3073,7 +3110,10 @@ mod tests {
             )
             .unwrap()
         };
-        assert!(blob_b_exists, "referenced blob B must not be deleted by cleanup");
+        assert!(
+            blob_b_exists,
+            "referenced blob B must not be deleted by cleanup"
+        );
 
         // 6. cleanup returned > 0 only if blob A's file existed on disk
         // (may be 0 if the fake bytes didn't write a real file; that's OK).
