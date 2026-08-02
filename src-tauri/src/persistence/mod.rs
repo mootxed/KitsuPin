@@ -32,16 +32,20 @@ impl Repository {
         {
             use std::os::unix::fs::PermissionsExt;
             if path.exists() {
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                    .context("не удалось установить права 0600 на БД")?;
             }
             if let Some(parent) = path.parent() {
-                let wal = parent.join("kitsupin.sqlite3-wal");
+                let db_name = path.file_name().unwrap_or_default().to_string_lossy();
+                let wal = parent.join(format!("{db_name}-wal"));
                 if wal.exists() {
-                    let _ = std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o600));
+                    std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o600))
+                        .context("не удалось установить права 0600 на WAL-файл")?;
                 }
-                let shm = parent.join("kitsupin.sqlite3-shm");
+                let shm = parent.join(format!("{db_name}-shm"));
                 if shm.exists() {
-                    let _ = std::fs::set_permissions(&shm, std::fs::Permissions::from_mode(0o600));
+                    std::fs::set_permissions(&shm, std::fs::Permissions::from_mode(0o600))
+                        .context("не удалось установить права 0600 на SHM-файл")?;
                 }
             }
         }

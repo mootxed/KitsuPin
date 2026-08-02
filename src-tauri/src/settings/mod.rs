@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -122,10 +122,10 @@ impl SettingsStore {
         };
 
         if path.exists() {
-            secure_file(&path);
+            secure_file(&path)?;
         }
         if invalid_path.exists() {
-            secure_file(&invalid_path);
+            secure_file(&invalid_path)?;
         }
 
         Ok(Arc::new(Self {
@@ -164,23 +164,27 @@ impl SettingsStore {
             // fsync to ensure data reaches disk before rename.
             f.sync_data()?;
         }
-        secure_file(&tmp);
+        secure_file(&tmp)?;
         std::fs::rename(&tmp, &self.path)?;
-        secure_file(&self.path);
+        secure_file(&self.path)?;
         *self.value.write() = value;
         Ok(())
     }
 }
 
 #[cfg(unix)]
-fn secure_file(path: &Path) {
+fn secure_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     if path.exists() {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Не удалось установить права 0600 на {:?}", path))?;
     }
+    Ok(())
 }
 #[cfg(not(unix))]
-fn secure_file(_path: &Path) {}
+fn secure_file(_path: &Path) -> Result<()> {
+    Ok(())
+}
 
 pub fn project_dirs() -> Result<ProjectDirs> {
     ProjectDirs::from("io.github.mootxed", "", "kitsupin")
@@ -223,7 +227,8 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .with_context(|| format!("Не удалось установить права 0644 на {:?}", path))?;
         }
     } else {
         std::fs::create_dir_all(path.parent().unwrap())?;
@@ -236,7 +241,8 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .with_context(|| format!("Не удалось установить права 0644 на {:?}", path))?;
         }
     }
     Ok(())

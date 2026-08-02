@@ -600,10 +600,12 @@ fn start_single_instance_listener(data_dir: &Path, app: AppHandle) {
     }
     match UnixListener::bind(&socket_path) {
         Ok(listener) => {
-            let _ = std::fs::set_permissions(
+            if let Err(e) = std::fs::set_permissions(
                 &socket_path,
                 std::os::unix::fs::PermissionsExt::from_mode(0o600),
-            );
+            ) {
+                log::error!("Single-instance listener: не удалось установить права 0600 на socket: {e}");
+            }
             std::thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
                     let mut reader = BufReader::new(stream);
@@ -714,7 +716,8 @@ pub fn run() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700));
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("failed to set 0700 permissions on data directory");
     }
 
     // ── Atomic single-instance check (BEFORE DB open or starting threads) ──

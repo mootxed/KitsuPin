@@ -260,7 +260,8 @@ function clipCard(c: ClipSummary, index: number) {
   if (popup) {
     // Compact popup style — popitem
     const metaLabel = c.domain ? `${typeLabel} · ${c.domain}` : typeLabel;
-    return `<button class="popitem ${index === state.selected ? "selected" : ""}" tabindex="0" data-clip="${c.id}" aria-label="Скопировать фрагмент">
+    const isSelected = index === state.selected;
+    return `<button class="popitem ${isSelected ? "selected" : ""}" tabindex="0" data-clip="${c.id}" id="clip-item-${index}" role="option" aria-selected="${isSelected}" aria-label="Скопировать фрагмент ${index + 1}: ${esc(c.preview)}">
       <span class="popnum">${index + 1 <= 9 ? index + 1 : "·"}</span>
       <span><p>${esc(c.preview)}${isTruncated ? "…" : ""}</p><small>${metaLabel}</small></span>
       <span class="kbd">Enter</span>
@@ -356,7 +357,21 @@ function renderCards() {
   root.querySelector("[data-load-more]")?.addEventListener("click", loadMore);
   hydrateIcons(root);
   if (popup) {
-    root.querySelector(".popitem.selected")?.scrollIntoView({ block: "nearest" });
+    const selectedEl = root.querySelector<HTMLElement>(".popitem.selected");
+    selectedEl?.scrollIntoView({ block: "nearest" });
+    const searchInput = document.querySelector<HTMLInputElement>("#search");
+    if (searchInput) {
+      if (state.clips.length > 0 && state.selected >= 0) {
+        searchInput.setAttribute("aria-activedescendant", `clip-item-${state.selected}`);
+      } else {
+        searchInput.removeAttribute("aria-activedescendant");
+      }
+    }
+    const announcer = document.querySelector<HTMLElement>("#sr-announcer");
+    const activeClip = state.clips[state.selected];
+    if (announcer && activeClip) {
+      announcer.textContent = `Выбран элемент ${state.selected + 1} из ${state.clips.length}: ${activeClip.preview}`;
+    }
   }
 }
 
@@ -383,7 +398,13 @@ function bindCards(root: HTMLElement) {
       }
     });
 
-    card.ondragstart = (e) => e.dataTransfer?.setData("text/kitsupin", clip.id);
+    card.ondragstart = (e) => {
+      if (e.target instanceof Element && e.target.closest('button, .clip-actions, input, a, .tag')) {
+        e.preventDefault();
+        return;
+      }
+      e.dataTransfer?.setData("text/kitsupin", clip.id);
+    };
 
     card.querySelector<HTMLElement>("[data-action=details]")?.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -748,8 +769,13 @@ function showSettings() {
   showScreen("settings");
 }
 
+let draftSettings: Settings | null = null;
+
 function renderSettingsScreen() {
-  const s = state.settings;
+  if (!draftSettings && state.settings) {
+    draftSettings = { ...state.settings };
+  }
+  const s = draftSettings || state.settings;
   const body = document.querySelector<HTMLElement>("#settings-body");
   if (!body || !s) return;
 
@@ -758,7 +784,7 @@ function renderSettingsScreen() {
     btn.onclick = () => {
       document.querySelectorAll<HTMLElement>(".settings-nav .navbtn").forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
-      if (btn.dataset.tab === "general") renderGeneralTab(body, s);
+      if (btn.dataset.tab === "general") renderGeneralTab(body);
       else if (btn.dataset.tab === "integration") renderIntegrationView(body);
       else if (btn.dataset.tab === "about") renderAboutTab(body);
     };
@@ -767,7 +793,7 @@ function renderSettingsScreen() {
   // Default: show general tab
   document.querySelectorAll<HTMLElement>(".settings-nav .navbtn").forEach((b) => b.classList.remove("active"));
   document.querySelector<HTMLElement>(".settings-nav .navbtn[data-tab='general']")?.classList.add("active");
-  renderGeneralTab(body, s);
+  renderGeneralTab(body);
 }
 
 function renderAboutTab(body: HTMLElement) {
@@ -787,18 +813,22 @@ function renderAboutTab(body: HTMLElement) {
   `;
 }
 
-function renderGeneralTab(body: HTMLElement, s: NonNullable<typeof state.settings>) {
+function renderGeneralTab(body: HTMLElement) {
+  if (!draftSettings && state.settings) {
+    draftSettings = { ...state.settings };
+  }
+  const s = draftSettings || state.settings;
   if (!s) return;
   body.innerHTML = `
     <div class="panel">
       <h2>Основные</h2>
       <div class="setting-row">
         <div><strong>Запись истории</strong><p>Отслеживать обычный X11 Clipboard</p></div>
-        <button class="switch ${s.paused ? "" : "on"}" role="switch" id="sw-recording" aria-label="Запись" aria-checked="${!s.paused}"></button>
+        <button class="switch ${s.paused ? "" : "on"}" role="switch" type="button" tabindex="0" id="sw-recording" aria-label="Запись" aria-checked="${!s.paused}"></button>
       </div>
       <div class="setting-row">
         <div><strong>Автозапуск</strong><p>Запускать после входа в KDE</p></div>
-        <button class="switch ${s.autostart ? "on" : ""}" role="switch" id="sw-autostart" aria-label="Автозапуск" aria-checked="${s.autostart}"></button>
+        <button class="switch ${s.autostart ? "on" : ""}" role="switch" type="button" tabindex="0" id="sw-autostart" aria-label="Автозапуск" aria-checked="${s.autostart}"></button>
       </div>
       <div class="setting-row">
         <div><strong>Горячая клавиша</strong><p>Открывает компактную историю поверх окон.</p></div>
@@ -827,30 +857,46 @@ function renderGeneralTab(body: HTMLElement, s: NonNullable<typeof state.setting
   `;
   hydrateIcons(body);
 
-  // Toggle switches
+  // Toggle switches with click & Space key handling
   const swRecording = body.querySelector<HTMLButtonElement>("#sw-recording");
   const swAutostart = body.querySelector<HTMLButtonElement>("#sw-autostart");
-  swRecording?.addEventListener("click", () => {
-    const enabled = swRecording.classList.toggle("on");
-    swRecording.setAttribute("aria-checked", String(enabled));
+
+  const bindSwitch = (btn: HTMLButtonElement | null, getValue: () => boolean, setValue: (val: boolean) => void) => {
+    if (!btn) return;
+    btn.onclick = () => {
+      const nextVal = !getValue();
+      setValue(nextVal);
+      btn.classList.toggle("on", nextVal);
+      btn.setAttribute("aria-checked", String(nextVal));
+    };
+    btn.onkeydown = (e) => {
+      if (e.key === " " || e.key === "Spacebar") {
+        e.preventDefault();
+        btn.click();
+      }
+    };
+  };
+
+  bindSwitch(swRecording, () => !s.paused, (on) => { if (draftSettings) draftSettings.paused = !on; });
+  bindSwitch(swAutostart, () => s.autostart, (on) => { if (draftSettings) draftSettings.autostart = on; });
+
+  const inputShortcut = body.querySelector<HTMLInputElement>("#input-shortcut");
+  inputShortcut?.addEventListener("input", () => {
+    if (draftSettings) draftSettings.shortcut = inputShortcut.value;
   });
-  swAutostart?.addEventListener("click", () => {
-    const enabled = swAutostart.classList.toggle("on");
-    swAutostart.setAttribute("aria-checked", String(enabled));
+
+  const inputRetention = body.querySelector<HTMLInputElement>("#input-retention");
+  inputRetention?.addEventListener("input", () => {
+    if (draftSettings) draftSettings.retentionDays = Number(inputRetention.value);
   });
 
   // Save
   body.querySelector("#btn-save-settings")?.addEventListener("click", async () => {
-    const next = {
-      ...s,
-      paused: !swRecording?.classList.contains("on"),
-      autostart: swAutostart?.classList.contains("on") ?? s.autostart,
-      shortcut: (body.querySelector<HTMLInputElement>("#input-shortcut")?.value ?? s.shortcut),
-      retentionDays: Number(body.querySelector<HTMLInputElement>("#input-retention")?.value ?? s.retentionDays),
-    };
+    const next = draftSettings || s;
     try {
       await api.saveSettings(next);
-      state.settings = next;
+      state.settings = { ...next };
+      draftSettings = { ...next };
       updateRecordingStatus(next.paused);
       const pauseBtn = document.querySelector<HTMLButtonElement>("#btn-pause");
       if (pauseBtn) pauseBtn.querySelector("span")!.textContent = next.paused ? "Продолжить" : "Пауза";
@@ -898,6 +944,9 @@ async function reload() {
   const data = await api.bootstrap(popup);
   state.categories = data.categories;
   state.settings = data.settings;
+  if (!draftSettings && data.settings) {
+    draftSettings = { ...data.settings };
+  }
   state.clips = await api.list(query());
   state.hasMore = !popup && state.clips.length === 60;
   renderFilters();

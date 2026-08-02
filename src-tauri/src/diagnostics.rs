@@ -379,7 +379,12 @@ pub fn save_user_extension_manifest(extension_id: &str) -> Result<PathBuf, Strin
     let json_content = generate_native_manifest(&host_path, extension_id)?;
     fs::write(&manifest_path, json_content)
         .map_err(|e| format!("Не удалось записать манифест: {e}"))?;
-    let _ = fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("Не удалось установить права на манифест: {e}"))?;
+    }
 
     Ok(manifest_path)
 }

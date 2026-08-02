@@ -33,9 +33,22 @@ pub fn migrate_pastily_to_kitsupin() -> LegacyMigrationResult {
     migrate_pastily_to_kitsupin_at(&data_home, config_home.as_deref())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreFaultHook {
+    FailAfterFinalRename,
+}
+
 pub fn migrate_pastily_to_kitsupin_at(
     data_home: &Path,
     config_home: Option<&Path>,
+) -> LegacyMigrationResult {
+    migrate_pastily_to_kitsupin_at_with_hook(data_home, config_home, None)
+}
+
+pub fn migrate_pastily_to_kitsupin_at_with_hook(
+    data_home: &Path,
+    config_home: Option<&Path>,
+    hook: Option<RestoreFaultHook>,
 ) -> LegacyMigrationResult {
     let lock_path = data_home.join(".kitsupin-migration.lock");
     if let Some(parent) = lock_path.parent() {
@@ -52,8 +65,10 @@ pub fn migrate_pastily_to_kitsupin_at(
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600));
+                if let Err(e) = std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600)) {
+                    log::warn!("Failed to set permissions on migration lock file {:?}: {e}", lock_path);
+                    return LegacyMigrationResult::ConflictPreserved;
+                }
             }
             let mut acquired = false;
             for _ in 0..30 {
@@ -77,7 +92,7 @@ pub fn migrate_pastily_to_kitsupin_at(
         }
     };
 
-    let result = migrate_data_dir_at(data_home);
+    let result = migrate_data_dir_at_with_hook(data_home, hook);
 
     if let Some(config_home) = config_home {
         migrate_autostart_at(config_home);
@@ -88,7 +103,15 @@ pub fn migrate_pastily_to_kitsupin_at(
     result
 }
 
+#[allow(dead_code)]
 fn migrate_data_dir_at(data_home: &Path) -> LegacyMigrationResult {
+    migrate_data_dir_at_with_hook(data_home, None)
+}
+
+fn migrate_data_dir_at_with_hook(
+    data_home: &Path,
+    hook: Option<RestoreFaultHook>,
+) -> LegacyMigrationResult {
     let old_dir = data_home.join("pastily");
     let new_dir = data_home.join("kitsupin");
 
@@ -96,7 +119,7 @@ fn migrate_data_dir_at(data_home: &Path) -> LegacyMigrationResult {
     if old_dir.exists() && !new_dir.exists() {
         if let Some(old_db_path) = find_legacy_db(&old_dir) {
             let new_db = new_dir.join("kitsupin.sqlite3");
-            let res = restore_legacy_db(&old_db_path, &new_db);
+            let res = restore_legacy_db_with_hook(&old_db_path, &new_db, hook);
             if res == LegacyMigrationResult::ConflictPreserved {
                 let _ = std::fs::remove_dir_all(&new_dir);
                 return LegacyMigrationResult::ConflictPreserved;
@@ -145,8 +168,8 @@ fn migrate_data_dir_at(data_home: &Path) -> LegacyMigrationResult {
 
     // Scenario B: pastily exists, kitsupin exists, kitsupin.sqlite3 missing
     if !new_db.exists() {
-        remove_db_and_sidecars(&new_db);
-        return restore_legacy_db(&old_db_path, &new_db);
+        let _ = remove_db_and_sidecars(&new_db);
+        return restore_legacy_db_with_hook(&old_db_path, &new_db, hook);
     }
 
     // Both databases exist. Inspect their data states.
@@ -175,7 +198,7 @@ fn migrate_data_dir_at(data_home: &Path) -> LegacyMigrationResult {
                 log::error!("Failed to backup empty kitsupin DB: {e}");
                 return LegacyMigrationResult::ConflictPreserved;
             }
-            let res = restore_legacy_db(&old_db_path, &new_db);
+            let res = restore_legacy_db_with_hook(&old_db_path, &new_db, hook);
             if res == LegacyMigrationResult::ConflictPreserved {
                 if let Err(rb_e) = rename_db_and_sidecars(&backup_empty, &new_db) {
                     log::error!("CRITICAL: Failed to restore backup_empty to new_db: {rb_e}");
@@ -264,17 +287,22 @@ fn rename_db_and_sidecars(src_db: &Path, dst_db: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn remove_db_and_sidecars(db_path: &Path) {
-    let _ = std::fs::remove_file(db_path);
+fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn remove_db_and_sidecars(db_path: &Path) -> std::io::Result<()> {
+    remove_file_if_exists(db_path)?;
     let db_str = db_path.to_string_lossy();
     let wal = PathBuf::from(format!("{db_str}-wal"));
-    if wal.exists() {
-        let _ = std::fs::remove_file(&wal);
-    }
+    remove_file_if_exists(&wal)?;
     let shm = PathBuf::from(format!("{db_str}-shm"));
-    if shm.exists() {
-        let _ = std::fs::remove_file(&shm);
-    }
+    remove_file_if_exists(&shm)?;
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -355,7 +383,7 @@ fn backup_database_file(src_db_path: &Path, dst_backup_path: &Path) -> anyhow::R
     }
     let temp_backup = dst_backup_path.with_extension("tmp_bak");
     if temp_backup.exists() {
-        let _ = std::fs::remove_file(&temp_backup);
+        remove_file_if_exists(&temp_backup)?;
     }
 
     let src_conn = Connection::open_with_flags(
@@ -367,13 +395,13 @@ fn backup_database_file(src_db_path: &Path, dst_backup_path: &Path) -> anyhow::R
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&temp_backup, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(&temp_backup, std::fs::Permissions::from_mode(0o600))?;
     }
     let backup_res =
         rusqlite::backup::Backup::new(&src_conn, &mut dst_conn).and_then(|b| b.step(-1));
 
     if let Err(e) = backup_res {
-        let _ = std::fs::remove_file(&temp_backup);
+        let _ = remove_file_if_exists(&temp_backup);
         anyhow::bail!("Backup API failed for {:?}: {e}", src_db_path);
     }
 
@@ -382,17 +410,17 @@ fn backup_database_file(src_db_path: &Path, dst_backup_path: &Path) -> anyhow::R
     drop(src_conn);
 
     if let Ok(file) = std::fs::File::open(&temp_backup) {
-        let _ = file.sync_all();
+        file.sync_all()?;
     }
 
     std::fs::rename(&temp_backup, dst_backup_path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(dst_backup_path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(dst_backup_path, std::fs::Permissions::from_mode(0o600))?;
     }
 
-    remove_db_and_sidecars(src_db_path);
+    remove_db_and_sidecars(src_db_path)?;
 
     Ok(())
 }
@@ -442,7 +470,16 @@ fn ensure_legacy_imports_table(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrationResult {
+    restore_legacy_db_with_hook(old_db_path, target_db_path, None)
+}
+
+fn restore_legacy_db_with_hook(
+    old_db_path: &Path,
+    target_db_path: &Path,
+    hook: Option<RestoreFaultHook>,
+) -> LegacyMigrationResult {
     let target_dir = match target_db_path.parent() {
         Some(d) => d,
         None => return LegacyMigrationResult::ConflictPreserved,
@@ -454,7 +491,7 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
 
     let importing_path = target_dir.join("kitsupin.sqlite3.importing");
     if importing_path.exists() {
-        let _ = std::fs::remove_file(&importing_path);
+        let _ = remove_file_if_exists(&importing_path);
     }
 
     // Compute fingerprint of legacy DB before closing / restoring
@@ -489,7 +526,11 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&importing_path, std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = std::fs::set_permissions(&importing_path, std::fs::Permissions::from_mode(0o600)) {
+            log::error!("Failed to set permissions 0600 on {:?}: {e}", importing_path);
+            let _ = remove_file_if_exists(&importing_path);
+            return LegacyMigrationResult::ConflictPreserved;
+        }
     }
 
     let backup_res =
@@ -497,7 +538,7 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
 
     if let Err(e) = backup_res {
         log::error!("SQLite backup failed for {:?}: {e}", old_db_path);
-        let _ = std::fs::remove_file(&importing_path);
+        let _ = remove_file_if_exists(&importing_path);
         return LegacyMigrationResult::ConflictPreserved;
     }
 
@@ -507,7 +548,7 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
             "Integrity check failed for imported DB at {:?}: {e}",
             importing_path
         );
-        let _ = std::fs::remove_file(&importing_path);
+        let _ = remove_file_if_exists(&importing_path);
         return LegacyMigrationResult::ConflictPreserved;
     }
 
@@ -516,14 +557,14 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
             "Foreign key check failed for imported DB at {:?}: {e}",
             importing_path
         );
-        let _ = std::fs::remove_file(&importing_path);
+        let _ = remove_file_if_exists(&importing_path);
         return LegacyMigrationResult::ConflictPreserved;
     }
 
     // Write ledger record to restored database — mandatory post-condition
     if let Err(e) = ensure_legacy_imports_table(&dst_conn) {
         log::error!("Failed to ensure legacy_imports table in imported DB: {e}");
-        let _ = std::fs::remove_file(&importing_path);
+        let _ = remove_file_if_exists(&importing_path);
         return LegacyMigrationResult::ConflictPreserved;
     }
 
@@ -534,7 +575,7 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
         params![import_id, fp, now_ms, old_db_path.to_string_lossy()],
     ) {
         log::error!("Failed to record ledger entry in imported DB: {e}");
-        let _ = std::fs::remove_file(&importing_path);
+        let _ = remove_file_if_exists(&importing_path);
         return LegacyMigrationResult::ConflictPreserved;
     }
 
@@ -548,19 +589,29 @@ fn restore_legacy_db(old_db_path: &Path, target_db_path: &Path) -> LegacyMigrati
     // Step 4: Atomic rename importing file to final DB target
     if let Err(e) = std::fs::rename(&importing_path, target_db_path) {
         log::error!("Failed to rename importing DB to final path: {e}");
-        let _ = std::fs::remove_file(&importing_path);
+        let _ = remove_file_if_exists(&importing_path);
         return LegacyMigrationResult::ConflictPreserved;
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(target_db_path, std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = std::fs::set_permissions(target_db_path, std::fs::Permissions::from_mode(0o600)) {
+            log::error!("Failed to set permissions 0600 on target DB {:?}: {e}", target_db_path);
+            let _ = remove_db_and_sidecars(target_db_path);
+            return LegacyMigrationResult::ConflictPreserved;
+        }
+    }
+
+    if hook == Some(RestoreFaultHook::FailAfterFinalRename) {
+        log::error!("Fault injection triggered: simulating failure after final rename");
+        let _ = remove_db_and_sidecars(target_db_path);
+        return LegacyMigrationResult::ConflictPreserved;
     }
 
     // Ensure target database opens & migrates correctly with current schema
     if let Err(e) = crate::persistence::Repository::open(target_db_path) {
         log::error!("Target database failed schema migration after restore: {e:?}");
-        remove_db_and_sidecars(target_db_path);
+        let _ = remove_db_and_sidecars(target_db_path);
         return LegacyMigrationResult::ConflictPreserved;
     }
 
@@ -1959,19 +2010,11 @@ mod tests {
         std::fs::create_dir_all(&old_dir).unwrap();
         std::fs::create_dir_all(&new_dir).unwrap();
 
-        // Create corrupt old db so schema migration or restore opening will fail after rename
         let old_db = old_dir.join("pastily.sqlite3");
         let new_db = new_dir.join("kitsupin.sqlite3");
 
-        // pastily_db has 1 clip, but we will make restore_legacy_db fail at Repository::open stage by writing an invalid sqlite header
         // First create a valid old_db with clips table so inspect_database_data_state sees ContainsData
-        {
-            let conn = Connection::open(&old_db).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE clips (id TEXT PRIMARY KEY, content TEXT, content_type TEXT, created_at INTEGER, last_copied_at INTEGER, copy_count INTEGER);
-                 INSERT INTO clips VALUES ('1', 'hello', 'Text', 100, 100, 1);"
-            ).unwrap();
-        }
+        create_real_pastily_v1_db(&old_db, &[("1", "hello", "", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", 1, 0)]);
 
         // Create empty new_db
         {
@@ -1982,9 +2025,8 @@ mod tests {
         }
 
         // Run scenario C: new_db is Empty, old_db ContainsData.
-        // It backs up empty new_db, calls restore_legacy_db, which copies old_db to importing and renames to new_db.
-        // Then Repository::open runs. Since old_db lacks required migrations table/columns for current Repository schema, Repository::open will fail!
-        let res = migrate_pastily_to_kitsupin_at(data_home, None);
+        // We use fault injection RestoreFaultHook::FailAfterFinalRename to test failure after final rename reliably.
+        let res = migrate_pastily_to_kitsupin_at_with_hook(data_home, None, Some(RestoreFaultHook::FailAfterFinalRename));
 
         // It should return ConflictPreserved, and the empty new_db must be restored back!
         assert_eq!(res, LegacyMigrationResult::ConflictPreserved);
