@@ -609,8 +609,8 @@ impl Repository {
 
         let id = existing_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let changed = tx.execute(
-            "UPDATE clips SET last_copied_at=?2, copy_count=copy_count+1, page_title=COALESCE(?3,page_title), sort_key=sort_key+1 WHERE id=?1",
-            params![id, input.now, title],
+            "UPDATE clips SET content=?4, last_copied_at=?2, copy_count=copy_count+1, page_title=COALESCE(?3,page_title), sort_key=sort_key+1 WHERE id=?1",
+            params![id, input.now, title, input.content],
         )?;
         if changed == 0 {
             tx.execute(
@@ -857,7 +857,7 @@ impl Repository {
         let offset = query.offset.unwrap_or(0);
 
         let search_len = search.chars().count();
-        let is_short_query = !search.is_empty() && search_len < 3;
+        let is_short_query = !search.is_empty() && (search_len < 3 || fts_formatted.is_empty());
         let short_query_flag = if is_short_query { 1i32 } else { 0i32 };
 
         // Build domain/category LIKE pattern.

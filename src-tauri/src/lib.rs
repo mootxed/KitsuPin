@@ -363,7 +363,7 @@ fn get_integration_status(
     let project = settings::project_dirs().map_err(err)?;
     let data_dir = project.data_dir();
     let shortcut_registered = state.registered_shortcut.lock().is_some();
-    let autostart_enabled = state.settings.get().autostart;
+    let autostart_enabled = settings::is_autostart_actual_enabled();
     Ok(diagnostics::get_integration_status(
         data_dir,
         shortcut_registered,
@@ -380,7 +380,7 @@ fn configure_extension_id(
     let project = settings::project_dirs().map_err(err)?;
     let data_dir = project.data_dir();
     let shortcut_registered = state.registered_shortcut.lock().is_some();
-    let autostart_enabled = state.settings.get().autostart;
+    let autostart_enabled = settings::is_autostart_actual_enabled();
     Ok(diagnostics::get_integration_status(
         data_dir,
         shortcut_registered,
@@ -408,23 +408,32 @@ fn open_extension_dir() -> CommandResult<String> {
     }
     let path = target_dir.ok_or_else(|| "Каталог Chrome-расширения не найден.".to_string())?;
     let path_str = path.to_string_lossy().to_string();
-    let _ = std::process::Command::new("xdg-open")
+    std::process::Command::new("xdg-open")
         .arg(&path_str)
-        .spawn();
+        .spawn()
+        .map_err(|e| format!("Не удалось открыть каталог: {e}"))?;
     Ok(path_str)
 }
 
 #[tauri::command]
 fn open_chrome_extensions_page() -> CommandResult<()> {
-    let _ = std::process::Command::new("google-chrome")
-        .arg("chrome://extensions")
-        .spawn()
-        .or_else(|_| {
-            std::process::Command::new("xdg-open")
-                .arg("chrome://extensions")
-                .spawn()
-        });
-    Ok(())
+    let binaries = [
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "xdg-open",
+    ];
+    for bin in &binaries {
+        if std::process::Command::new(bin)
+            .arg("chrome://extensions")
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    Err("Не удалось открыть страницу расширений (браузер не найден).".into())
 }
 
 fn show_main(app: &AppHandle) {
@@ -651,7 +660,8 @@ pub fn run() {
             }
         };
         let data_dir = project.data_dir();
-        let status = diagnostics::get_integration_status(data_dir, true, true);
+        let autostart_actual = settings::is_autostart_actual_enabled();
+        let status = diagnostics::get_integration_status(data_dir, true, autostart_actual);
         println!("=== KitsuPin Integration Diagnostics ===");
         println!("OS Linux: {}", status.is_linux);
         println!(
@@ -854,7 +864,7 @@ pub fn run() {
                 clipboard.clone(),
                 paused.clone(),
             );
-            jobs::start(repo.clone(), settings.clone());
+            jobs::start(app.handle().clone(), repo.clone(), settings.clone());
 
             if settings.get().autostart {
                 let _ = settings::set_autostart(true);

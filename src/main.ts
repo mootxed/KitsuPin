@@ -180,7 +180,12 @@ function showScreen(id: string) {
     b.setAttribute("aria-current", active ? "page" : "false");
   });
   // When switching to settings screen, hydrate its content
-  if (id === "settings") renderSettingsScreen();
+  if (id === "settings") {
+    renderSettingsScreen();
+  } else {
+    draftSettings = null;
+    settingsDirty = false;
+  }
   // When switching to categories screen, render list
   if (id === "categories") renderCategoriesScreen();
 }
@@ -280,7 +285,7 @@ function clipCard(c: ClipSummary, index: number) {
     : `<button class="iconbtn" data-action="pin" aria-label="Закрепить"><i data-lucide="pin"></i></button>`;
 
   return `<article class="clip ${c.pinned ? "pinned" : ""}" data-clip="${c.id}" draggable="true">
-    <button class="clip-main" tabindex="0" aria-label="Скопировать фрагмент">
+    <div class="clip-main" tabindex="0" role="button" aria-label="Скопировать фрагмент">
       <div class="clip-top">
         <strong>${esc(typeLabel)}</strong>
         ${c.domain ? `<span>${esc(c.domain)}</span>` : ""}
@@ -292,7 +297,7 @@ function clipCard(c: ClipSummary, index: number) {
         <span>${c.copyCount > 1 ? `скопировано ${c.copyCount} раз` : "одна копия"}${isTruncated ? ` · ${c.contentLength} симв.` : ""}</span>
         <span>· ${relativeTime(c.lastCopiedAt)}</span>
       </div>
-    </button>
+    </div>
     <div class="clip-actions">
       ${detailsButton}
       ${pinIcon}
@@ -386,15 +391,29 @@ function bindCards(root: HTMLElement) {
   root.querySelectorAll<HTMLElement>("[data-clip]").forEach((card) => {
     const clip = state.clips.find((c) => c.id === card.dataset.clip)!;
 
-    // Main action: copy on click on clip-main button or on popitem
+    // Main action: copy on click on clip-main or on popitem
     const mainBtn = card.classList.contains("popitem") ? card : card.querySelector<HTMLElement>(".clip-main");
-    mainBtn?.addEventListener("click", async () => {
+    const handleCopy = async (e: Event) => {
+      if (e.target instanceof Element && e.target.closest(".tag, .clip-actions, button, input, a")) {
+        return;
+      }
       try {
         let content: string | undefined;
         if (!isTauri) content = await api.getClipContent(clip.id);
         await api.copy(clip.id, popup, content);
       } catch {
         showToast("Не удалось скопировать");
+      }
+    };
+
+    mainBtn?.addEventListener("click", handleCopy);
+    mainBtn?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        if (e.target instanceof Element && e.target.closest(".tag, .clip-actions, button, input, a")) {
+          return;
+        }
+        e.preventDefault();
+        handleCopy(e);
       }
     });
 
@@ -647,8 +666,13 @@ function showAssignCategoryModal(clip: ClipSummary) {
         try {
           if (isAssigned) {
             await api.unassign(clip.id, catId);
+            clip.categories = clip.categories.filter((c) => c.id !== catId);
           } else {
             await api.assign(clip.id, catId);
+            const targetCat = state.categories.find((c) => c.id === catId);
+            if (targetCat && !clip.categories.some((c) => c.id === catId)) {
+              clip.categories.push(targetCat);
+            }
           }
           await reload();
           const updatedClip = state.clips.find((c) => c.id === clip.id);
@@ -770,6 +794,7 @@ function showSettings() {
 }
 
 let draftSettings: Settings | null = null;
+let settingsDirty = false;
 
 function renderSettingsScreen() {
   if (!draftSettings && state.settings) {
@@ -877,17 +902,33 @@ function renderGeneralTab(body: HTMLElement) {
     };
   };
 
-  bindSwitch(swRecording, () => !s.paused, (on) => { if (draftSettings) draftSettings.paused = !on; });
-  bindSwitch(swAutostart, () => s.autostart, (on) => { if (draftSettings) draftSettings.autostart = on; });
+  bindSwitch(swRecording, () => !s.paused, (on) => {
+    if (draftSettings) {
+      draftSettings.paused = !on;
+      settingsDirty = true;
+    }
+  });
+  bindSwitch(swAutostart, () => s.autostart, (on) => {
+    if (draftSettings) {
+      draftSettings.autostart = on;
+      settingsDirty = true;
+    }
+  });
 
   const inputShortcut = body.querySelector<HTMLInputElement>("#input-shortcut");
   inputShortcut?.addEventListener("input", () => {
-    if (draftSettings) draftSettings.shortcut = inputShortcut.value;
+    if (draftSettings) {
+      draftSettings.shortcut = inputShortcut.value;
+      settingsDirty = true;
+    }
   });
 
   const inputRetention = body.querySelector<HTMLInputElement>("#input-retention");
   inputRetention?.addEventListener("input", () => {
-    if (draftSettings) draftSettings.retentionDays = Number(inputRetention.value);
+    if (draftSettings) {
+      draftSettings.retentionDays = Number(inputRetention.value);
+      settingsDirty = true;
+    }
   });
 
   // Save
@@ -897,6 +938,7 @@ function renderGeneralTab(body: HTMLElement) {
       await api.saveSettings(next);
       state.settings = { ...next };
       draftSettings = { ...next };
+      settingsDirty = false;
       updateRecordingStatus(next.paused);
       const pauseBtn = document.querySelector<HTMLButtonElement>("#btn-pause");
       if (pauseBtn) pauseBtn.querySelector("span")!.textContent = next.paused ? "Продолжить" : "Пауза";
@@ -944,7 +986,7 @@ async function reload() {
   const data = await api.bootstrap(popup);
   state.categories = data.categories;
   state.settings = data.settings;
-  if (!draftSettings && data.settings) {
+  if (!settingsDirty && data.settings) {
     draftSettings = { ...data.settings };
   }
   state.clips = await api.list(query());

@@ -248,6 +248,27 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn is_autostart_actual_enabled() -> bool {
+    let path = match autostart_path() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let system_entry = Path::new("/etc/xdg/autostart/kitsupin.desktop");
+
+    if path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if content.lines().any(|l| l.trim() == "Hidden=true") {
+                return false;
+            }
+            if content.lines().any(|l| l.trim().starts_with("Exec=")) {
+                return true;
+            }
+        }
+    }
+
+    system_entry.exists()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

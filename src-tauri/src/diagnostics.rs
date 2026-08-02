@@ -39,9 +39,14 @@ pub const SYSTEM_NATIVE_HOST_PATH: &str = "/usr/lib/kitsupin/kitsupin-native-hos
 pub const SYSTEM_CHROME_EXTENSION_DIR: &str = "/usr/lib/kitsupin/resources/chrome-extension";
 pub const SYSTEM_UNINSTALL_SCRIPT_PATH: &str =
     "/usr/lib/kitsupin/resources/scripts/uninstall-user-data.sh";
-pub const SYSTEM_MANIFEST_PATH: &str =
-    "/etc/opt/chrome/native-messaging-hosts/io.github.mootxed.kitsupin.native.json";
-pub const USER_MANIFEST_DIR: &str = "google-chrome/NativeMessagingHosts";
+pub const SYSTEM_MANIFEST_PATHS: &[&str] = &[
+    "/etc/opt/chrome/native-messaging-hosts/io.github.mootxed.kitsupin.native.json",
+    "/etc/chromium/native-messaging-hosts/io.github.mootxed.kitsupin.native.json",
+];
+pub const USER_MANIFEST_DIRS: &[&str] = &[
+    "google-chrome/NativeMessagingHosts",
+    "chromium/NativeMessagingHosts",
+];
 
 /// Validates that an extension ID consists of exactly 32 characters in the range 'a'..='p'.
 pub fn validate_extension_id(id: &str) -> bool {
@@ -80,9 +85,23 @@ pub fn validate_manifest_content(content: &str) -> Result<String, String> {
         ));
     }
 
+    let manifest_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if manifest_type != "stdio" {
+        return Err(format!(
+            "Тип манифеста '{manifest_type}' должен быть 'stdio'"
+        ));
+    }
+
     let path_str = val.get("path").and_then(|v| v.as_str()).unwrap_or("");
     if path_str.is_empty() {
         return Err("Манифест не содержит пути path".into());
+    }
+    let target_path = Path::new(path_str);
+    if !target_path.exists() {
+        return Err(format!("Указанный в манифесте путь '{path_str}' не существует"));
+    }
+    if !is_file_executable(target_path) {
+        return Err(format!("Указанный в манифесте файл '{path_str}' не является исполняемым"));
     }
 
     let origins = val.get("allowed_origins").and_then(|v| v.as_array());
@@ -143,15 +162,23 @@ pub fn check_chrome_installed() -> bool {
     false
 }
 
-pub fn get_user_manifest_path() -> Option<PathBuf> {
-    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+pub fn get_user_manifest_paths() -> Vec<PathBuf> {
+    let config_dir = match std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(
-        config_dir
-            .join(USER_MANIFEST_DIR)
-            .join(format!("{NATIVE_HOST_NAME}.json")),
-    )
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    {
+        Some(dir) => dir,
+        None => return Vec::new(),
+    };
+
+    USER_MANIFEST_DIRS
+        .iter()
+        .map(|dir| config_dir.join(dir).join(format!("{NATIVE_HOST_NAME}.json")))
+        .collect()
+}
+
+pub fn get_user_manifest_path() -> Option<PathBuf> {
+    get_user_manifest_paths().into_iter().next()
 }
 
 pub fn resolve_native_host_path() -> Option<PathBuf> {
@@ -185,8 +212,10 @@ pub fn get_integration_status(
     let desktop_environment = std::env::var("XDG_CURRENT_DESKTOP").ok();
     let session_type = std::env::var("XDG_SESSION_TYPE").ok();
 
-    let is_supported_x11 =
-        session_type.as_deref() == Some("x11") || std::env::var("DISPLAY").is_ok();
+    let is_supported_x11 = match session_type.as_deref() {
+        Some(st) => st.eq_ignore_ascii_case("x11"),
+        None => std::env::var("DISPLAY").is_ok(),
+    };
 
     let chrome_detected = check_chrome_installed();
     let native_host_path = resolve_native_host_path();
@@ -196,38 +225,40 @@ pub fn get_integration_status(
         .map(|p| is_file_executable(p))
         .unwrap_or(false);
 
-    let system_manifest = Path::new(SYSTEM_MANIFEST_PATH);
-    let user_manifest = get_user_manifest_path();
-
     let mut native_manifest_exists = false;
     let mut native_manifest_valid = false;
     let mut extension_id: Option<String> = None;
 
-    if system_manifest.exists() {
-        native_manifest_exists = true;
-        if let Ok(content) = fs::read_to_string(system_manifest) {
-            if let Ok(ext_id) = validate_manifest_content(&content) {
-                native_manifest_valid = true;
-                extension_id = Some(ext_id);
+    for sys_path_str in SYSTEM_MANIFEST_PATHS {
+        let sys_path = Path::new(sys_path_str);
+        if sys_path.exists() {
+            native_manifest_exists = true;
+            if let Ok(content) = fs::read_to_string(sys_path) {
+                if let Ok(ext_id) = validate_manifest_content(&content) {
+                    native_manifest_valid = true;
+                    extension_id = Some(ext_id);
+                    break;
+                }
             }
         }
     }
 
     if !native_manifest_valid {
-        if let Some(ref u_path) = user_manifest {
+        for u_path in get_user_manifest_paths() {
             if u_path.exists() {
                 native_manifest_exists = true;
-                if let Ok(content) = fs::read_to_string(u_path) {
+                if let Ok(content) = fs::read_to_string(&u_path) {
                     if let Ok(ext_id) = validate_manifest_content(&content) {
                         native_manifest_valid = true;
                         extension_id = Some(ext_id);
+                        break;
                     }
                 }
             }
         }
     }
 
-    let socket_path = data_dir.join("browser_metadata.sock");
+    let socket_path = crate::browser_metadata::socket_path(data_dir);
     let native_socket_available = socket_path.exists();
     let native_messaging_connected = native_socket_available && native_manifest_valid;
 
@@ -369,24 +400,27 @@ pub fn save_user_extension_manifest(extension_id: &str) -> Result<PathBuf, Strin
         ));
     }
 
-    let manifest_path = get_user_manifest_path()
-        .ok_or_else(|| "Не удалось определить домашний каталог пользователя".to_string())?;
-
-    if let Some(parent) = manifest_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("Не удалось создать каталог: {e}"))?;
+    let manifest_paths = get_user_manifest_paths();
+    if manifest_paths.is_empty() {
+        return Err("Не удалось определить домашний каталог пользователя".to_string());
     }
 
     let json_content = generate_native_manifest(&host_path, extension_id)?;
-    fs::write(&manifest_path, json_content)
-        .map_err(|e| format!("Не удалось записать манифест: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("Не удалось установить права на манифест: {e}"))?;
+
+    for manifest_path in &manifest_paths {
+        if let Some(parent) = manifest_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if fs::write(manifest_path, &json_content).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(manifest_path, fs::Permissions::from_mode(0o600));
+            }
+        }
     }
 
-    Ok(manifest_path)
+    Ok(manifest_paths[0].clone())
 }
 
 #[cfg(test)]
@@ -417,21 +451,30 @@ mod tests {
 
     #[test]
     fn test_validate_manifest_content() {
+        let dir = tempdir().unwrap();
+        let bin_path = dir.path().join("kitsupin-native-host");
+        fs::write(&bin_path, "dummy").unwrap();
+        fs::set_permissions(&bin_path, fs::Permissions::from_mode(0o755)).unwrap();
+
         let id = "abcdefghijklmnopabcdefghijklmnop";
         let valid_json = format!(
             r#"{{
             "name": "io.github.mootxed.kitsupin.native",
             "description": "test",
-            "path": "{SYSTEM_NATIVE_HOST_PATH}",
+            "path": "{}",
             "type": "stdio",
             "allowed_origins": ["chrome-extension://{id}/"]
-        }}"#
+        }}"#,
+            bin_path.to_string_lossy()
         );
         let parsed_id = validate_manifest_content(&valid_json).unwrap();
         assert_eq!(parsed_id, id);
 
         let invalid_name = valid_json.replace("io.github.mootxed.kitsupin.native", "wrong.name");
         assert!(validate_manifest_content(&invalid_name).is_err());
+
+        let invalid_type = valid_json.replace("\"type\": \"stdio\"", "\"type\": \"invalid\"");
+        assert!(validate_manifest_content(&invalid_type).is_err());
 
         let invalid_id = valid_json.replace(id, "short-id");
         assert!(validate_manifest_content(&invalid_id).is_err());
