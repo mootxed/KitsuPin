@@ -12,13 +12,15 @@ use std::{
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     pub paused: bool,
     pub autostart: bool,
     pub shortcut: String,
     pub retention_days: u32,
     pub excluded_apps: Vec<String>,
+    pub max_image_size_mb: u32,
+    pub max_storage_size_mb: u32,
 }
 
 impl Settings {
@@ -39,6 +41,14 @@ impl Settings {
         anyhow::ensure!(
             self.excluded_apps.len() <= 100,
             "список исключённых приложений превышает 100 элементов"
+        );
+        anyhow::ensure!(
+            (1..=50).contains(&self.max_image_size_mb),
+            "лимит одного изображения должен быть от 1 до 50 МБ"
+        );
+        anyhow::ensure!(
+            (100..=50_000).contains(&self.max_storage_size_mb),
+            "лимит хранилища должен быть от 100 до 50000 МБ"
         );
         for app in &self.excluded_apps {
             anyhow::ensure!(
@@ -63,6 +73,8 @@ impl Default for Settings {
             shortcut: "Super+V".into(),
             retention_days: 90,
             excluded_apps: vec![],
+            max_image_size_mb: 25,
+            max_storage_size_mb: 1_024,
         }
     }
 }
@@ -284,6 +296,7 @@ mod tests {
             shortcut: "Super+V".into(),
             retention_days: 30,
             excluded_apps: vec![],
+            ..Settings::default()
         };
         std::fs::write(&path, serde_json::to_string(&valid).unwrap()).unwrap();
 

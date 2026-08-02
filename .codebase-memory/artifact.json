@@ -1,11 +1,11 @@
 {
     "schema_version": 2,
-    "commit": "fae20b1e580d92644fa95abfd28b0c3996cbf78d",
-    "indexed_at": "2026-07-31T21:15:46Z",
+    "commit": "51690034aa9bd818b8b4ba1d993f966b681ffd18",
+    "indexed_at": "2026-08-02T14:54:24Z",
     "project": "KitsuPin",
-    "nodes": 377,
-    "edges": 901,
-    "original_size": 1900544,
-    "compressed_size": 298930,
-    "compression_level": 9
+    "nodes": 941,
+    "edges": 3607,
+    "original_size": 3211264,
+    "compressed_size": 331396,
+    "compression_level": 3
 }

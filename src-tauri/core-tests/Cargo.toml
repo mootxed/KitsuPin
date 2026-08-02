@@ -8,11 +8,14 @@ path = "../src/core_test_lib.rs"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6"
 hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 log = "0.4"
 parking_lot = "0.12"
+png = "0.18"
 regex = "1"
 # Must use bundled-full (not just bundled) to include FTS5 and other extensions
 # that match the production binary configuration in src-tauri/Cargo.toml.

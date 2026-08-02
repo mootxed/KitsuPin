@@ -41,7 +41,7 @@ impl BrowserCopyEvent {
             "некорректный hash"
         );
         anyhow::ensure!(
-            self.content_length <= 1_000_000,
+            self.content_length <= 256 * 1024 * 1024,
             "слишком большое содержимое"
         );
         self.domain =

@@ -114,6 +114,63 @@ describe("Chrome Extension - Content Script Execution & Data Formatting", () => 
     expect(msg.contentHash).toBe(expectedHash);
     expect(msg.contentHash).toHaveLength(64);
   });
+
+  it("hashes copied image dimensions and RGBA bytes for source reconciliation", async () => {
+    let copyHandler: ((e: unknown) => Promise<void>) | null = null;
+    const sentMessages: Array<{ contentHash: string; contentLength: number }> = [];
+    const rgba = new Uint8ClampedArray([255, 0, 0, 255, 0, 255, 0, 255]);
+    const fakeDocument = {
+      title: "Image page",
+      activeElement: null,
+      getSelection: () => ({ toString: () => "" }),
+      addEventListener: (_type: string, handler: (e: unknown) => Promise<void>) => { copyHandler = handler; },
+      createElement: () => ({ getContext: () => null }),
+    };
+    class FakeCanvas {
+      constructor(width: number, height: number) { void width; void height; }
+      getContext() {
+        return { drawImage: () => {}, getImageData: () => ({ data: rgba }) };
+      }
+    }
+    const fakeCrypto = {
+      subtle: {
+        digest: async (_alg: string, bytes: Uint8Array) => {
+          const hash = crypto.createHash("sha256").update(bytes).digest();
+          return hash.buffer.slice(hash.byteOffset, hash.byteOffset + hash.byteLength);
+        },
+      },
+    };
+    const fn = new Function(
+      "window", "document", "location", "chrome", "crypto", "TextEncoder", "Uint8Array",
+      "navigator", "createImageBitmap", "OffscreenCanvas", "HTMLInputElement", "HTMLTextAreaElement", contentScriptCode
+    );
+    fn(
+      {
+        navigator: { clipboard: { read: async () => [{ types: ["image/webp"], getType: async () => ({ size: 100 }) }] } },
+        createImageBitmap: async () => ({ width: 2, height: 1, close: () => {} }),
+        OffscreenCanvas: FakeCanvas,
+      },
+      fakeDocument,
+      { hostname: "images.example.com" },
+      { runtime: { sendMessage: (message: { contentHash: string; contentLength: number }) => { sentMessages.push(message); return Promise.resolve(); } } },
+      fakeCrypto,
+      TextEncoder,
+      Uint8Array,
+      { clipboard: { read: async () => [{ types: ["image/webp"], getType: async () => ({ size: 100 }) }] } },
+      async () => ({ width: 2, height: 1, close: () => {} }),
+      FakeCanvas,
+      class {},
+      class {},
+    );
+    await copyHandler!({ clipboardData: { getData: () => "" } });
+    expect(sentMessages).toHaveLength(1);
+    const input = Buffer.alloc(8 + rgba.length);
+    input.writeUInt32LE(2, 0);
+    input.writeUInt32LE(1, 4);
+    Buffer.from(rgba).copy(input, 8);
+    expect(sentMessages[0]!.contentHash).toBe(crypto.createHash("sha256").update(input).digest("hex"));
+    expect(sentMessages[0]!.contentLength).toBe(rgba.length);
+  });
 });
 
 type LifecycleListener = () => void | Promise<void>;

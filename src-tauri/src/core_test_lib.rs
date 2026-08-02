@@ -2,6 +2,8 @@
 pub mod domain;
 #[path = "persistence/mod.rs"]
 pub mod persistence;
+#[path = "blob_store.rs"]
+pub mod blob_store;
 #[path = "browser_metadata/mod.rs"]
 pub mod browser_metadata;
 #[path = "native_host.rs"]

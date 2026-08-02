@@ -1,11 +1,14 @@
 export type ContentType = "Text" | "Links" | "Email" | "Numbers";
+export type PayloadKind = "text" | "image";
 export interface Category { id:string; name:string; color:string; createdAt:number; sortOrder:number }
-export interface ClipSummary { id:string; preview:string; contentLength:number; isTruncated:boolean; contentType:ContentType; domain:string|null; pageTitle:string|null; createdAt:number; lastCopiedAt:number; copyCount:number; pinned:boolean; categories:Category[] }
+export interface ImageMetadata { mimeType:string; width:number; height:number; sizeBytes:number; thumbnailDataUrl:string }
+export interface ClipSummary { id:string; preview:string; contentLength:number; isTruncated:boolean; contentType:ContentType; payloadKind:PayloadKind; image:ImageMetadata|null; domain:string|null; pageTitle:string|null; createdAt:number; lastCopiedAt:number; copyCount:number; pinned:boolean; categories:Category[] }
 export interface ClipDetails { id:string; content:string }
-export interface Settings { paused:boolean; autostart:boolean; shortcut:string; retentionDays:number; excludedApps:string[] }
+export interface Settings { paused:boolean; autostart:boolean; shortcut:string; retentionDays:number; excludedApps:string[]; maxImageSizeMb:number; maxStorageSizeMb:number }
 export interface Bootstrap { clips:ClipSummary[]; categories:Category[]; settings:Settings; invalidSettingsWarning?:boolean }
-export interface ClipQuery { search?:string; contentType?:ContentType; domain?:string; categoryId?:string; limit?:number; offset?:number }
+export interface ClipQuery { search?:string; contentType?:ContentType; payloadKind?:PayloadKind; domain?:string; categoryId?:string; limit?:number; offset?:number }
 export type Grouping = "none"|"domain"|"category"|"type";
+export interface StorageStats { imageCount:number; imageBytes:number; orphanFilesRemoved:number }
 
 export interface IntegrationProblem {
   id: string;
@@ -39,4 +42,3 @@ export interface IntegrationStatus {
   autostartEnabled: boolean;
   problems: IntegrationProblem[];
 }
-

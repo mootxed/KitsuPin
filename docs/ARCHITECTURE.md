@@ -14,6 +14,8 @@ KitsuPin состоит из одного долгоживущего Tauri-пр�
 | `src-tauri/src/browser_metadata` | Unix socket, буфер событий Chrome с `event_id: Uuid`, `ClipUpsertReceipt`, `take_matching_receipt`, cleanup по времени |
 | `src-tauri/src/jobs` | Очистка устаревшей незакреплённой истории |
 | `src-tauri/src/settings` | Настройки (write-fsync-rename), XDG Autostart, consume_invalid_warning |
+| `src-tauri/src/blob_store.rs` | SHA-256 blob-хранилище изображений, безопасное декодирование, PNG thumbnails, очистка orphan-файлов |
+| `src-tauri/src/popup_state.rs` | Rust state machine `Hidden → Opening → VisibleAndFocused`, bounded focus retries и blur lifecycle |
 | `src-tauri/src/migration.rs` | Миграция Pastily v1 → KitsuPin, schema introspection, parse_legacy_timestamp, canonical ID maps, Backup API, 4 сценария (A, B, C, D) |
 | `src-tauri/src/lib.rs` | Команды Tauri, окна, tray, регистрация горячих клавиш с обработкой `registered_shortcut = None`, single-instance lock |
 | `src/` | TypeScript UI; режим выбирается по query `?mode=popup` |
@@ -34,7 +36,9 @@ KitsuPin состоит из одного долгоживущего Tauri-пр�
     ├── kitsupin.lock        # Advisory file lock (fs2), удерживается весь срок жизни
     ├── app.sock             # Unix socket для single-instance IPC
     ├── native.sock          # Unix socket для Native Messaging (0600)
-    └── settings.json        # Настройки (0o600, write-fsync-rename)
+    ├── settings.json        # Настройки (0o600, write-fsync-rename)
+    └── blobs/               # Оригиналы изображений, каталоги 0700 и файлы 0600
+        └── ab/abcdef….png   # Content-addressed SHA-256 path
 ```
 
 ---
@@ -71,7 +75,7 @@ KitsuPin состоит из одного долгоживущего Tauri-пр�
 3. **Сценарий C (kitsupin.sqlite3 существует, но фактически пуст)**:
    Перемещает пустую новую базу и её sidecar-файлы в `kitsupin.sqlite3.empty.bak*`, переносит старую базу через SQLite Backup API с записью в `legacy_imports` и проверкой целостности, сохраняя `.empty.bak`.
 4. **Сценарий D (Обе базы содержат пользовательские данные)**:
-   Открывает и мигрирует новую базу до актуальной схемы v1–9 via `Repository::open`, затем выполняет транзакционный merge legacy Pastily v1 с проверкой `legacy_imports` и подсчетом отчета `LegacyMergeReport`.
+   Открывает и мигрирует новую базу до актуальной схемы v1–10 via `Repository::open`, затем выполняет транзакционный merge legacy Pastily v1 с проверкой `legacy_imports` и подсчетом отчета `LegacyMergeReport`.
 
 ---
 
@@ -93,6 +97,12 @@ KitsuPin состоит из одного долгоживущего Tauri-пр�
                        └─ Pushes receipt в MetadataBuffer
 ```
 
+До текстового пути watcher применяет приоритет `image → single image file URI → text`. Это предотвращает создание нескольких карточек для объекта, у которого Clipboard одновременно предлагает PNG и текстовое представление. Runtime-модель `ClipboardPayload` типизирована (`Text`/`Image`), а `OwnCopyGuard` сравнивает payload fingerprint и для текста, и для бинарных данных.
+
+Изображения из Clipboard декодируются в RGBA с пределом 256 МБ после декодирования. PNG/JPEG/WebP, скопированные одним файлом, проверяются по magic format и расширению; SVG и остальные URI отклоняются. Оригинальные байты файлов сохраняются, а пиксельные Clipboard payload канонизируются в PNG. SQLite хранит только metadata, thumbnail data URL и ссылку на файл.
+
+Для image copy Chrome content script с разрешением `clipboardRead` после пользовательского `copy` локально вычисляет SHA-256 над `width_le + height_le + RGBA`. Native Messaging получает только hash, RGBA length и прежние source metadata; watcher принимает их лишь при точном совпадении hash/length в коротком временном окне. Изображение через расширение не передаётся и не сохраняется в `chrome.storage`.
+
 ### Прикрепление метаданных (reconciliation)
 
 - `reserve_matching_pair` под единым мьютексом атомарно завышает флаг `reserved = true` и у `BufferedEvent`, и у `ClipUpsertReceipt`.
@@ -102,6 +112,12 @@ KitsuPin состоит из одного долгоживущего Tauri-пр�
 - При получении `Ok(None)` (устаревший receipt, не соответствующий текущему состоянию DB) удаляется только несостоятельный receipt (`remove_receipt`), а событие освобождается (`release_event`), оставаясь доступным для свежего receipt или `take_match`.
 - При ошибках БД (`Err`) бронирование снимется с обоих объектов (`release_receipt` и `release_event`).
 - Устаревшие незарезервированные events и receipts старше 10 000 мс автоматически очищаются (`cleanup_stale`).
+
+---
+
+## Popup focus lifecycle
+
+Окно popup имеет GTK/X11 type hint `Utility`. Rust-level `PopupStateMachine` переводит окно из `Hidden` в `Opening`, игнорирует промежуточный `Focused(false)`, подтверждает активацию только системным `Focused(true)`/`is_focused()` и скрывает окно после первого blur из `VisibleAndFocused`. Три ограниченные попытки фокуса логируются; frontend только обновляет данные, фокусирует поиск после `popup-focused` и обрабатывает Escape.
 
 ---
 
@@ -142,14 +158,21 @@ KitsuPin состоит из одного долгоживущего Tauri-пр�
 | `copy_count` | INTEGER | ≥ 1 |
 | `pinned` | INTEGER | 0 или 1 |
 | `sort_key` | INTEGER | Дополнительный критерий сортировки |
+| `payload_kind` | TEXT | `text` или `image` |
+| `blob_hash` | TEXT? FK | Ссылка на `image_blobs.hash` для изображения |
 
 UNIQUE constraint: `(content_hash, domain_key)`.
+
+### Таблица `image_blobs`
+
+Хранит SHA-256, безопасный относительный путь, MIME (`image/png`, `image/jpeg`, `image/webp`), ширину, высоту, размер, PNG thumbnail data URL и время создания. Оригинальные бинарные данные в SQLite не сохраняются.
 
 ### История миграций DB
 
 - **1–7**: Начальная схема, `domain_key`, FTS5, integer timestamps, merge duplicates, UPDATE triggers.
 - **8**: Пересоздание FTS5 с `trigram` токенизатором, индекс `idx_clip_categories_category`.
 - **9**: Добавление реестровой таблицы `legacy_imports` для учёта и дедупликации импортированных legacy-баз.
+- **10**: `payload_kind`, ссылка `clips.blob_hash`, таблица `image_blobs` (hash, relative path, MIME, dimensions, byte size, thumbnail) и индексы image payload.
 
 ---
 

@@ -1,3 +1,4 @@
+mod blob_store;
 pub mod browser_metadata;
 mod clipboard;
 pub mod diagnostics;
@@ -12,7 +13,7 @@ mod settings;
 use browser_metadata::MetadataBuffer;
 use chrono::Utc;
 use clipboard::ClipboardAccess;
-use domain::{Category, ClipQuery, ClipSummary, OwnCopyGuard};
+use domain::{Category, ClipQuery, ClipSummary, OwnCopyGuard, StorageStats};
 use parking_lot::Mutex;
 use persistence::Repository;
 use serde::Serialize;
@@ -111,11 +112,17 @@ fn copy_clip(
     id: String,
     popup: Option<bool>,
 ) -> CommandResult<()> {
-    // Step 1: read content (does not mutate anything).
-    let content = state.repo.get_clip_content(&id).map_err(err)?;
+    // Step 1: read the typed payload (does not mutate anything).
+    let copy = state.repo.get_clip_for_copy(&id).map_err(err)?;
 
     // Steps 2+3: set clipboard (marks pending guard, commits on success, cancels on fail).
-    clipboard::set_clipboard(&content, &state.guard, &state.clipboard).map_err(err)?;
+    clipboard::set_clipboard_payload(
+        &copy.payload,
+        &copy.fingerprint,
+        &state.guard,
+        &state.clipboard,
+    )
+    .map_err(err)?;
 
     // Step 4: update DB stats only after clipboard write succeeded.
     let now = Utc::now().timestamp_millis();
@@ -166,6 +173,71 @@ fn clear_unpinned(app: AppHandle, state: tauri::State<AppState>) -> CommandResul
         let _ = app.emit("clips-changed", ());
     }
     res
+}
+
+#[tauri::command]
+fn get_image_data_url(state: tauri::State<AppState>, id: String) -> CommandResult<String> {
+    state.repo.get_image_data_url(&id).map_err(err)
+}
+
+#[tauri::command]
+fn storage_stats(state: tauri::State<AppState>) -> CommandResult<StorageStats> {
+    state.repo.storage_stats().map_err(err)
+}
+
+#[tauri::command]
+fn clear_unpinned_images(app: AppHandle, state: tauri::State<AppState>) -> CommandResult<usize> {
+    let result = state.repo.clear_unpinned_images().map_err(err);
+    if result.is_ok() {
+        let _ = app.emit("clips-changed", ());
+    }
+    result
+}
+
+#[tauri::command]
+fn save_image_copy(state: tauri::State<AppState>, id: String) -> CommandResult<String> {
+    let source = state.repo.image_file_path(&id).map_err(err)?;
+    let user_dirs =
+        directories::UserDirs::new().ok_or_else(|| "Домашний каталог недоступен".to_string())?;
+    let base = user_dirs
+        .picture_dir()
+        .or_else(|| user_dirs.download_dir())
+        .unwrap_or_else(|| user_dirs.home_dir())
+        .join("KitsuPin");
+    std::fs::create_dir_all(&base).map_err(err)?;
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("image");
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("png");
+    let mut destination = base.join(format!("{stem}.{extension}"));
+    for suffix in 1..=999 {
+        if !destination.exists() {
+            break;
+        }
+        destination = base.join(format!("{stem}-{suffix}.{extension}"));
+    }
+    if destination.exists() {
+        return Err("не удалось подобрать свободное имя файла".into());
+    }
+    std::fs::copy(&source, &destination).map_err(err)?;
+    Ok(destination.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn open_image_folder(state: tauri::State<AppState>, id: String) -> CommandResult<()> {
+    let source = state.repo.image_file_path(&id).map_err(err)?;
+    let folder = source
+        .parent()
+        .ok_or_else(|| "Папка изображения недоступна".to_string())?;
+    std::process::Command::new("xdg-open")
+        .arg(folder)
+        .spawn()
+        .map_err(err)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -958,6 +1030,11 @@ pub fn run() {
             delete_clip,
             set_pinned,
             clear_unpinned,
+            get_image_data_url,
+            storage_stats,
+            clear_unpinned_images,
+            save_image_copy,
+            open_image_folder,
             create_category,
             update_category,
             delete_category,
@@ -971,7 +1048,7 @@ pub fn run() {
             hide_popup
         ])
         .setup(move |app| {
-            WebviewWindowBuilder::new(
+            let popup_window = WebviewWindowBuilder::new(
                 app,
                 "popup",
                 WebviewUrl::App("index.html?mode=popup".into()),
@@ -984,6 +1061,13 @@ pub fn run() {
             .visible(false)
             .resizable(false)
             .build()?;
+
+            #[cfg(target_os = "linux")]
+            if let Ok(gtk_window) = popup_window.gtk_window() {
+                use gtk::prelude::GtkWindowExt;
+                gtk_window.set_type_hint(gdk::WindowTypeHint::Utility);
+                log::info!("popup X11/GTK window type hint configured as Utility");
+            }
 
             if let Err(error) = setup_tray(app) {
                 log::error!("KDE System Tray недоступен: {error}");
@@ -1027,7 +1111,13 @@ pub fn run() {
                 guard.clone(),
                 clipboard.clone(),
                 paused.clone(),
+                settings.clone(),
             );
+            match repo.cleanup_orphan_blobs() {
+                Ok(count) if count > 0 => log::info!("Удалено потерянных blob-файлов: {count}"),
+                Err(error) => log::warn!("Не удалось очистить потерянные blob-файлы: {error}"),
+                _ => {}
+            }
             jobs::start(app.handle().clone(), repo.clone(), settings.clone());
 
             if settings.get().autostart {

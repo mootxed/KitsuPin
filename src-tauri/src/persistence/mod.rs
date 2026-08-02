@@ -1,11 +1,15 @@
-use crate::domain::{
-    classify, content_hash, normalize_content, normalize_domain, Category, ClipQuery, ClipSummary,
-    ContentType, NewClip,
+use crate::{
+    blob_store::BlobStore,
+    domain::{
+        classify, content_hash, normalize_content, normalize_domain, Category, ClipQuery,
+        ClipSummary, ClipboardCopy, ClipboardPayload, ContentType, ImageMetadata, NewClip,
+        NewImageClip, PayloadKind, StorageStats,
+    },
 };
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use rusqlite::{functions::FunctionFlags, params, Connection, Row};
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 use uuid::Uuid;
 
 const MIGRATION_1: &str = include_str!("../../migrations/001_initial.sql");
@@ -18,6 +22,7 @@ type PriorClipState = (String, Option<i64>, Option<i64>, i64, String);
 
 pub struct Repository {
     connection: Mutex<Connection>,
+    blob_store: Option<BlobStore>,
 }
 
 impl Repository {
@@ -53,6 +58,11 @@ impl Repository {
         }
         let repo = Self {
             connection: Mutex::new(connection),
+            blob_store: Some(BlobStore::new(
+                path.parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("blobs"),
+            )?),
         };
         repo.migrate()?;
         Ok(repo)
@@ -65,6 +75,20 @@ impl Repository {
         connection.execute_batch("PRAGMA foreign_keys=ON;")?;
         let repo = Self {
             connection: Mutex::new(connection),
+            blob_store: None,
+        };
+        repo.migrate()?;
+        Ok(repo)
+    }
+
+    #[cfg(test)]
+    pub fn open_in_memory_with_blobs(blob_dir: &Path) -> Result<Self> {
+        let connection = Connection::open_in_memory()?;
+        configure_connection(&connection)?;
+        connection.execute_batch("PRAGMA foreign_keys=ON;")?;
+        let repo = Self {
+            connection: Mutex::new(connection),
+            blob_store: Some(BlobStore::new(blob_dir.to_path_buf())?),
         };
         repo.migrate()?;
         Ok(repo)
@@ -553,6 +577,37 @@ impl Repository {
             )?;
         }
 
+        // ── Migration 10: typed payloads + file-backed image blobs ────────
+        let exists_10: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=10)",
+            [],
+            |r| r.get(0),
+        )?;
+        if !exists_10 {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS image_blobs (
+                    hash TEXT PRIMARY KEY NOT NULL,
+                    relative_path TEXT NOT NULL UNIQUE,
+                    mime_type TEXT NOT NULL CHECK (mime_type IN ('image/png','image/jpeg','image/webp')),
+                    width INTEGER NOT NULL CHECK (width > 0),
+                    height INTEGER NOT NULL CHECK (height > 0),
+                    size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+                    thumbnail_data_url TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                ALTER TABLE clips ADD COLUMN payload_kind TEXT NOT NULL DEFAULT 'text'
+                    CHECK (payload_kind IN ('text','image'));
+                ALTER TABLE clips ADD COLUMN blob_hash TEXT REFERENCES image_blobs(hash) ON DELETE RESTRICT;
+                CREATE INDEX IF NOT EXISTS idx_clips_payload_recency
+                    ON clips(payload_kind, last_copied_at DESC, sort_key DESC);
+                CREATE INDEX IF NOT EXISTS idx_clips_blob_hash ON clips(blob_hash);",
+            )?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(10, datetime('now'))",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -649,6 +704,96 @@ impl Repository {
 
         tx.commit()?;
         Ok((clip, receipt))
+    }
+
+    pub fn upsert_image(&self, input: NewImageClip<'_>) -> Result<ClipSummary> {
+        let store = self
+            .blob_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("blob-хранилище недоступно"))?;
+        let prepared = store.prepare(input.image, input.max_image_bytes)?;
+        let domain = input.domain.and_then(normalize_domain);
+        let domain_key = domain.as_deref().unwrap_or("");
+        let title = input
+            .page_title
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(500).collect::<String>());
+
+        let mut db = self.connection.lock();
+        let tx = db.transaction()?;
+        let blob_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM image_blobs WHERE hash=?1)",
+            [&prepared.hash],
+            |row| row.get(0),
+        )?;
+        if !blob_exists {
+            let current_bytes: i64 = tx.query_row(
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM image_blobs",
+                [],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                (current_bytes as u64).saturating_add(prepared.size_bytes)
+                    <= input.max_storage_bytes,
+                "хранилище изображений достигло лимита {} МБ",
+                input.max_storage_bytes / (1024 * 1024)
+            );
+        }
+
+        let created_file = store.persist(&prepared)?;
+        let db_result = (|| -> Result<ClipSummary> {
+            tx.execute(
+                "INSERT OR IGNORE INTO image_blobs(
+                    hash,relative_path,mime_type,width,height,size_bytes,thumbnail_data_url,created_at
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    prepared.hash,
+                    prepared.relative_path,
+                    prepared.mime_type,
+                    prepared.width,
+                    prepared.height,
+                    prepared.size_bytes,
+                    prepared.thumbnail_data_url,
+                    input.now
+                ],
+            )?;
+
+            let existing_id: Option<String> = match tx.query_row(
+                "SELECT id FROM clips WHERE content_hash=?1 AND domain_key=?2",
+                params![prepared.hash, domain_key],
+                |row| row.get(0),
+            ) {
+                Ok(id) => Some(id),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(error) => return Err(error.into()),
+            };
+            let id = existing_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            let changed = tx.execute(
+                "UPDATE clips SET last_copied_at=?2, copy_count=copy_count+1,
+                    page_title=COALESCE(?3,page_title), sort_key=sort_key+1,
+                    payload_kind='image', blob_hash=?4
+                 WHERE id=?1",
+                params![id, input.now, title, prepared.hash],
+            )?;
+            if changed == 0 {
+                tx.execute(
+                    "INSERT INTO clips(
+                        id,content,content_hash,content_type,domain,domain_key,page_title,
+                        created_at,last_copied_at,copy_count,pinned,sort_key,payload_kind,blob_hash
+                     ) VALUES(?1,'',?2,'Text',?3,?4,?5,?6,?6,1,0,0,'image',?2)",
+                    params![id, prepared.hash, domain, domain_key, title, input.now],
+                )?;
+            }
+            let summary = load_clip_summary(&tx, &id)?;
+            tx.commit()?;
+            Ok(summary)
+        })();
+
+        if db_result.is_err() && created_file {
+            let _ = store.remove(&prepared.relative_path);
+        }
+        db_result
     }
 
     /// Attach browser metadata to a recently saved clip using its upsert receipt.
@@ -876,6 +1021,7 @@ impl Repository {
         let _ = Self::SHORT_SEARCH_FALLBACK_LIMIT;
         let fts_formatted = format_fts_query(&search);
         let kind = query.content_type.map(ContentType::as_str);
+        let payload_kind = query.payload_kind.map(PayloadKind::as_str);
         let limit = query.limit.unwrap_or(100).clamp(1, 200);
         let offset = query.offset.unwrap_or(0);
 
@@ -906,8 +1052,15 @@ impl Repository {
                     c.created_at,
                     c.last_copied_at,
                     c.copy_count,
-                    c.pinned
+                    c.pinned,
+                    c.payload_kind,
+                    b.mime_type,
+                    b.width,
+                    b.height,
+                    b.size_bytes,
+                    b.thumbnail_data_url
              FROM clips c
+             LEFT JOIN image_blobs b ON b.hash = c.blob_hash
              LEFT JOIN clip_user_categories cc ON cc.clip_id = c.id
              LEFT JOIN user_categories uc ON uc.id = cc.category_id
              WHERE (?1 = ''
@@ -918,6 +1071,7 @@ impl Repository {
                AND (?4 IS NULL OR c.content_type = ?4)
                AND (?5 IS NULL OR c.domain = ?5)
                AND (?6 IS NULL OR cc.category_id = ?6)
+               AND (?10 IS NULL OR c.payload_kind = ?10)
              ORDER BY c.last_copied_at DESC, c.sort_key DESC
              LIMIT ?7 OFFSET ?8",
         )?;
@@ -933,10 +1087,32 @@ impl Repository {
                     query.category_id,
                     limit,
                     offset,
-                    short_query_flag
+                    short_query_flag,
+                    payload_kind
                 ],
                 |r| {
-                    let preview: String = r.get(1)?;
+                    let payload_kind_str: String = r.get(10)?;
+                    let payload_kind = if payload_kind_str == "image" {
+                        PayloadKind::Image
+                    } else {
+                        PayloadKind::Text
+                    };
+                    let image = if payload_kind == PayloadKind::Image {
+                        Some(ImageMetadata {
+                            mime_type: r.get(11)?,
+                            width: r.get::<_, i64>(12)? as u32,
+                            height: r.get::<_, i64>(13)? as u32,
+                            size_bytes: r.get::<_, i64>(14)? as u64,
+                            thumbnail_data_url: r.get(15)?,
+                        })
+                    } else {
+                        None
+                    };
+                    let text_preview: String = r.get(1)?;
+                    let preview = image
+                        .as_ref()
+                        .map(|meta| format!("Изображение {} × {}", meta.width, meta.height))
+                        .unwrap_or(text_preview);
                     // SQLite length() counts bytes for BLOB but chars for TEXT.
                     // We store content as TEXT, so length() returns char count on most builds,
                     // but we also have the stored byte length. Use the stored byte length
@@ -946,7 +1122,8 @@ impl Repository {
                     // SQLite substr(x,1,300) extracts up to 300 chars; compare char counts.
                     let preview_chars = preview.chars().count() as i64;
                     // stored_len here is length(c.content) in SQLite which for TEXT = chars.
-                    let is_truncated = stored_len > preview_chars;
+                    let is_truncated =
+                        payload_kind == PayloadKind::Text && stored_len > preview_chars;
                     let kind_str: String = r.get(3)?;
                     let content_type = match kind_str.as_str() {
                         "Links" => ContentType::Links,
@@ -961,6 +1138,8 @@ impl Repository {
                         content_length: stored_len as usize,
                         is_truncated,
                         content_type,
+                        payload_kind,
+                        image,
                         domain: r.get(4)?,
                         page_title: r.get(5)?,
                         created_at: r.get(6)?,
@@ -1019,9 +1198,100 @@ impl Repository {
 
     pub fn get_clip_content(&self, id: &str) -> Result<String> {
         let db = self.connection.lock();
-        let content: String =
-            db.query_row("SELECT content FROM clips WHERE id=?1", [id], |r| r.get(0))?;
+        let (content, payload_kind): (String, String) = db.query_row(
+            "SELECT content,payload_kind FROM clips WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        anyhow::ensure!(
+            payload_kind == "text",
+            "карточка содержит изображение, а не текст"
+        );
         Ok(content)
+    }
+
+    pub fn get_clip_for_copy(&self, id: &str) -> Result<ClipboardCopy> {
+        let (payload_kind, content, relative_path): (String, String, Option<String>) =
+            self.connection.lock().query_row(
+                "SELECT c.payload_kind,c.content,b.relative_path
+             FROM clips c LEFT JOIN image_blobs b ON b.hash=c.blob_hash WHERE c.id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+        if payload_kind == "image" {
+            let store = self
+                .blob_store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("blob-хранилище недоступно"))?;
+            let relative_path = relative_path
+                .ok_or_else(|| anyhow::anyhow!("у изображения отсутствует blob-файл"))?;
+            let payload = ClipboardPayload::Image(store.load(&relative_path)?);
+            Ok(ClipboardCopy {
+                fingerprint: payload.fingerprint(),
+                payload,
+            })
+        } else {
+            let payload = ClipboardPayload::Text(content);
+            Ok(ClipboardCopy {
+                fingerprint: payload.fingerprint(),
+                payload,
+            })
+        }
+    }
+
+    pub fn get_image_data_url(&self, id: &str) -> Result<String> {
+        let (relative_path, mime_type): (String, String) = self.connection.lock().query_row(
+            "SELECT b.relative_path,b.mime_type FROM clips c
+             JOIN image_blobs b ON b.hash=c.blob_hash
+             WHERE c.id=?1 AND c.payload_kind='image'",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        self.blob_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("blob-хранилище недоступно"))?
+            .read_data_url(&relative_path, &mime_type)
+    }
+
+    pub fn image_file_path(&self, id: &str) -> Result<std::path::PathBuf> {
+        let relative_path: String = self.connection.lock().query_row(
+            "SELECT b.relative_path FROM clips c JOIN image_blobs b ON b.hash=c.blob_hash
+             WHERE c.id=?1 AND c.payload_kind='image'",
+            [id],
+            |r| r.get(0),
+        )?;
+        self.blob_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("blob-хранилище недоступно"))?
+            .absolute_path(&relative_path)
+    }
+
+    pub fn storage_stats(&self) -> Result<StorageStats> {
+        let (count, bytes): (i64, i64) = self.connection.lock().query_row(
+            "SELECT COUNT(*),COALESCE(SUM(size_bytes),0) FROM image_blobs",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(StorageStats {
+            image_count: count as u64,
+            image_bytes: bytes as u64,
+            orphan_files_removed: 0,
+        })
+    }
+
+    pub fn cleanup_orphan_blobs(&self) -> Result<usize> {
+        let db = self.connection.lock();
+        let mut statement = db.prepare("SELECT relative_path FROM image_blobs")?;
+        let referenced = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        drop(statement);
+        drop(db);
+        self.blob_store
+            .as_ref()
+            .map(|store| store.cleanup_orphans(&referenced))
+            .transpose()
+            .map(|count| count.unwrap_or(0))
     }
 
     /// Update copy statistics for a clip. Call this AFTER successfully writing to clipboard.
@@ -1055,9 +1325,40 @@ impl Repository {
     }
 
     pub fn delete_clip(&self, id: &str) -> Result<()> {
-        self.connection
-            .lock()
-            .execute("DELETE FROM clips WHERE id=?1", [id])?;
+        let mut db = self.connection.lock();
+        let tx = db.transaction()?;
+        let blob: Option<(String, String)> = match tx.query_row(
+            "SELECT b.hash,b.relative_path FROM clips c JOIN image_blobs b ON b.hash=c.blob_hash WHERE c.id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ) {
+            Ok(value) => Some(value),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(error) => return Err(error.into()),
+        };
+        tx.execute("DELETE FROM clips WHERE id=?1", [id])?;
+        let orphan_path = if let Some((hash, relative_path)) = blob {
+            let refs: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM clips WHERE blob_hash=?1",
+                [&hash],
+                |r| r.get(0),
+            )?;
+            if refs == 0 {
+                tx.execute("DELETE FROM image_blobs WHERE hash=?1", [&hash])?;
+                Some(relative_path)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        tx.commit()?;
+        drop(db);
+        if let (Some(store), Some(path)) = (&self.blob_store, orphan_path) {
+            if let Err(error) = store.remove(&path) {
+                log::warn!("не удалось удалить потерянный blob {path}: {error}");
+            }
+        }
         Ok(())
     }
     pub fn set_pinned(&self, id: &str, pinned: bool) -> Result<()> {
@@ -1068,10 +1369,11 @@ impl Repository {
         Ok(())
     }
     pub fn clear_unpinned(&self) -> Result<usize> {
-        Ok(self
-            .connection
-            .lock()
-            .execute("DELETE FROM clips WHERE pinned=0", [])?)
+        self.delete_matching("pinned=0", [])
+    }
+
+    pub fn clear_unpinned_images(&self) -> Result<usize> {
+        self.delete_matching("pinned=0 AND payload_kind='image'", [])
     }
     pub fn cleanup(&self, days: u32, now_ms: i64) -> Result<usize> {
         anyhow::ensure!(
@@ -1080,10 +1382,25 @@ impl Repository {
         );
         let retention_ms = (days as i64) * 86_400_000;
         let cutoff_ms = now_ms.saturating_sub(retention_ms);
-        Ok(self.connection.lock().execute(
-            "DELETE FROM clips WHERE pinned=0 AND last_copied_at < ?1",
-            params![cutoff_ms],
-        )?)
+        self.delete_matching("pinned=0 AND last_copied_at < ?1", params![cutoff_ms])
+    }
+
+    fn delete_matching<P>(&self, predicate: &str, parameters: P) -> Result<usize>
+    where
+        P: rusqlite::Params,
+    {
+        let ids = {
+            let db = self.connection.lock();
+            let mut statement = db.prepare(&format!("SELECT id FROM clips WHERE {predicate}"))?;
+            let ids = statement
+                .query_map(parameters, |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ids
+        };
+        for id in &ids {
+            self.delete_clip(id)?;
+        }
+        Ok(ids.len())
     }
 
     pub fn list_categories(&self) -> Result<Vec<Category>> {
@@ -1194,13 +1511,36 @@ fn row_category(row: &Row<'_>) -> rusqlite::Result<Category> {
 
 fn load_clip_summary(db: &Connection, id: &str) -> Result<ClipSummary> {
     let mut summary = db.query_row(
-        "SELECT id, substr(content,1,300), length(content), content_type, domain, page_title, created_at, last_copied_at, copy_count, pinned FROM clips WHERE id=?1",
+        "SELECT c.id, substr(c.content,1,300), length(c.content), c.content_type,
+                c.domain, c.page_title, c.created_at, c.last_copied_at, c.copy_count, c.pinned,
+                c.payload_kind, b.mime_type, b.width, b.height, b.size_bytes, b.thumbnail_data_url
+         FROM clips c LEFT JOIN image_blobs b ON b.hash=c.blob_hash WHERE c.id=?1",
         [id],
         |r| {
-            let preview: String = r.get(1)?;
+            let payload_kind = if r.get::<_, String>(10)? == "image" {
+                PayloadKind::Image
+            } else {
+                PayloadKind::Text
+            };
+            let image = if payload_kind == PayloadKind::Image {
+                Some(ImageMetadata {
+                    mime_type: r.get(11)?,
+                    width: r.get::<_, i64>(12)? as u32,
+                    height: r.get::<_, i64>(13)? as u32,
+                    size_bytes: r.get::<_, i64>(14)? as u64,
+                    thumbnail_data_url: r.get(15)?,
+                })
+            } else {
+                None
+            };
+            let text_preview: String = r.get(1)?;
+            let preview = image
+                .as_ref()
+                .map(|meta| format!("Изображение {} × {}", meta.width, meta.height))
+                .unwrap_or(text_preview);
             let stored_len: i64 = r.get(2)?;
             let preview_chars = preview.chars().count() as i64;
-            let is_truncated = stored_len > preview_chars;
+            let is_truncated = payload_kind == PayloadKind::Text && stored_len > preview_chars;
             let kind: String = r.get(3)?;
             Ok(ClipSummary {
                 id: r.get(0)?,
@@ -1213,6 +1553,8 @@ fn load_clip_summary(db: &Connection, id: &str) -> Result<ClipSummary> {
                     "Numbers" => ContentType::Numbers,
                     _ => ContentType::Text,
                 },
+                payload_kind,
+                image,
                 domain: r.get(4)?,
                 page_title: r.get(5)?,
                 created_at: r.get(6)?,
@@ -1233,6 +1575,7 @@ fn load_clip_summary(db: &Connection, id: &str) -> Result<ClipSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{ClipboardPayload, ImagePayload, NewImageClip, PayloadKind};
     use rusqlite::Connection;
 
     fn add<'a>(
@@ -1269,6 +1612,104 @@ mod tests {
             now,
         })
         .unwrap()
+    }
+
+    fn image(red: u8) -> ImagePayload {
+        ImagePayload {
+            width: 2,
+            height: 1,
+            rgba: vec![red, 0, 0, 255, 0, 255, 0, 255],
+            source_mime: None,
+            source_bytes: None,
+        }
+    }
+
+    fn add_image(
+        repo: &Repository,
+        image: &ImagePayload,
+        domain: Option<&str>,
+        now: i64,
+    ) -> ClipSummary {
+        repo.upsert_image(NewImageClip {
+            image,
+            domain,
+            page_title: Some("Image source"),
+            now,
+            max_image_bytes: 1024 * 1024,
+            max_storage_bytes: 10 * 1024 * 1024,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn image_blobs_are_deduplicated_and_copy_back_as_rgba() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::open_in_memory_with_blobs(&temp.path().join("blobs")).unwrap();
+        let payload = image(255);
+        let first = add_image(&repo, &payload, None, 1_000);
+        let second = add_image(&repo, &payload, None, 2_000);
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.copy_count, 2);
+        assert_eq!(second.payload_kind, PayloadKind::Image);
+        assert_eq!(repo.storage_stats().unwrap().image_count, 1);
+        let copy = repo.get_clip_for_copy(&first.id).unwrap();
+        assert_eq!(
+            copy.fingerprint,
+            ClipboardPayload::Image(payload.clone()).fingerprint()
+        );
+        match copy.payload {
+            ClipboardPayload::Image(restored) => assert_eq!(restored.rgba, payload.rgba),
+            ClipboardPayload::Text(_) => panic!("expected image payload"),
+        }
+    }
+
+    #[test]
+    fn deleting_last_image_reference_removes_blob_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::open_in_memory_with_blobs(&temp.path().join("blobs")).unwrap();
+        let payload = image(100);
+        let first = add_image(&repo, &payload, Some("one.example"), 1_000);
+        let second = add_image(&repo, &payload, Some("two.example"), 2_000);
+        let path = repo.image_file_path(&first.id).unwrap();
+        assert!(path.exists());
+        repo.delete_clip(&first.id).unwrap();
+        assert!(path.exists());
+        repo.delete_clip(&second.id).unwrap();
+        assert!(!path.exists());
+        assert_eq!(repo.storage_stats().unwrap().image_count, 0);
+    }
+
+    #[test]
+    fn image_storage_limit_rejects_without_leaving_orphan() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::open_in_memory_with_blobs(&temp.path().join("blobs")).unwrap();
+        let payload = image(75);
+        let result = repo.upsert_image(NewImageClip {
+            image: &payload,
+            domain: None,
+            page_title: None,
+            now: 1_000,
+            max_image_bytes: 1024 * 1024,
+            max_storage_bytes: 1,
+        });
+        assert!(result.is_err());
+        assert_eq!(repo.storage_stats().unwrap().image_count, 0);
+        assert_eq!(repo.cleanup_orphan_blobs().unwrap(), 0);
+    }
+
+    #[test]
+    fn clearing_images_preserves_pinned_image_and_blob() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::open_in_memory_with_blobs(&temp.path().join("blobs")).unwrap();
+        let pinned = add_image(&repo, &image(20), None, 1_000);
+        let unpinned = add_image(&repo, &image(40), None, 2_000);
+        let pinned_path = repo.image_file_path(&pinned.id).unwrap();
+        let unpinned_path = repo.image_file_path(&unpinned.id).unwrap();
+        repo.set_pinned(&pinned.id, true).unwrap();
+        assert_eq!(repo.clear_unpinned_images().unwrap(), 1);
+        assert!(pinned_path.exists());
+        assert!(!unpinned_path.exists());
+        assert_eq!(repo.storage_stats().unwrap().image_count, 1);
     }
 
     #[test]
@@ -1846,6 +2287,7 @@ mod tests {
 
         let repo = Repository {
             connection: Mutex::new(conn),
+            blob_store: None,
         };
         repo.migrate().unwrap();
 
@@ -1960,6 +2402,7 @@ mod tests {
 
         let repo = Repository {
             connection: Mutex::new(conn),
+            blob_store: None,
         };
         repo.migrate().unwrap();
 

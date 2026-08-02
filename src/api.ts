@@ -1,16 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Bootstrap, Category, ClipSummary, ClipQuery, Settings, IntegrationStatus } from "./types";
+import type { Bootstrap, Category, ClipSummary, ClipQuery, Settings, IntegrationStatus, StorageStats } from "./types";
 
 const tauri = "__TAURI_INTERNALS__" in window;
 
 const now = Date.now();
 let demoClips: ClipSummary[] = [
-  { id: "sample-1", preview: "曖昧さを恐れず、まず小さく試してみる。", contentLength: 21, isTruncated: false, contentType: "Text", domain: "youtube.com", pageTitle: "Japanese listening practice — quiet morning", createdAt: now, lastCopiedAt: now - 180_000, copyCount: 3, pinned: true, categories: [] },
-  { id: "sample-2", preview: "https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging", contentLength: 76, isTruncated: false, contentType: "Links", domain: "developer.chrome.com", pageTitle: "Native messaging | Chrome for Developers", createdAt: now, lastCopiedAt: now - 3_600_000, copyCount: 1, pinned: false, categories: [] },
-  { id: "sample-3", preview: "A clipboard is most useful when it stays out of your way.", contentLength: 55, isTruncated: false, contentType: "Text", domain: null, pageTitle: null, createdAt: now, lastCopiedAt: now - 86_400_000, copyCount: 1, pinned: false, categories: [] }
+  { id: "sample-1", preview: "曖昧さを恐れず、まず小さく試してみる。", contentLength: 21, isTruncated: false, contentType: "Text", payloadKind: "text", image: null, domain: "youtube.com", pageTitle: "Japanese listening practice — quiet morning", createdAt: now, lastCopiedAt: now - 180_000, copyCount: 3, pinned: true, categories: [] },
+  { id: "sample-2", preview: "https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging", contentLength: 76, isTruncated: false, contentType: "Links", payloadKind: "text", image: null, domain: "developer.chrome.com", pageTitle: "Native messaging | Chrome for Developers", createdAt: now, lastCopiedAt: now - 3_600_000, copyCount: 1, pinned: false, categories: [] },
+  { id: "sample-3", preview: "A clipboard is most useful when it stays out of your way.", contentLength: 55, isTruncated: false, contentType: "Text", payloadKind: "text", image: null, domain: null, pageTitle: null, createdAt: now, lastCopiedAt: now - 86_400_000, copyCount: 1, pinned: false, categories: [] }
 ];
 
-const mock: Bootstrap = { clips: demoClips, categories: [], settings: { paused: false, autostart: true, shortcut: "Super+V", retentionDays: 90, excludedApps: [] } };
+const mock: Bootstrap = { clips: demoClips, categories: [], settings: { paused: false, autostart: true, shortcut: "Super+V", retentionDays: 90, excludedApps: [], maxImageSizeMb: 25, maxStorageSizeMb: 1024 } };
 
 const mockStatus: IntegrationStatus = {
   isLinux: true,
@@ -53,6 +53,7 @@ export const api = {
     demoClips.filter(c => {
       if (query.search && !JSON.stringify(c).toLowerCase().includes(query.search.toLowerCase())) return false;
       if (query.contentType && c.contentType !== query.contentType) return false;
+      if (query.payloadKind && c.payloadKind !== query.payloadKind) return false;
       if (query.domain && c.domain !== query.domain) return false;
       if (query.categoryId && !c.categories.some(cat => cat.id === query.categoryId)) return false;
       return true;
@@ -98,6 +99,11 @@ export const api = {
     return Promise.resolve();
   })(),
   saveSettings: (settings: Settings) => tauri ? invoke("save_settings", { settings }) : (mock.settings = settings, Promise.resolve()),
+  getImageDataUrl: (id: string) => tauri ? invoke<string>("get_image_data_url", { id }) : Promise.resolve(demoClips.find(c => c.id === id)?.image?.thumbnailDataUrl || ""),
+  storageStats: () => tauri ? invoke<StorageStats>("storage_stats") : Promise.resolve({ imageCount: demoClips.filter(c => c.payloadKind === "image").length, imageBytes: demoClips.reduce((sum, c) => sum + (c.image?.sizeBytes || 0), 0), orphanFilesRemoved: 0 }),
+  clearUnpinnedImages: () => tauri ? invoke<number>("clear_unpinned_images") : Promise.resolve(0),
+  saveImageCopy: (id: string) => tauri ? invoke<string>("save_image_copy", { id }) : Promise.resolve("Pictures/KitsuPin/image.png"),
+  openImageFolder: (id: string) => tauri ? invoke("open_image_folder", { id }) : Promise.resolve(),
   getIntegrationStatus: () => tauri ? invoke<IntegrationStatus>("get_integration_status") : Promise.resolve(mockStatus),
   configureExtensionId: (extensionId: string) => tauri ? invoke<IntegrationStatus>("configure_extension_id", { extensionId }) : Promise.resolve({ ...mockStatus, extensionId, nativeManifestExists: true, nativeManifestValid: true, problems: [] }),
   openExtensionDir: () => tauri ? invoke<string>("open_extension_dir") : Promise.resolve("chrome-extension"),

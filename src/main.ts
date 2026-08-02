@@ -2,7 +2,7 @@ import "./styles.css";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, isTauri } from "./api";
-import type { Category, ClipSummary, ClipQuery, ContentType, Grouping, Settings } from "./types";
+import type { Category, ClipSummary, ClipQuery, ContentType, Grouping, PayloadKind, Settings } from "./types";
 import { hydrateIcons } from "./ui/icons";
 import { mainWindowShell } from "./ui/main-window";
 import { popupShell } from "./ui/popup";
@@ -15,6 +15,7 @@ const state: {
   settings: Settings | null;
   search: string;
   type: ContentType | null;
+  payloadKind: PayloadKind | null;
   category: string | null;
   domain: string | null;
   grouping: Grouping;
@@ -26,6 +27,7 @@ const state: {
   settings: null,
   search: "",
   type: null,
+  payloadKind: null,
   category: null,
   domain: null,
   grouping: "none",
@@ -94,6 +96,7 @@ function query(): ClipQuery {
   return {
     search: state.search || undefined,
     contentType: state.type || undefined,
+    payloadKind: state.payloadKind || undefined,
     categoryId: state.category || undefined,
     domain: state.domain || undefined,
     limit: popup ? 16 : 60,
@@ -114,10 +117,11 @@ function filtersMarkup(): string {
   const types: ContentType[] = ["Text", "Links", "Email", "Numbers"];
   const typeLabels: Record<ContentType, string> = { Text: "Текст", Links: "Ссылки", Email: "Почта", Numbers: "Числа" };
   const domains = [...new Set(state.clips.map((c) => c.domain).filter((v): v is string => !!v))].slice(0, 5);
-  const allActive = !state.type && !state.category && !state.domain;
+  const allActive = !state.type && !state.payloadKind && !state.category && !state.domain;
   return [
     `<button class="chip ${allActive ? "active" : ""}" data-filter="all">Все</button>`,
     ...types.map((t) => `<button class="chip ${state.type === t ? "active" : ""}" data-type="${t}">${typeLabels[t]}</button>`),
+    `<button class="chip ${state.payloadKind === "image" ? "active" : ""}" data-payload="image">Изображения</button>`,
     ...state.categories.map((c) => `<button class="chip user-chip ${state.category === c.id ? "active" : ""}" data-category="${c.id}" style="--tag:${c.color}">${esc(c.name)}</button>`),
     ...domains.map((d) => `<button class="chip ${state.domain === d ? "active" : ""}" data-domain="${esc(d)}">${esc(d)}</button>`),
     `<span class="spacer"></span>`,
@@ -140,14 +144,24 @@ function bindFilters(root: HTMLElement) {
     (el) =>
       (el.onclick = () => {
         state.type = state.type === el.dataset.type ? null : (el.dataset.type as ContentType);
+        state.payloadKind = null;
         state.category = state.domain = null;
         refresh();
       })
   );
+  root.querySelectorAll<HTMLElement>("[data-payload]").forEach((el) => {
+    el.onclick = () => {
+      state.payloadKind = state.payloadKind === el.dataset.payload ? null : (el.dataset.payload as PayloadKind);
+      state.type = null;
+      state.category = state.domain = null;
+      refresh();
+    };
+  });
   root.querySelectorAll<HTMLElement>("[data-category]").forEach((el) => {
     el.onclick = () => {
       state.category = state.category === el.dataset.category ? null : el.dataset.category!;
       state.type = state.domain = null;
+      state.payloadKind = null;
       refresh();
     };
     el.ondragover = (e) => {
@@ -186,6 +200,7 @@ function bindFilters(root: HTMLElement) {
       (el.onclick = () => {
         state.domain = state.domain === el.dataset.domain ? null : el.dataset.domain!;
         state.type = state.category = null;
+        state.payloadKind = null;
         refresh();
       })
   );
@@ -193,6 +208,7 @@ function bindFilters(root: HTMLElement) {
   if (allBtn) {
     allBtn.onclick = () => {
       state.type = state.category = state.domain = null;
+      state.payloadKind = null;
       refresh();
     };
   }
@@ -236,8 +252,6 @@ function bindShell() {
     clearTimeout(timer);
     timer = window.setTimeout(refresh, 120);
   });
-  if (popup && input) setTimeout(() => input.focus(), 20);
-
   // Sidebar navigation
   document.querySelectorAll<HTMLElement>(".sidebar .navbtn[data-screen]").forEach((b) => {
     b.addEventListener("click", () => showScreen(b.dataset.screen!));
@@ -296,9 +310,21 @@ function updateRecordingStatus(paused: boolean) {
 
 const TYPE_LABELS: Record<string, string> = { Text: "Текст", Links: "Ссылка", Email: "Почта", Numbers: "Число" };
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} Б`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} КБ`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`;
+}
+
+function formatImageMime(mime: string): string {
+  if (mime === "image/jpeg") return "JPEG";
+  if (mime === "image/webp") return "WebP";
+  return "PNG";
+}
+
 function clipCard(c: ClipSummary, index: number) {
   const isTruncated = c.isTruncated;
-  const typeLabel = TYPE_LABELS[c.contentType] ?? c.contentType;
+  const typeLabel = c.payloadKind === "image" ? "Изображение" : (TYPE_LABELS[c.contentType] ?? c.contentType);
 
   if (popup) {
     // Compact popup style — popitem
@@ -307,9 +333,11 @@ function clipCard(c: ClipSummary, index: number) {
     if (c.pageTitle) metaParts.push(esc(c.pageTitle));
     const metaLabel = metaParts.join(" · ");
     const isSelected = index === state.selected;
+    const imagePreview = c.image ? `<img class="popthumb" src="${c.image.thumbnailDataUrl}" alt=""/>` : "";
+    const imageMeta = c.image ? ` · ${c.image.width} × ${c.image.height} · ${formatImageMime(c.image.mimeType)} · ${formatBytes(c.image.sizeBytes)}` : "";
     return `<button class="popitem ${isSelected ? "selected" : ""}" tabindex="0" data-clip="${c.id}" id="clip-item-${index}" role="option" aria-selected="${isSelected}" aria-label="Скопировать фрагмент ${index + 1}: ${esc(c.preview)}">
       <span class="popnum">${index + 1 <= 9 ? index + 1 : "·"}</span>
-      <span><p>${esc(c.preview)}${isTruncated ? "…" : ""}</p><small>${metaLabel}</small></span>
+      <span class="popbody">${imagePreview}<span class="popcopy"><p class="${c.contentType === "Links" ? "url" : ""}">${esc(c.preview)}${isTruncated ? "…" : ""}</p><small>${metaLabel}${imageMeta}</small></span></span>
       <span class="kbd">Enter</span>
     </button>`;
   }
@@ -318,8 +346,8 @@ function clipCard(c: ClipSummary, index: number) {
   const categories = c.categories
     .map((x) => `<button class="tag user-tag" style="--tag:${x.color}" data-unassign="${x.id}" title="Убрать категорию">${esc(x.name)} ×</button>`)
     .join("");
-  const detailsButton = isTruncated
-    ? `<button class="iconbtn" data-action="details" aria-label="Полный текст" title="Полный текст"><i data-lucide="eye"></i></button>`
+  const detailsButton = isTruncated || c.payloadKind === "image"
+    ? `<button class="iconbtn" data-action="details" aria-label="Просмотр" title="Просмотр"><i data-lucide="eye"></i></button>`
     : "";
   const pinIcon = c.pinned
     ? `<button class="iconbtn" data-action="pin" aria-label="Открепить"><i data-lucide="pin-off"></i></button>`
@@ -333,6 +361,12 @@ function clipCard(c: ClipSummary, index: number) {
     c.domain ? `<span>${esc(c.domain)}</span>` : "",
     c.pageTitle ? `<span>${esc(c.pageTitle)}</span>` : ""
   ].filter(Boolean).join("<span>·</span>");
+  const imagePreview = c.image
+    ? `<img class="clip-image" src="${c.image.thumbnailDataUrl}" alt="Миниатюра ${c.image.width} × ${c.image.height}"/>`
+    : "";
+  const contentPreview = c.image
+    ? `<div class="clip-image-info"><strong>${c.image.width} × ${c.image.height}</strong><span>${formatImageMime(c.image.mimeType)} · ${formatBytes(c.image.sizeBytes)}</span></div>`
+    : `<div class="clip-text ${c.contentType === "Links" ? "url" : ""}">${esc(c.preview)}${isTruncated ? "…" : ""}</div>`;
 
   return `<article class="clip ${c.pinned ? "pinned" : ""}" data-clip="${c.id}">
     ${dragHandleHtml}
@@ -341,7 +375,8 @@ function clipCard(c: ClipSummary, index: number) {
         <strong>${esc(typeLabel)}</strong>
         ${headerSource ? `<span>·</span>${headerSource}` : ""}
       </div>
-      <div class="clip-text">${esc(c.preview)}${isTruncated ? "…" : ""}</div>
+      ${imagePreview}
+      ${contentPreview}
       <div class="clip-meta">
         ${categories}
         <span>${c.copyCount > 1 ? `скопировано ${c.copyCount} раз` : "одна копия"}${isTruncated ? ` · ${c.contentLength} симв.` : ""}</span>
@@ -361,7 +396,10 @@ function clipCard(c: ClipSummary, index: number) {
 function groups(): [string, ClipSummary[]][] {
   if (state.grouping === "none") return [["", state.clips]];
   if (state.grouping === "type")
-    return (["Text", "Links", "Email", "Numbers"] as ContentType[]).map((t) => [t, state.clips.filter((c) => c.contentType === t)]);
+    return [
+      ["Изображения", state.clips.filter((c) => c.payloadKind === "image")],
+      ...(["Text", "Links", "Email", "Numbers"] as ContentType[]).map((t) => [t, state.clips.filter((c) => c.payloadKind === "text" && c.contentType === t)] as [string, ClipSummary[]]),
+    ];
   if (state.grouping === "domain") {
     const map = new Map<string, ClipSummary[]>();
     const noSource: ClipSummary[] = [];
@@ -390,11 +428,11 @@ function renderCards() {
   const root = document.querySelector<HTMLElement>("#cards");
   if (!root) return;
   if (!state.clips.length) {
-    const hasFilter = !!(state.search || state.type || state.category || state.domain);
+    const hasFilter = !!(state.search || state.type || state.payloadKind || state.category || state.domain);
     root.innerHTML = `<div class="empty">
       <svg class="fox" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M4 5.5 8.2 8 12 6.5 15.8 8 20 5.5l-1.2 8.2C18.3 17.4 15.5 20 12 21c-3.5-1-6.3-3.6-6.8-7.3L4 5.5Z"/></svg>
       <h2>${hasFilter ? "Лиса ничего не нашла" : "История пока пуста"}</h2>
-      <p>${hasFilter ? "Попробуйте другой запрос или сбросьте фильтры." : "Скопируйте текст через Ctrl+C — он появится здесь."}</p>
+      <p>${hasFilter ? "Попробуйте другой запрос или сбросьте фильтры." : "Скопируйте текст или изображение через Ctrl+C — оно появится здесь."}</p>
     </div>`;
     return;
   }
@@ -501,7 +539,8 @@ function bindCards(root: HTMLElement) {
 
     card.querySelector<HTMLElement>("[data-action=details]")?.addEventListener("click", (e) => {
       e.stopPropagation();
-      showClipDetailsModal(clip.id);
+      if (clip.payloadKind === "image") showImageDetailsModal(clip);
+      else showClipDetailsModal(clip.id);
     });
 
     card.querySelector<HTMLElement>("[data-action=pin]")?.addEventListener("click", async (e) => {
@@ -601,6 +640,52 @@ async function showClipDetailsModal(clipId: string) {
       showToast("Не удалось скопировать");
     }
   });
+}
+
+async function showImageDetailsModal(clip: ClipSummary) {
+  if (!clip.image) return;
+  try {
+    const dataUrl = await api.getImageDataUrl(clip.id);
+    const root = modal(
+      "Просмотр изображения",
+      `<div class="image-viewer">
+        <div class="image-canvas"><img src="${dataUrl}" alt="Изображение ${clip.image.width} × ${clip.image.height}"/></div>
+        <div class="image-details">
+          <span>${clip.image.width} × ${clip.image.height}</span>
+          <span>${formatImageMime(clip.image.mimeType)}</span>
+          <span>${formatBytes(clip.image.sizeBytes)}</span>
+          ${clip.domain ? `<span>${esc(clip.domain)}</span>` : ""}
+        </div>
+        <div class="modal-actions image-actions">
+          <button class="btn primary" data-image-action="copy">Скопировать</button>
+          <button class="btn" data-image-action="save">Сохранить копию</button>
+          <button class="btn" data-image-action="folder">Открыть папку blob</button>
+        </div>
+      </div>`
+    );
+    if (!root) return;
+    root.querySelector("[data-image-action=copy]")?.addEventListener("click", async () => {
+      try {
+        await api.copy(clip.id, popup);
+        root.innerHTML = "";
+      } catch {
+        showToast("Не удалось скопировать изображение");
+      }
+    });
+    root.querySelector("[data-image-action=save]")?.addEventListener("click", async () => {
+      try {
+        const path = await api.saveImageCopy(clip.id);
+        showToast(`Сохранено: ${path}`, "info");
+      } catch {
+        showToast("Не удалось сохранить изображение");
+      }
+    });
+    root.querySelector("[data-image-action=folder]")?.addEventListener("click", () => {
+      api.openImageFolder(clip.id).catch(() => showToast("Не удалось открыть папку"));
+    });
+  } catch {
+    showToast("Файл изображения недоступен или повреждён");
+  }
 }
 
 // ── Categories screen ─────────────────────────────────────────────────────────
@@ -957,10 +1042,19 @@ function renderGeneralTab(body: HTMLElement) {
         <div><strong>Автоочистка (дней)</strong><p>Закреплённые фрагменты сохраняются.</p></div>
         <input id="input-retention" type="number" min="1" max="3650" style="width:80px;height:32px;border:1px solid var(--border);border-radius:7px;background:var(--bg);padding:0 8px;font-size:12px" value="${s.retentionDays}"/>
       </div>
+      <div class="setting-row">
+        <div><strong>Максимум одного изображения</strong><p>Повреждённые и слишком большие изображения не сохраняются.</p></div>
+        <label><input id="input-image-limit" type="number" min="1" max="50" style="width:80px;height:32px;border:1px solid var(--border);border-radius:7px;background:var(--bg);padding:0 8px;font-size:12px" value="${s.maxImageSizeMb}"/> МБ</label>
+      </div>
+      <div class="setting-row">
+        <div><strong>Лимит blob-хранилища</strong><p id="storage-usage">Подсчёт текущего размера…</p></div>
+        <label><input id="input-storage-limit" type="number" min="100" max="50000" style="width:96px;height:32px;border:1px solid var(--border);border-radius:7px;background:var(--bg);padding:0 8px;font-size:12px" value="${s.maxStorageSizeMb}"/> МБ</label>
+      </div>
       <div class="notice" style="margin-top:16px">Исключение приложений подготовлено архитектурно, но отключено в MVP: X11 не сообщает надёжно источник Clipboard во всех случаях.</div>
       <div style="display:flex;gap:8px;margin-top:20px">
         <button class="btn primary" id="btn-save-settings">Сохранить</button>
         <button class="btn danger" id="btn-clear-history">Очистить историю</button>
+        <button class="btn" id="btn-clear-images">Очистить незакреплённые изображения</button>
       </div>
 
       <h2 style="margin-top:28px">Chrome Extension</h2>
@@ -1025,6 +1119,20 @@ function renderGeneralTab(body: HTMLElement) {
       settingsDirty = true;
     }
   });
+  const inputImageLimit = body.querySelector<HTMLInputElement>("#input-image-limit");
+  inputImageLimit?.addEventListener("input", () => {
+    if (draftSettings) {
+      draftSettings.maxImageSizeMb = Number(inputImageLimit.value);
+      settingsDirty = true;
+    }
+  });
+  const inputStorageLimit = body.querySelector<HTMLInputElement>("#input-storage-limit");
+  inputStorageLimit?.addEventListener("input", () => {
+    if (draftSettings) {
+      draftSettings.maxStorageSizeMb = Number(inputStorageLimit.value);
+      settingsDirty = true;
+    }
+  });
 
   // Save
   body.querySelector("#btn-save-settings")?.addEventListener("click", async () => {
@@ -1058,6 +1166,28 @@ function renderGeneralTab(body: HTMLElement) {
         showToast("Не удалось очистить историю");
       }
     }
+  });
+  body.querySelector("#btn-clear-images")?.addEventListener("click", async () => {
+    const confirmed = await confirmModal(
+      "Очистить изображения?",
+      "Удалить все незакреплённые карточки изображений и их неиспользуемые blob-файлы?"
+    );
+    if (!confirmed) return;
+    try {
+      const count = await api.clearUnpinnedImages();
+      showToast(`Удалено изображений: ${count}`, "info");
+      renderGeneralTab(body);
+    } catch {
+      showToast("Не удалось очистить изображения");
+    }
+  });
+
+  api.storageStats().then((stats) => {
+    const usage = body.querySelector<HTMLElement>("#storage-usage");
+    if (usage) usage.textContent = `${stats.imageCount} изобр. · ${formatBytes(stats.imageBytes)} занято`;
+  }).catch(() => {
+    const usage = body.querySelector<HTMLElement>("#storage-usage");
+    if (usage) usage.textContent = "Размер хранилища недоступен";
   });
 
   // Check extension
@@ -1175,6 +1305,7 @@ reload();
 
 if (isTauri) {
   listen("clips-changed", refresh);
+  listen<string>("clipboard-warning", (event) => showToast(event.payload));
   listen("categories-changed", reload);
   listen("settings-changed", reload);
   if (!popup) {
