@@ -6,7 +6,7 @@ async function performHandshake() {
       version: 1,
       event: "status",
       timestamp: new Date().toISOString(),
-      extensionVersion: "0.1.1"
+      extensionVersion: "0.1.2"
     });
     if (response?.ok === true) {
       await chrome.storage.local.set({ nativeStatus: "connected", checkedAt: Date.now(), errorDetail: null });
