@@ -101,7 +101,8 @@ export const api = {
   getIntegrationStatus: () => tauri ? invoke<IntegrationStatus>("get_integration_status") : Promise.resolve(mockStatus),
   configureExtensionId: (extensionId: string) => tauri ? invoke<IntegrationStatus>("configure_extension_id", { extensionId }) : Promise.resolve({ ...mockStatus, extensionId, nativeManifestExists: true, nativeManifestValid: true, problems: [] }),
   openExtensionDir: () => tauri ? invoke<string>("open_extension_dir") : Promise.resolve("chrome-extension"),
-  openChromeExtensionsPage: () => tauri ? invoke("open_chrome_extensions_page") : Promise.resolve()
+  openChromeExtensionsPage: () => tauri ? invoke("open_chrome_extensions_page") : Promise.resolve(),
+  hidePopup: () => tauri ? invoke("hide_popup") : Promise.resolve()
 };
 
 export const isTauri = tauri;

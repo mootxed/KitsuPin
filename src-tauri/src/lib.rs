@@ -6,6 +6,7 @@ mod jobs;
 mod migration;
 pub mod native_host;
 mod persistence;
+pub mod popup_state;
 mod settings;
 
 use browser_metadata::MetadataBuffer;
@@ -128,8 +129,8 @@ fn copy_clip(
 
     // Step 6: hide popup only on full success.
     if popup.unwrap_or(false) {
-        if let Some(w) = app.get_webview_window("popup") {
-            let _ = w.hide();
+        if let Some(mgr) = app.try_state::<Arc<PopupManager>>() {
+            mgr.hide(&app);
         }
     }
     Ok(())
@@ -436,6 +437,14 @@ fn open_chrome_extensions_page() -> CommandResult<()> {
     Err("Не удалось открыть страницу расширений (браузер не найден).".into())
 }
 
+#[tauri::command]
+fn hide_popup(app: AppHandle) -> CommandResult<()> {
+    if let Some(mgr) = app.try_state::<Arc<PopupManager>>() {
+        mgr.hide(&app);
+    }
+    Ok(())
+}
+
 fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
@@ -444,18 +453,130 @@ fn show_main(app: &AppHandle) {
     }
 }
 
-fn toggle_popup(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("popup") {
-        if w.is_visible().unwrap_or(false) {
-            let _ = w.hide();
-        } else {
-            let _ = app.emit("clips-changed", ());
-            let _ = app.emit("categories-changed", ());
-            let _ = app.emit("settings-changed", ());
-            let _ = w.center();
-            let _ = w.show();
-            let _ = w.set_focus();
+pub struct PopupManager {
+    sm: Mutex<popup_state::PopupStateMachine>,
+}
+
+impl Default for PopupManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PopupManager {
+    pub fn new() -> Self {
+        Self {
+            sm: Mutex::new(popup_state::PopupStateMachine::new(3)),
         }
+    }
+
+    pub fn toggle(&self, app: &AppHandle) {
+        log::info!("popup toggle requested");
+        let action = self
+            .sm
+            .lock()
+            .handle_event(popup_state::PopupEvent::ToggleRequested);
+        self.execute_action(app, action);
+    }
+
+    pub fn focus_gained(&self, app: &AppHandle) {
+        log::info!("Focused(true)");
+        let action = self
+            .sm
+            .lock()
+            .handle_event(popup_state::PopupEvent::FocusGained);
+        self.execute_action(app, action);
+    }
+
+    pub fn focus_lost(&self, app: &AppHandle) {
+        let action = self
+            .sm
+            .lock()
+            .handle_event(popup_state::PopupEvent::FocusLost);
+        if matches!(action, popup_state::PopupAction::HideWindow) {
+            log::info!("popup hidden after blur");
+        } else {
+            log::info!("blur ignored because popup is still opening");
+        }
+        self.execute_action(app, action);
+    }
+
+    pub fn hide(&self, app: &AppHandle) {
+        let action = self
+            .sm
+            .lock()
+            .handle_event(popup_state::PopupEvent::HideRequested);
+        self.execute_action(app, action);
+    }
+
+    fn handle_check_result(&self, app: &AppHandle, generation: u64, is_focused: bool) {
+        log::info!("popup is_focused result for generation {generation}: {is_focused}");
+        let action = self
+            .sm
+            .lock()
+            .handle_event(popup_state::PopupEvent::FocusCheckResult {
+                generation,
+                is_focused,
+            });
+        self.execute_action(app, action);
+    }
+
+    fn execute_action(&self, app: &AppHandle, action: popup_state::PopupAction) {
+        let Some(w) = app.get_webview_window("popup") else {
+            return;
+        };
+        match action {
+            popup_state::PopupAction::ShowAndRequestFocus { generation } => {
+                log::info!("popup show completed for generation {generation}");
+                let _ = app.emit("clips-changed", ());
+                let _ = app.emit("categories-changed", ());
+                let _ = app.emit("settings-changed", ());
+                let _ = app.emit_to("popup", "popup-opened", ());
+                let _ = w.center();
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+
+                self.schedule_focus_check(app.clone(), generation, 1);
+            }
+            popup_state::PopupAction::RetryFocus {
+                generation,
+                attempt,
+            } => {
+                log::info!("focus request attempt {attempt} for generation {generation}");
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+
+                self.schedule_focus_check(app.clone(), generation, attempt);
+            }
+            popup_state::PopupAction::HideWindow => {
+                let _ = w.hide();
+            }
+            popup_state::PopupAction::NotifyFrontendFocused { generation } => {
+                log::info!("focus confirmed for generation {generation}");
+                let _ = app.emit_to("popup", "popup-focused", ());
+            }
+            popup_state::PopupAction::NoAction => {}
+        }
+    }
+
+    fn schedule_focus_check(&self, app: AppHandle, generation: u64, attempt: u32) {
+        std::thread::spawn(move || {
+            let delay = match attempt {
+                1 => 50,
+                2 => 80,
+                _ => 120,
+            };
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+            let is_focused = app
+                .get_webview_window("popup")
+                .and_then(|w| w.is_focused().ok())
+                .unwrap_or(false);
+
+            if let Some(mgr) = app.try_state::<Arc<PopupManager>>() {
+                mgr.handle_check_result(&app, generation, is_focused);
+            }
+        });
     }
 }
 
@@ -514,7 +635,9 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                 ..
             } = event
             {
-                toggle_popup(tray.app_handle())
+                if let Some(mgr) = tray.app_handle().try_state::<Arc<PopupManager>>() {
+                    mgr.toggle(tray.app_handle());
+                }
             }
         })
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -781,6 +904,8 @@ pub fn run() {
 
     let initial_shortcut = settings.get().shortcut.clone();
 
+    let popup_manager = Arc::new(PopupManager::new());
+
     let state = AppState {
         repo: repo.clone(),
         settings: settings.clone(),
@@ -803,12 +928,27 @@ pub fn run() {
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _, event| {
                     if event.state() == ShortcutState::Pressed {
-                        toggle_popup(app)
+                        if let Some(mgr) = app.try_state::<Arc<PopupManager>>() {
+                            mgr.toggle(app);
+                        }
                     }
                 })
                 .build(),
         )
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::Focused(focused) if window.label() == "popup" => {
+                if let Some(mgr) = window.try_state::<Arc<PopupManager>>() {
+                    if *focused {
+                        mgr.focus_gained(window.app_handle());
+                    } else {
+                        mgr.focus_lost(window.app_handle());
+                    }
+                }
+            }
+            _ => {}
+        })
         .manage(state)
+        .manage(popup_manager)
         .invoke_handler(tauri::generate_handler![
             bootstrap,
             consume_invalid_settings_warning,
@@ -827,7 +967,8 @@ pub fn run() {
             get_integration_status,
             configure_extension_id,
             open_extension_dir,
-            open_chrome_extensions_page
+            open_chrome_extensions_page,
+            hide_popup
         ])
         .setup(move |app| {
             WebviewWindowBuilder::new(

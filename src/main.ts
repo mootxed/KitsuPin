@@ -1141,7 +1141,7 @@ document.addEventListener("keydown", (e) => {
   }
   if (!popup) return;
   if (e.key === "Escape") {
-    if (isTauri) getCurrentWindow().hide();
+    if (isTauri) api.hidePopup();
   } else if (e.key === "ArrowDown") {
     e.preventDefault();
     state.selected = Math.max(0, Math.min(state.selected + 1, state.clips.length - 1));
@@ -1194,12 +1194,13 @@ if (isTauri) {
       }
     });
   } else {
-    getCurrentWindow().onFocusChanged(({ payload }) => {
-      if (!payload) {
-        getCurrentWindow().hide();
-      } else {
-        reload();
-        document.querySelector<HTMLInputElement>("#search")?.focus();
+    listen("popup-opened", () => {
+      reload();
+    });
+    listen("popup-focused", () => {
+      const searchInput = document.querySelector<HTMLInputElement>("#search");
+      if (searchInput) {
+        searchInput.focus();
       }
     });
   }

@@ -10,3 +10,5 @@ pub mod native_host;
 pub mod settings;
 #[path = "migration.rs"]
 pub mod migration;
+#[path = "popup_state.rs"]
+pub mod popup_state;
