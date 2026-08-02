@@ -1,8 +1,8 @@
 use crate::{
     browser_metadata::MetadataBuffer,
     domain::{
-        content_hash, normalize_content, CapturedImageSource, ClipboardPayload, ImagePayload,
-        NewClip, NewImageClip, OwnCopyGuard,
+        content_hash, normalize_content, CapturedImageSource, ClipboardEventOrigin,
+        ClipboardPayload, ImagePayload, NewClip, NewImageClip, OwnCopyGuard,
     },
     persistence::Repository,
     settings::SettingsStore,
@@ -12,8 +12,9 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use std::{
     borrow::Cow,
+    path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError},
         Arc,
     },
@@ -29,16 +30,24 @@ use x11rb::{
     },
 };
 
+pub trait ClipboardReader {
+    fn file_list(&self) -> Result<Vec<PathBuf>, arboard::Error>;
+    fn get_image(&self) -> Result<ImageData<'static>, arboard::Error>;
+    fn get_text(&self) -> Result<String, arboard::Error>;
+    #[allow(dead_code)]
+    fn get_selection_owner(&self) -> Option<u32>;
+}
+
 #[derive(Default)]
 pub struct ClipboardAccess {
     clipboard: Mutex<Option<Clipboard>>,
 }
 
 impl ClipboardAccess {
-    fn inspect_x11_clipboard(&self, context: &str) -> Option<u32> {
+    pub fn inspect_x11_clipboard(&self, context: &str) -> Option<u32> {
         #[cfg(target_os = "linux")]
         {
-            if let Ok((conn, screen_num)) = x11rb::connect(None) {
+            if let Ok((conn, _screen_num)) = x11rb::connect(None) {
                 if let Ok(clipboard_reply) = conn.intern_atom(false, b"CLIPBOARD") {
                     if let Ok(clipboard_atom) = clipboard_reply.reply() {
                         if let Ok(owner_reply) = conn.get_selection_owner(clipboard_atom.atom) {
@@ -52,32 +61,43 @@ impl ClipboardAccess {
                         }
                     }
                 }
-                let _ = screen_num;
             }
         }
         let _ = context;
         None
     }
 
+    fn with_arboard<T>(
+        &self,
+        operation: impl FnOnce(&mut Clipboard) -> Result<T, arboard::Error>,
+    ) -> Result<T, arboard::Error> {
+        let mut clipboard = self.clipboard.lock();
+        if clipboard.is_none() {
+            match Clipboard::new() {
+                Ok(c) => *clipboard = Some(c),
+                Err(e) => return Err(e),
+            }
+        }
+        let result = operation(clipboard.as_mut().expect("clipboard initialized"));
+        if matches!(result, Err(arboard::Error::ClipboardNotSupported)) {
+            *clipboard = None;
+        }
+        result
+    }
+
     fn with<T>(
         &self,
         operation: impl FnOnce(&mut Clipboard) -> Result<T, arboard::Error>,
     ) -> anyhow::Result<T> {
-        let mut clipboard = self.clipboard.lock();
-        if clipboard.is_none() {
-            *clipboard = Some(Clipboard::new()?);
-        }
-        let result = operation(clipboard.as_mut().expect("clipboard initialized"));
-        if result.is_err() {
-            *clipboard = None;
-        }
-        Ok(result?)
+        Ok(self.with_arboard(operation)?)
     }
 
-    fn read_text(&self) -> Option<String> {
+    fn read_payload(&self, max_image_bytes: u64) -> Option<ClipboardPayload> {
+        let _owner_before = self.inspect_x11_clipboard("before read_payload");
         for attempt in 0..3 {
-            if let Ok(text) = self.with(Clipboard::get_text) {
-                return Some(text);
+            if let Some(payload) = read_payload_with_reader(self, max_image_bytes) {
+                let _owner_after = self.inspect_x11_clipboard("after read_payload");
+                return Some(payload);
             }
             if attempt < 2 {
                 std::thread::sleep(Duration::from_millis(25));
@@ -85,55 +105,107 @@ impl ClipboardAccess {
         }
         None
     }
+}
 
-    fn read_payload(&self, max_image_bytes: u64) -> Option<ClipboardPayload> {
-        let _owner_before = self.inspect_x11_clipboard("before read_payload");
+impl ClipboardReader for ClipboardAccess {
+    fn file_list(&self) -> Result<Vec<PathBuf>, arboard::Error> {
+        self.with_arboard(|clipboard| clipboard.get().file_list())
+    }
+
+    fn get_image(&self) -> Result<ImageData<'static>, arboard::Error> {
         for attempt in 0..3 {
-            if let Ok(image) = self.with(Clipboard::get_image) {
-                let payload = ImagePayload {
-                    width: u32::try_from(image.width).ok()?,
-                    height: u32::try_from(image.height).ok()?,
-                    rgba: image.bytes.into_owned(),
-                    source_mime: None,
-                    source_bytes: None,
-                    image_source: CapturedImageSource::ClipboardImage,
-                };
-                if payload.validate().is_ok() {
-                    let _owner_after = self.inspect_x11_clipboard("after Clipboard::get_image");
-                    log::info!(
-                        "Captured ClipboardImage: {}x{}, fingerprint: {}",
-                        payload.width,
-                        payload.height,
-                        ClipboardPayload::Image(payload.clone()).fingerprint()
-                    );
-                    return Some(ClipboardPayload::Image(payload));
-                }
+            if let Ok(image) = self.with_arboard(Clipboard::get_image) {
+                return Ok(image);
             }
             if attempt < 2 {
                 std::thread::sleep(Duration::from_millis(25));
             }
         }
-        if let Some(image) = self.read_file_image(max_image_bytes) {
-            log::info!(
-                "Captured CopiedImageFile: {}x{}, mime: {:?}, fingerprint: {}",
-                image.width,
-                image.height,
-                image.source_mime,
-                ClipboardPayload::Image(image.clone()).fingerprint()
-            );
-            return Some(ClipboardPayload::Image(image));
-        }
-        self.read_text().map(ClipboardPayload::Text)
+        self.with_arboard(Clipboard::get_image)
     }
 
-    fn read_file_image(&self, max_image_bytes: u64) -> Option<ImagePayload> {
-        let paths = self.with(|clipboard| clipboard.get().file_list()).ok()?;
-        if paths.len() != 1 {
-            return None;
+    fn get_text(&self) -> Result<String, arboard::Error> {
+        for attempt in 0..3 {
+            if let Ok(text) = self.with_arboard(Clipboard::get_text) {
+                return Ok(text);
+            }
+            *self.clipboard.lock() = None;
+            if attempt < 2 {
+                std::thread::sleep(Duration::from_millis(25));
+            }
         }
-        let path = paths.first()?;
-        decode_image_file(path, max_image_bytes)
+        self.with_arboard(Clipboard::get_text)
     }
+
+    fn get_selection_owner(&self) -> Option<u32> {
+        self.inspect_x11_clipboard("ClipboardReader::get_selection_owner")
+    }
+}
+
+pub fn read_payload_with_reader<R: ClipboardReader>(
+    reader: &R,
+    max_image_bytes: u64,
+) -> Option<ClipboardPayload> {
+    if let Ok(paths) = reader.file_list() {
+        if paths.len() == 1 {
+            let path = &paths[0];
+            let ext = path
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase());
+            if matches!(ext.as_deref(), Some("png" | "jpg" | "jpeg" | "webp")) {
+                if let Some(image) = decode_image_file(path, max_image_bytes) {
+                    log::info!(
+                        "Captured CopiedImageFile: {}x{}, mime: {:?}, fingerprint: {}",
+                        image.width,
+                        image.height,
+                        image.source_mime,
+                        ClipboardPayload::Image(image.clone()).fingerprint()
+                    );
+                    return Some(ClipboardPayload::Image(image));
+                } else {
+                    // Corrupted or oversized image file!
+                    // Prohibit falling back to get_image to preserve file clipboard semantics.
+                    return reader.get_text().ok().map(ClipboardPayload::Text);
+                }
+            } else {
+                // Non-graphic single file (SVG, PDF, directory, unsupported format).
+                // Prohibit falling back to raw get_image; fallback to text if any.
+                return reader.get_text().ok().map(ClipboardPayload::Text);
+            }
+        } else {
+            // Empty or multiple files in file_list -> fallback to text directly.
+            return reader.get_text().ok().map(ClipboardPayload::Text);
+        }
+    }
+
+    // file_list missing or unavailable -> inspect raw Clipboard image
+    if let Ok(image) = reader.get_image() {
+        if let (Ok(width), Ok(height)) = (
+            u32::try_from(image.width),
+            u32::try_from(image.height),
+        ) {
+            let payload = ImagePayload {
+                width,
+                height,
+                rgba: image.bytes.into_owned(),
+                source_mime: None,
+                source_bytes: None,
+                image_source: CapturedImageSource::ClipboardImage,
+            };
+            if payload.validate().is_ok() {
+                log::info!(
+                    "Captured ClipboardImage: {}x{}, fingerprint: {}",
+                    payload.width,
+                    payload.height,
+                    ClipboardPayload::Image(payload.clone()).fingerprint()
+                );
+                return Some(ClipboardPayload::Image(payload));
+            }
+        }
+    }
+
+    // Fallback to text
+    reader.get_text().ok().map(ClipboardPayload::Text)
 }
 
 fn decode_image_file(path: &std::path::Path, max_image_bytes: u64) -> Option<ImagePayload> {
@@ -190,7 +262,11 @@ pub fn set_clipboard_payload(
     guard: &OwnCopyGuard,
     access: &ClipboardAccess,
 ) -> anyhow::Result<()> {
-    let token = guard.mark_pending(fingerprint);
+    let token = guard.mark_pending_with_details(
+        fingerprint,
+        ClipboardEventOrigin::KitsuPin,
+        None,
+    );
     let result = match payload {
         ClipboardPayload::Text(content) => {
             access.with(|clipboard| clipboard.set_text(content.to_owned()))
@@ -216,6 +292,7 @@ pub fn set_clipboard_payload(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub fn set_clipboard(
     content: &str,
     guard: &OwnCopyGuard,
@@ -226,7 +303,64 @@ pub fn set_clipboard(
     set_clipboard_payload(&payload, &fingerprint, guard, access)
 }
 
-fn x11_notifications() -> anyhow::Result<Receiver<()>> {
+#[derive(Debug, Default)]
+pub struct ClipboardGeneration {
+    current: AtomicU64,
+}
+
+impl ClipboardGeneration {
+    pub fn current(&self) -> u64 {
+        self.current.load(Ordering::SeqCst)
+    }
+
+    pub fn next(&self) -> u64 {
+        self.current.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    #[allow(dead_code)]
+    pub fn set(&self, val: u64) {
+        self.current.store(val, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct X11ClipboardNotification {
+    pub sequence: u64,
+    pub owner: u32,
+    pub timestamp: u32,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum RepublishDecision {
+    Republish,
+    SkipNewerClipboard,
+    SkipFilePayload,
+    SkipOwnEvent,
+}
+
+pub fn evaluate_republish(
+    captured_generation: u64,
+    current_generation: u64,
+    image_source: Option<CapturedImageSource>,
+    is_own_event: bool,
+    owner_changed: bool,
+) -> RepublishDecision {
+    if is_own_event {
+        RepublishDecision::SkipOwnEvent
+    } else if image_source == Some(CapturedImageSource::CopiedImageFile) {
+        RepublishDecision::SkipFilePayload
+    } else if owner_changed || current_generation != captured_generation {
+        RepublishDecision::SkipNewerClipboard
+    } else if image_source == Some(CapturedImageSource::ClipboardImage) {
+        RepublishDecision::Republish
+    } else {
+        RepublishDecision::SkipFilePayload
+    }
+}
+
+fn x11_notifications(
+    generation: Arc<ClipboardGeneration>,
+) -> anyhow::Result<Receiver<X11ClipboardNotification>> {
     let (sender, receiver) = mpsc::channel();
     let (connection, screen_number) = x11rb::connect(None)?;
     connection.xfixes_query_version(5, 0)?.reply()?;
@@ -241,7 +375,13 @@ fn x11_notifications() -> anyhow::Result<Receiver<()>> {
     std::thread::spawn(move || loop {
         match connection.wait_for_event() {
             Ok(Event::XfixesSelectionNotify(event)) if event.selection == clipboard => {
-                if sender.send(()).is_err() {
+                let sequence = generation.next();
+                let notification = X11ClipboardNotification {
+                    sequence,
+                    owner: event.owner,
+                    timestamp: event.timestamp,
+                };
+                if sender.send(notification).is_err() {
                     break;
                 }
             }
@@ -264,8 +404,10 @@ pub fn start(
     paused: Arc<AtomicBool>,
     settings: Arc<SettingsStore>,
 ) {
+    let generation = Arc::new(ClipboardGeneration::default());
+    let generation_clone = Arc::clone(&generation);
     std::thread::spawn(move || {
-        let notifications = match x11_notifications() {
+        let notifications = match x11_notifications(generation_clone) {
             Ok(receiver) => Some(receiver),
             Err(error) => {
                 log::warn!("XFixes unavailable, using Clipboard polling fallback: {error}");
@@ -280,23 +422,44 @@ pub fn start(
             .unwrap_or_default();
 
         loop {
-            let from_event = if let Some(receiver) = &notifications {
+            let (from_event, notif) = if let Some(receiver) = &notifications {
                 match receiver.recv_timeout(Duration::from_millis(500)) {
-                    Ok(()) => true,
+                    Ok(mut first_notif) => {
+                        while let Ok(newer_notif) = receiver.try_recv() {
+                            first_notif = newer_notif;
+                        }
+                        (true, Some(first_notif))
+                    }
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => {
                         std::thread::sleep(Duration::from_millis(350));
-                        false
+                        (false, None)
                     }
                 }
             } else {
                 std::thread::sleep(Duration::from_millis(350));
-                false
+                (false, None)
             };
+
+            let captured_owner_before = access.inspect_x11_clipboard("watcher before read");
+            let captured_gen = generation.current();
+
+            if let (Some(n), Some(curr_owner)) = (notif, captured_owner_before) {
+                if n.owner != curr_owner && n.owner != 0 {
+                    log::info!(
+                        "X11 event sequence {} owner window ID {} differs from current owner window ID {}; reading current selection",
+                        n.sequence,
+                        n.owner,
+                        curr_owner
+                    );
+                }
+            }
+
             let max_image_bytes = settings.get().max_image_size_mb as u64 * 1024 * 1024;
             let Some(payload) = access.read_payload(max_image_bytes) else {
                 continue;
             };
+
             let fingerprint = payload_fingerprint(&payload);
             let is_same = fingerprint == last_fingerprint;
             last_fingerprint.clone_from(&fingerprint);
@@ -307,9 +470,20 @@ pub fn start(
             if !from_event && is_same {
                 continue;
             }
-            if guard.should_suppress(&fingerprint) {
+
+            let captured_owner_after = access.inspect_x11_clipboard("watcher after read");
+            let post_read_gen = generation.current();
+            let owner_changed = captured_owner_before.is_some()
+                && captured_owner_after.is_some()
+                && captured_owner_before != captured_owner_after;
+
+            let is_own_event =
+                guard.should_suppress_with_owner(&fingerprint, captured_owner_before);
+            if is_own_event {
+                log::info!("Suppressed own clipboard copy event (fingerprint: {fingerprint})");
                 continue;
             }
+
             let now = Utc::now();
             let save_result = match &payload {
                 ClipboardPayload::Text(text) => {
@@ -343,8 +517,6 @@ pub fn start(
                         .match_key()
                         .expect("validated image payload has a match key");
                     let mut browser = metadata.take_match(&image_hash, image_length, Utc::now());
-                    // Chrome must read and hash the just-written image after the DOM copy event.
-                    // Give that high-confidence metadata a short bounded window to arrive.
                     for _ in 0..4 {
                         if browser.is_some() {
                             break;
@@ -373,12 +545,26 @@ pub fn start(
                     })
                 }
             };
+
             match save_result {
                 Ok(()) => {
                     let _ = app.emit("clips-changed", ());
 
-                    if let ClipboardPayload::Image(ref image_payload) = payload {
-                        if image_payload.image_source == CapturedImageSource::ClipboardImage {
+                    let image_source = match &payload {
+                        ClipboardPayload::Image(img) => Some(img.image_source),
+                        _ => None,
+                    };
+
+                    let decision = evaluate_republish(
+                        captured_gen,
+                        post_read_gen,
+                        image_source,
+                        is_own_event,
+                        owner_changed,
+                    );
+
+                    match decision {
+                        RepublishDecision::Republish => {
                             log::info!(
                                 "ClipboardImage saved to DB successfully. Re-publishing PNG image to X11 CLIPBOARD to maintain selection ownership for immediate Ctrl+V..."
                             );
@@ -393,15 +579,27 @@ pub fn start(
                                     "Successfully re-published ClipboardImage to X11 CLIPBOARD."
                                 );
                             }
-                        } else {
+                        }
+                        RepublishDecision::SkipNewerClipboard => {
                             log::info!(
-                                "CopiedImageFile detected. Preserving file-list semantics (no set_image re-publication)."
+                                "Skipping re-publication of image: newer clipboard activity detected (captured gen: {}, post-read gen: {}, owner_changed: {}).",
+                                captured_gen,
+                                post_read_gen,
+                                owner_changed
                             );
+                        }
+                        RepublishDecision::SkipFilePayload => {
+                            log::info!(
+                                "CopiedImageFile detected or non-raw image payload. Preserving file-list semantics (no set_image re-publication)."
+                            );
+                        }
+                        RepublishDecision::SkipOwnEvent => {
+                            log::info!("Skipping re-publication for internal own copy event.");
                         }
                     }
                 }
                 Err(error) => {
-                    log::error!("Не удалось сохранить Clipboard: {error}");
+                    log::error!("Failed to save Clipboard: {error}");
                     let _ = app.emit("clipboard-warning", error.to_string());
                 }
             }
@@ -412,6 +610,370 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct MockClipboardReader {
+        file_list: Option<Vec<PathBuf>>,
+        image: Option<ImageData<'static>>,
+        text: Option<String>,
+        #[allow(dead_code)]
+        owner: Option<u32>,
+    }
+
+    impl ClipboardReader for MockClipboardReader {
+        fn file_list(&self) -> Result<Vec<PathBuf>, arboard::Error> {
+            self.file_list
+                .clone()
+                .ok_or(arboard::Error::ContentNotAvailable)
+        }
+
+        fn get_image(&self) -> Result<ImageData<'static>, arboard::Error> {
+            self.image
+                .as_ref()
+                .map(|img| ImageData {
+                    width: img.width,
+                    height: img.height,
+                    bytes: Cow::Owned(img.bytes.to_vec()),
+                })
+                .ok_or(arboard::Error::ContentNotAvailable)
+        }
+
+        fn get_text(&self) -> Result<String, arboard::Error> {
+            self.text
+                .clone()
+                .ok_or(arboard::Error::ContentNotAvailable)
+        }
+
+        fn get_selection_owner(&self) -> Option<u32> {
+            self.owner
+        }
+    }
+
+    // --- Generation & Republish Decision Tests ---
+
+    #[test]
+    fn republish_decision_image_a_unchanged_generation() {
+        assert_eq!(
+            evaluate_republish(
+                10,
+                10,
+                Some(CapturedImageSource::ClipboardImage),
+                false,
+                false
+            ),
+            RepublishDecision::Republish
+        );
+    }
+
+    #[test]
+    fn republish_decision_image_a_then_text_b_skips() {
+        assert_eq!(
+            evaluate_republish(
+                10,
+                11,
+                Some(CapturedImageSource::ClipboardImage),
+                false,
+                false
+            ),
+            RepublishDecision::SkipNewerClipboard
+        );
+    }
+
+    #[test]
+    fn republish_decision_image_a_then_image_c_skips() {
+        assert_eq!(
+            evaluate_republish(
+                10,
+                12,
+                Some(CapturedImageSource::ClipboardImage),
+                false,
+                false
+            ),
+            RepublishDecision::SkipNewerClipboard
+        );
+    }
+
+    #[test]
+    fn republish_decision_own_event_suppressed() {
+        assert_eq!(
+            evaluate_republish(
+                10,
+                10,
+                Some(CapturedImageSource::ClipboardImage),
+                true,
+                false
+            ),
+            RepublishDecision::SkipOwnEvent
+        );
+    }
+
+    #[test]
+    fn republish_decision_copied_image_file_skips() {
+        assert_eq!(
+            evaluate_republish(
+                10,
+                10,
+                Some(CapturedImageSource::CopiedImageFile),
+                false,
+                false
+            ),
+            RepublishDecision::SkipFilePayload
+        );
+    }
+
+    #[test]
+    fn republish_decision_owner_changed_during_read_skips() {
+        assert_eq!(
+            evaluate_republish(
+                10,
+                10,
+                Some(CapturedImageSource::ClipboardImage),
+                false,
+                true
+            ),
+            RepublishDecision::SkipNewerClipboard
+        );
+    }
+
+    #[test]
+    fn republish_decision_owner_read_failure_safe() {
+        assert_eq!(
+            evaluate_republish(
+                10,
+                11,
+                Some(CapturedImageSource::ClipboardImage),
+                false,
+                false
+            ),
+            RepublishDecision::SkipNewerClipboard
+        );
+    }
+
+    #[test]
+    fn republish_decision_generation_wrapping_overflow() {
+        let gen1 = u64::MAX;
+        let gen2 = u64::MAX.wrapping_add(1);
+        assert_eq!(
+            evaluate_republish(
+                gen1,
+                gen2,
+                Some(CapturedImageSource::ClipboardImage),
+                false,
+                false
+            ),
+            RepublishDecision::SkipNewerClipboard
+        );
+    }
+
+    // --- Reader Priority & File Tests ---
+
+    #[test]
+    fn file_list_plus_png_selects_copied_image_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sample.png");
+        let source = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            2,
+            1,
+            image::Rgb([200, 10, 20]),
+        ));
+        source.save_with_format(&path, image::ImageFormat::Png).unwrap();
+
+        let mock = MockClipboardReader {
+            file_list: Some(vec![path]),
+            image: Some(ImageData {
+                width: 2,
+                height: 1,
+                bytes: Cow::Owned(vec![200, 10, 20, 255, 200, 10, 20, 255]),
+            }),
+            text: Some("file:///path/to/sample.png".to_owned()),
+            owner: Some(101),
+        };
+
+        let payload = read_payload_with_reader(&mock, 1024 * 1024).unwrap();
+        match payload {
+            ClipboardPayload::Image(img) => {
+                assert_eq!(img.image_source, CapturedImageSource::CopiedImageFile);
+            }
+            _ => panic!("Expected CopiedImageFile payload"),
+        }
+    }
+
+    #[test]
+    fn only_image_png_selects_clipboard_image() {
+        let mock = MockClipboardReader {
+            file_list: None,
+            image: Some(ImageData {
+                width: 2,
+                height: 1,
+                bytes: Cow::Owned(vec![255, 0, 0, 255, 0, 255, 0, 255]),
+            }),
+            text: None,
+            owner: Some(102),
+        };
+
+        let payload = read_payload_with_reader(&mock, 1024 * 1024).unwrap();
+        match payload {
+            ClipboardPayload::Image(img) => {
+                assert_eq!(img.image_source, CapturedImageSource::ClipboardImage);
+            }
+            _ => panic!("Expected ClipboardImage payload"),
+        }
+    }
+
+    #[test]
+    fn one_jpeg_and_webp_files_selected_as_copied_image_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            2,
+            1,
+            image::Rgb([10, 200, 50]),
+        ));
+
+        for (ext, fmt) in [
+            ("jpg", image::ImageFormat::Jpeg),
+            ("webp", image::ImageFormat::WebP),
+        ] {
+            let path = temp.path().join(format!("test.{ext}"));
+            source.save_with_format(&path, fmt).unwrap();
+
+            let mock = MockClipboardReader {
+                file_list: Some(vec![path]),
+                image: None,
+                text: None,
+                owner: Some(103),
+            };
+
+            let payload = read_payload_with_reader(&mock, 1024 * 1024).unwrap();
+            match payload {
+                ClipboardPayload::Image(img) => {
+                    assert_eq!(img.image_source, CapturedImageSource::CopiedImageFile);
+                }
+                _ => panic!("Expected CopiedImageFile for {ext}"),
+            }
+        }
+    }
+
+    #[test]
+    fn svg_file_not_decoded_as_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sample.svg");
+        std::fs::write(&path, "<svg xmlns='http://www.w3.org/2000/svg'></svg>").unwrap();
+
+        let mock = MockClipboardReader {
+            file_list: Some(vec![path.clone()]),
+            image: Some(ImageData {
+                width: 10,
+                height: 10,
+                bytes: Cow::Owned(vec![0; 400]),
+            }),
+            text: Some(format!("file://{}", path.display())),
+            owner: Some(104),
+        };
+
+        let payload = read_payload_with_reader(&mock, 1024 * 1024).unwrap();
+        match payload {
+            ClipboardPayload::Text(text) => {
+                assert!(text.contains("sample.svg"));
+            }
+            _ => panic!("SVG file should not be decoded as image payload"),
+        }
+    }
+
+    #[test]
+    fn multiple_files_not_converted_to_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let path1 = temp.path().join("1.png");
+        let path2 = temp.path().join("2.png");
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            1,
+            1,
+            image::Rgb([0, 0, 0]),
+        ));
+        img.save_with_format(&path1, image::ImageFormat::Png).unwrap();
+        img.save_with_format(&path2, image::ImageFormat::Png).unwrap();
+
+        let mock = MockClipboardReader {
+            file_list: Some(vec![path1, path2]),
+            image: Some(ImageData {
+                width: 1,
+                height: 1,
+                bytes: Cow::Owned(vec![0, 0, 0, 255]),
+            }),
+            text: Some("file:///1.png\nfile:///2.png".to_owned()),
+            owner: Some(105),
+        };
+
+        let payload = read_payload_with_reader(&mock, 1024 * 1024).unwrap();
+        match payload {
+            ClipboardPayload::Text(text) => {
+                assert!(text.contains("1.png"));
+            }
+            _ => panic!("Multiple files should not be converted to single image"),
+        }
+    }
+
+    #[test]
+    fn directory_not_decoded_as_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir_path = temp.path().join("dir.png");
+        std::fs::create_dir(&dir_path).unwrap();
+
+        let mock = MockClipboardReader {
+            file_list: Some(vec![dir_path.clone()]),
+            image: None,
+            text: Some(format!("file://{}", dir_path.display())),
+            owner: Some(106),
+        };
+
+        let payload = read_payload_with_reader(&mock, 1024 * 1024).unwrap();
+        match payload {
+            ClipboardPayload::Text(_) => {}
+            _ => panic!("Directory with .png extension must not be decoded as image"),
+        }
+    }
+
+    #[test]
+    fn corrupted_image_file_does_not_replace_active_clipboard() {
+        let temp = tempfile::tempdir().unwrap();
+        let corrupt_path = temp.path().join("corrupt.png");
+        std::fs::write(&corrupt_path, b"not a png image data").unwrap();
+
+        let mock = MockClipboardReader {
+            file_list: Some(vec![corrupt_path]),
+            image: Some(ImageData {
+                width: 5,
+                height: 5,
+                bytes: Cow::Owned(vec![0; 100]),
+            }),
+            text: None,
+            owner: Some(107),
+        };
+
+        let payload = read_payload_with_reader(&mock, 1024 * 1024);
+        assert!(payload.is_none());
+    }
+
+    #[test]
+    fn file_above_size_limit_not_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("big.png");
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            10,
+            10,
+            image::Rgb([0, 0, 0]),
+        ));
+        img.save_with_format(&path, image::ImageFormat::Png).unwrap();
+
+        let mock = MockClipboardReader {
+            file_list: Some(vec![path]),
+            image: None,
+            text: None,
+            owner: Some(108),
+        };
+
+        let payload = read_payload_with_reader(&mock, 10);
+        assert!(payload.is_none());
+    }
 
     #[test]
     fn decodes_png_jpeg_and_webp_files_but_not_svg() {
@@ -449,10 +1011,16 @@ mod tests {
         let access = ClipboardAccess::default();
         let guard = OwnCopyGuard::default();
         let value = format!("KitsuPin persistent X11 owner {}", std::process::id());
-        set_clipboard(&value, &guard, &access).unwrap();
+        let payload = ClipboardPayload::Text(value.clone());
+        let fingerprint = payload.fingerprint();
+        set_clipboard_payload(&payload, &fingerprint, &guard, &access).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        let mut independent_reader = Clipboard::new().unwrap();
-        assert_eq!(independent_reader.get_text().unwrap(), value);
+        let independent_reader = ClipboardAccess::default();
+        let payload_read = independent_reader.read_payload(1024 * 1024);
+        match payload_read {
+            Some(ClipboardPayload::Text(text)) => assert_eq!(text, value),
+            _ => panic!("Expected text payload from independent reader"),
+        }
     }
 
     #[test]
@@ -472,7 +1040,15 @@ mod tests {
         set_clipboard_payload(&payload, &fingerprint, &guard, &access).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         let mut independent_reader = Clipboard::new().unwrap();
-        let image = independent_reader.get_image().unwrap();
+        let mut image_res = independent_reader.get_image();
+        for _ in 0..5 {
+            if image_res.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            image_res = independent_reader.get_image();
+        }
+        let image = image_res.unwrap();
         assert_eq!((image.width, image.height), (2, 1));
         assert_eq!(image.bytes.as_ref(), &[255, 0, 0, 255, 0, 255, 0, 255]);
     }

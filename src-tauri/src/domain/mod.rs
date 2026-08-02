@@ -4,7 +4,7 @@ mod self_copy;
 
 pub use classification::{classify, ContentType};
 pub use normalize::{content_hash, normalize_content, normalize_domain};
-pub use self_copy::OwnCopyGuard;
+pub use self_copy::{ClipboardEventOrigin, OwnCopyGuard};
 
 use serde::{Deserialize, Serialize};
 
