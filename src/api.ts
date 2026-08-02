@@ -23,8 +23,12 @@ const mockStatus: IntegrationStatus = {
   nativeHostExecutable: true,
   nativeManifestExists: false,
   nativeManifestValid: false,
+  chromeManifestValid: false,
+  chromiumManifestValid: false,
   nativeSocketAvailable: true,
+  nativeMessagingConfigured: false,
   nativeMessagingConnected: false,
+  lastNativeMessageAt: null,
   shortcutRegistered: true,
   autostartEnabled: true,
   problems: [

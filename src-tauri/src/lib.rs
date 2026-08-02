@@ -366,7 +366,7 @@ fn get_integration_status(
     let autostart_enabled = settings::is_autostart_actual_enabled();
     Ok(diagnostics::get_integration_status(
         data_dir,
-        shortcut_registered,
+        Some(shortcut_registered),
         autostart_enabled,
     ))
 }
@@ -383,7 +383,7 @@ fn configure_extension_id(
     let autostart_enabled = settings::is_autostart_actual_enabled();
     Ok(diagnostics::get_integration_status(
         data_dir,
-        shortcut_registered,
+        Some(shortcut_registered),
         autostart_enabled,
     ))
 }
@@ -661,7 +661,7 @@ pub fn run() {
         };
         let data_dir = project.data_dir();
         let autostart_actual = settings::is_autostart_actual_enabled();
-        let status = diagnostics::get_integration_status(data_dir, true, autostart_actual);
+        let status = diagnostics::get_integration_status(data_dir, None, autostart_actual);
         println!("=== KitsuPin Integration Diagnostics ===");
         println!("OS Linux: {}", status.is_linux);
         println!(
@@ -684,6 +684,8 @@ pub fn run() {
         println!("Native Host Executable: {}", status.native_host_executable);
         println!("Native Manifest Exists: {}", status.native_manifest_exists);
         println!("Native Manifest Valid: {}", status.native_manifest_valid);
+        println!("Chrome Manifest Valid: {}", status.chrome_manifest_valid);
+        println!("Chromium Manifest Valid: {}", status.chromium_manifest_valid);
         println!(
             "Extension ID: {}",
             status.extension_id.as_deref().unwrap_or("не задан")
@@ -691,6 +693,22 @@ pub fn run() {
         println!(
             "Native Socket Available: {}",
             status.native_socket_available
+        );
+        println!(
+            "Native Messaging Configured: {}",
+            status.native_messaging_configured
+        );
+        println!(
+            "Native Messaging Connected: {}",
+            status.native_messaging_connected
+        );
+        println!(
+            "Hotkey Registered: {}",
+            match status.shortcut_registered {
+                Some(true) => "да",
+                Some(false) => "нет (занята)",
+                None => "неизвестно (отдельный CLI-процесс)",
+            }
         );
         println!("Problems Count: {}", status.problems.len());
         for p in &status.problems {

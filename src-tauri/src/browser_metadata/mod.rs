@@ -60,6 +60,23 @@ impl BrowserCopyEvent {
     }
 }
 
+use std::sync::atomic::{AtomicI64, Ordering};
+
+static LAST_NATIVE_MESSAGE_AT: AtomicI64 = AtomicI64::new(0);
+
+pub fn record_native_message_received() {
+    LAST_NATIVE_MESSAGE_AT.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
+}
+
+pub fn get_last_message_at() -> Option<i64> {
+    let ts = LAST_NATIVE_MESSAGE_AT.load(Ordering::Relaxed);
+    if ts > 0 {
+        Some(ts)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ClipUpsertReceipt {
     pub receipt_id: Uuid,
@@ -69,6 +86,7 @@ pub struct ClipUpsertReceipt {
     pub previous_last_copied_at: Option<i64>,
     pub previous_sort_key: Option<i64>,
     pub previous_copy_count: i64,
+    pub previous_content: Option<String>,
     pub resulting_last_copied_at: i64,
     pub resulting_sort_key: i64,
     pub resulting_copy_count: i64,
@@ -92,6 +110,7 @@ impl MetadataBuffer {
     pub fn push(&self, event: BrowserCopyEvent) -> Result<()> {
         let event = event.validate()?;
         let at = DateTime::parse_from_rfc3339(&event.timestamp)?.with_timezone(&Utc);
+        record_native_message_received();
         let mut events = self.events.lock();
         events.push_back(BufferedEvent {
             at,
@@ -397,6 +416,7 @@ mod tests {
             previous_last_copied_at: Some(now_ms - 5000),
             previous_sort_key: Some(10),
             previous_copy_count: 1,
+            previous_content: None,
             resulting_last_copied_at: now_ms - 1500,
             resulting_sort_key: 11,
             resulting_copy_count: 2,
@@ -411,6 +431,7 @@ mod tests {
             previous_last_copied_at: Some(now_ms - 3000),
             previous_sort_key: Some(20),
             previous_copy_count: 1,
+            previous_content: None,
             resulting_last_copied_at: now_ms - 300,
             resulting_sort_key: 21,
             resulting_copy_count: 2,
@@ -486,6 +507,7 @@ mod tests {
             previous_last_copied_at: None,
             previous_sort_key: None,
             previous_copy_count: 0,
+            previous_content: None,
             resulting_last_copied_at: now_ms,
             resulting_sort_key: 1,
             resulting_copy_count: 1,
@@ -543,6 +565,7 @@ mod tests {
             previous_last_copied_at: None,
             previous_sort_key: None,
             previous_copy_count: 0,
+            previous_content: None,
             resulting_last_copied_at: now_ms - 100,
             resulting_sort_key: 1,
             resulting_copy_count: 1,
@@ -568,6 +591,7 @@ mod tests {
             previous_last_copied_at: None,
             previous_sort_key: None,
             previous_copy_count: 0,
+            previous_content: None,
             resulting_last_copied_at: now_ms,
             resulting_sort_key: 2,
             resulting_copy_count: 1,

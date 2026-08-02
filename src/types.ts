@@ -26,9 +26,13 @@ export interface IntegrationStatus {
   nativeHostExecutable: boolean;
   nativeManifestExists: boolean;
   nativeManifestValid: boolean;
+  chromeManifestValid: boolean;
+  chromiumManifestValid: boolean;
   nativeSocketAvailable: boolean;
+  nativeMessagingConfigured: boolean;
   nativeMessagingConnected: boolean;
-  shortcutRegistered: boolean;
+  lastNativeMessageAt: number | null;
+  shortcutRegistered: boolean | null;
   autostartEnabled: boolean;
   problems: IntegrationProblem[];
 }

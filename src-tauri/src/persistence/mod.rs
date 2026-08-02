@@ -578,12 +578,12 @@ impl Repository {
         let mut db = self.connection.lock();
         let tx = db.transaction()?;
 
-        let prior_state: Option<(String, Option<i64>, Option<i64>, i64)> = if domain_key.is_empty()
+        let prior_state: Option<(String, Option<i64>, Option<i64>, i64, String)> = if domain_key.is_empty()
         {
             match tx.query_row(
-                "SELECT id, last_copied_at, sort_key, copy_count FROM clips WHERE content_hash=?1 AND domain_key=''",
+                "SELECT id, last_copied_at, sort_key, copy_count, content FROM clips WHERE content_hash=?1 AND domain_key=''",
                 params![hash],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             ) {
                 Ok(row) => Some(row),
                 Err(rusqlite::Error::QueryReturnedNoRows) => None,
@@ -594,7 +594,7 @@ impl Repository {
         };
 
         let existing_id: Option<String> = if domain_key.is_empty() {
-            prior_state.as_ref().map(|(id, _, _, _)| id.clone())
+            prior_state.as_ref().map(|(id, _, _, _, _)| id.clone())
         } else {
             match tx.query_row(
                 "SELECT id FROM clips WHERE content_hash=?1 AND domain_key=?2",
@@ -620,9 +620,9 @@ impl Repository {
         }
         let clip = load_clip_summary(&tx, &id)?;
 
-        let (clip_id, prev_last, prev_sort, prev_count) = match prior_state {
-            Some((cid, last, sort, count)) => (cid, last, sort, count),
-            None => (id.clone(), None, None, 0),
+        let (clip_id, prev_last, prev_sort, prev_count, prev_content) = match prior_state {
+            Some((cid, last, sort, count, content)) => (cid, last, sort, count, Some(content)),
+            None => (id.clone(), None, None, 0, None),
         };
 
         let resulting_sort = prev_sort.unwrap_or(0) + if prev_count > 0 { 1 } else { 0 };
@@ -636,6 +636,7 @@ impl Repository {
                 previous_last_copied_at: prev_last,
                 previous_sort_key: prev_sort,
                 previous_copy_count: prev_count,
+                previous_content: prev_content,
                 resulting_last_copied_at: input.now,
                 resulting_sort_key: resulting_sort,
                 resulting_copy_count: clip.copy_count,
@@ -767,7 +768,8 @@ impl Repository {
                 tx.execute(
                     "UPDATE clips SET
                         copy_count=?2, sort_key=?3, pinned=?4, created_at=?5,
-                        page_title=COALESCE(?6, page_title), last_copied_at=MAX(last_copied_at,?7)
+                        page_title=COALESCE(?6, page_title), last_copied_at=MAX(last_copied_at,?7),
+                        content=?8
                      WHERE id=?1",
                     params![
                         existing_id,
@@ -776,7 +778,8 @@ impl Repository {
                         merged_pinned,
                         merged_created,
                         title,
-                        event_ts_ms
+                        event_ts_ms,
+                        temp_content
                     ],
                 )?;
 
@@ -796,19 +799,37 @@ impl Repository {
                 temp_id
             }
         } else {
-            tx.execute(
-                "UPDATE clips SET
-                    copy_count = ?2,
-                    sort_key = COALESCE(?3, sort_key),
-                    last_copied_at = COALESCE(?4, last_copied_at)
-                 WHERE id = ?1",
-                params![
-                    temp_id,
-                    receipt.previous_copy_count,
-                    receipt.previous_sort_key,
-                    receipt.previous_last_copied_at
-                ],
-            )?;
+            if let Some(ref prev_content) = receipt.previous_content {
+                tx.execute(
+                    "UPDATE clips SET
+                        copy_count = ?2,
+                        sort_key = COALESCE(?3, sort_key),
+                        last_copied_at = COALESCE(?4, last_copied_at),
+                        content = ?5
+                     WHERE id = ?1",
+                    params![
+                        temp_id,
+                        receipt.previous_copy_count,
+                        receipt.previous_sort_key,
+                        receipt.previous_last_copied_at,
+                        prev_content
+                    ],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE clips SET
+                        copy_count = ?2,
+                        sort_key = COALESCE(?3, sort_key),
+                        last_copied_at = COALESCE(?4, last_copied_at)
+                     WHERE id = ?1",
+                    params![
+                        temp_id,
+                        receipt.previous_copy_count,
+                        receipt.previous_sort_key,
+                        receipt.previous_last_copied_at
+                    ],
+                )?;
+            }
 
             if let Some((existing_id, _, _, _, _)) = existing {
                 tx.execute(
@@ -816,9 +837,10 @@ impl Repository {
                         copy_count = copy_count + 1,
                         sort_key = MAX(sort_key, ?2),
                         last_copied_at = MAX(last_copied_at, ?3),
-                        page_title = COALESCE(?4, page_title)
+                        page_title = COALESCE(?4, page_title),
+                        content = ?5
                      WHERE id=?1",
-                    params![existing_id, temp_sort, event_ts_ms, title],
+                    params![existing_id, temp_sort, event_ts_ms, title, temp_content],
                 )?;
                 existing_id
             } else {
@@ -2049,5 +2071,68 @@ mod tests {
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].id, clip1.id);
         assert_ne!(res[0].id, clip2.id);
+    }
+
+    #[test]
+    fn test_exact_content_preservation_on_receipt_reconciliation() {
+        let r = Repository::open_in_memory().unwrap();
+        let now = 1_700_000_000_000;
+
+        // 1. Initial temp copy "foo"
+        let (c1, r1) = r
+            .upsert_clip(NewClip {
+                content: "foo",
+                domain: None,
+                page_title: None,
+                now,
+            })
+            .unwrap();
+        let receipt1 = r1.unwrap();
+        assert_eq!(receipt1.previous_copy_count, 0);
+
+        // 2. Second temp copy with exact text "foo " (same hash)
+        let (c2, r2) = r
+            .upsert_clip(NewClip {
+                content: "foo ",
+                domain: None,
+                page_title: None,
+                now: now + 1000,
+            })
+            .unwrap();
+        let receipt2 = r2.unwrap();
+        assert_eq!(c1.id, c2.id);
+        assert_eq!(receipt2.previous_copy_count, 1);
+        assert_eq!(receipt2.previous_content.as_deref(), Some("foo"));
+
+        // Temp clip content is updated to "foo "
+        let content = r.get_clip_content(&c1.id).unwrap();
+        assert_eq!(content, "foo ");
+
+        // 3. Late Chrome metadata arrives for second copy (receipt2)
+        let event = crate::browser_metadata::BrowserCopyEvent {
+            event_id: Uuid::new_v4(),
+            version: 1,
+            event: "copy".into(),
+            content_hash: receipt2.content_hash.clone(),
+            content_length: normalize_content("foo ").len(),
+            domain: "example.com".into(),
+            page_title: "Foo Page".into(),
+            timestamp: chrono::DateTime::from_timestamp_millis(now + 1000)
+                .unwrap()
+                .to_rfc3339(),
+        };
+
+        let domain_id = r
+            .attach_metadata_with_receipt(&event, receipt2)
+            .unwrap()
+            .unwrap();
+
+        // 4. Verify domain clip was created with exact content "foo "
+        let domain_content = r.get_clip_content(&domain_id).unwrap();
+        assert_eq!(domain_content, "foo ");
+
+        // 5. Verify temp clip was rolled back to original content "foo"
+        let temp_content = r.get_clip_content(&c1.id).unwrap();
+        assert_eq!(temp_content, "foo");
     }
 }

@@ -16,9 +16,13 @@ pub struct IntegrationStatus {
     pub native_host_executable: bool,
     pub native_manifest_exists: bool,
     pub native_manifest_valid: bool,
+    pub chrome_manifest_valid: bool,
+    pub chromium_manifest_valid: bool,
     pub native_socket_available: bool,
+    pub native_messaging_configured: bool,
     pub native_messaging_connected: bool,
-    pub shortcut_registered: bool,
+    pub last_native_message_at: Option<i64>,
+    pub shortcut_registered: Option<bool>,
     pub autostart_enabled: bool,
     pub problems: Vec<IntegrationProblem>,
 }
@@ -205,7 +209,7 @@ pub fn resolve_native_host_path() -> Option<PathBuf> {
 
 pub fn get_integration_status(
     data_dir: &Path,
-    shortcut_registered: bool,
+    shortcut_registered: Option<bool>,
     autostart_enabled: bool,
 ) -> IntegrationStatus {
     let is_linux = cfg!(target_os = "linux");
@@ -226,41 +230,47 @@ pub fn get_integration_status(
         .unwrap_or(false);
 
     let mut native_manifest_exists = false;
-    let mut native_manifest_valid = false;
+    let mut chrome_manifest_valid = false;
+    let mut chromium_manifest_valid = false;
     let mut extension_id: Option<String> = None;
 
-    for sys_path_str in SYSTEM_MANIFEST_PATHS {
-        let sys_path = Path::new(sys_path_str);
-        if sys_path.exists() {
+    let user_manifest_paths = get_user_manifest_paths();
+
+    let mut check_path = |path: &Path| -> bool {
+        if path.exists() {
             native_manifest_exists = true;
-            if let Ok(content) = fs::read_to_string(sys_path) {
+            if let Ok(content) = fs::read_to_string(path) {
                 if let Ok(ext_id) = validate_manifest_content(&content) {
-                    native_manifest_valid = true;
-                    extension_id = Some(ext_id);
-                    break;
-                }
-            }
-        }
-    }
-
-    if !native_manifest_valid {
-        for u_path in get_user_manifest_paths() {
-            if u_path.exists() {
-                native_manifest_exists = true;
-                if let Ok(content) = fs::read_to_string(&u_path) {
-                    if let Ok(ext_id) = validate_manifest_content(&content) {
-                        native_manifest_valid = true;
+                    if extension_id.is_none() {
                         extension_id = Some(ext_id);
-                        break;
                     }
+                    return true;
                 }
             }
         }
+        false
+    };
+
+    if !SYSTEM_MANIFEST_PATHS.is_empty() && check_path(Path::new(SYSTEM_MANIFEST_PATHS[0])) {
+        chrome_manifest_valid = true;
+    }
+    if SYSTEM_MANIFEST_PATHS.len() > 1 && check_path(Path::new(SYSTEM_MANIFEST_PATHS[1])) {
+        chromium_manifest_valid = true;
     }
 
+    if !user_manifest_paths.is_empty() && !chrome_manifest_valid && check_path(&user_manifest_paths[0]) {
+        chrome_manifest_valid = true;
+    }
+    if user_manifest_paths.len() > 1 && !chromium_manifest_valid && check_path(&user_manifest_paths[1]) {
+        chromium_manifest_valid = true;
+    }
+
+    let native_manifest_valid = chrome_manifest_valid || chromium_manifest_valid;
     let socket_path = crate::browser_metadata::socket_path(data_dir);
     let native_socket_available = socket_path.exists();
-    let native_messaging_connected = native_socket_available && native_manifest_valid;
+    let last_native_message_at = crate::browser_metadata::get_last_message_at();
+    let native_messaging_configured = native_socket_available && native_manifest_valid;
+    let native_messaging_connected = native_messaging_configured && last_native_message_at.is_some();
 
     let mut problems = Vec::new();
 
@@ -346,7 +356,7 @@ pub fn get_integration_status(
         });
     }
 
-    if !shortcut_registered {
+    if let Some(false) = shortcut_registered {
         problems.push(IntegrationProblem {
             id: "shortcut_conflict".into(),
             severity: "warning".into(),
@@ -377,8 +387,12 @@ pub fn get_integration_status(
         native_host_executable,
         native_manifest_exists,
         native_manifest_valid,
+        chrome_manifest_valid,
+        chromium_manifest_valid,
         native_socket_available,
+        native_messaging_configured,
         native_messaging_connected,
+        last_native_message_at,
         shortcut_registered,
         autostart_enabled,
         problems,
@@ -407,20 +421,39 @@ pub fn save_user_extension_manifest(extension_id: &str) -> Result<PathBuf, Strin
 
     let json_content = generate_native_manifest(&host_path, extension_id)?;
 
+    let mut written_paths = Vec::new();
+    let mut last_err = None;
+
     for manifest_path in &manifest_paths {
         if let Some(parent) = manifest_path.parent() {
-            let _ = fs::create_dir_all(parent);
+            if let Err(e) = fs::create_dir_all(parent) {
+                last_err = Some(format!("Не удалось создать каталог {parent:?}: {e}"));
+                continue;
+            }
         }
-        if fs::write(manifest_path, &json_content).is_ok() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(manifest_path, fs::Permissions::from_mode(0o600));
+        match fs::write(manifest_path, &json_content) {
+            Ok(_) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(e) = fs::set_permissions(manifest_path, fs::Permissions::from_mode(0o600)) {
+                        last_err = Some(format!("Не удалось установить права на {manifest_path:?}: {e}"));
+                        continue;
+                    }
+                }
+                written_paths.push(manifest_path.clone());
+            }
+            Err(e) => {
+                last_err = Some(format!("Не удалось записать манифест {manifest_path:?}: {e}"));
             }
         }
     }
 
-    Ok(manifest_paths[0].clone())
+    if written_paths.is_empty() {
+        return Err(last_err.unwrap_or_else(|| "Не удалось записать ни один manifest-файл".to_string()));
+    }
+
+    Ok(written_paths[0].clone())
 }
 
 #[cfg(test)]
@@ -512,5 +545,24 @@ mod tests {
         let manifest_content = generate_native_manifest(&bin_path, id).unwrap();
         let parsed = validate_manifest_content(&manifest_content).unwrap();
         assert_eq!(parsed, id);
+
+        // Invalid extension ID error
+        assert!(save_user_extension_manifest("invalid_id").is_err());
+    }
+
+    #[test]
+    fn test_integration_status_shortcut_options() {
+        let dir = tempdir().unwrap();
+        let status_none = get_integration_status(dir.path(), None, true);
+        assert_eq!(status_none.shortcut_registered, None);
+        assert!(!status_none.problems.iter().any(|p| p.id == "shortcut_conflict"));
+
+        let status_false = get_integration_status(dir.path(), Some(false), true);
+        assert_eq!(status_false.shortcut_registered, Some(false));
+        assert!(status_false.problems.iter().any(|p| p.id == "shortcut_conflict"));
+
+        let status_true = get_integration_status(dir.path(), Some(true), true);
+        assert_eq!(status_true.shortcut_registered, Some(true));
+        assert!(!status_true.problems.iter().any(|p| p.id == "shortcut_conflict"));
     }
 }

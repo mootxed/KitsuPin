@@ -394,8 +394,11 @@ function bindCards(root: HTMLElement) {
     // Main action: copy on click on clip-main or on popitem
     const mainBtn = card.classList.contains("popitem") ? card : card.querySelector<HTMLElement>(".clip-main");
     const handleCopy = async (e: Event) => {
-      if (e.target instanceof Element && e.target.closest(".tag, .clip-actions, button, input, a")) {
-        return;
+      if (e.target instanceof Element) {
+        const closestInteractive = e.target.closest(".tag, .clip-actions, button, input, a");
+        if (closestInteractive && closestInteractive !== mainBtn) {
+          return;
+        }
       }
       try {
         let content: string | undefined;
@@ -409,8 +412,11 @@ function bindCards(root: HTMLElement) {
     mainBtn?.addEventListener("click", handleCopy);
     mainBtn?.addEventListener("keydown", (e) => {
       if (e.key === "Enter" || e.key === " ") {
-        if (e.target instanceof Element && e.target.closest(".tag, .clip-actions, button, input, a")) {
-          return;
+        if (e.target instanceof Element) {
+          const closestInteractive = e.target.closest(".tag, .clip-actions, button, input, a");
+          if (closestInteractive && closestInteractive !== mainBtn) {
+            return;
+          }
         }
         e.preventDefault();
         handleCopy(e);
@@ -418,9 +424,12 @@ function bindCards(root: HTMLElement) {
     });
 
     card.ondragstart = (e) => {
-      if (e.target instanceof Element && e.target.closest('button, .clip-actions, input, a, .tag')) {
-        e.preventDefault();
-        return;
+      if (e.target instanceof Element) {
+        const closestInteractive = e.target.closest('button, .clip-actions, input, a, .tag');
+        if (closestInteractive && closestInteractive !== card) {
+          e.preventDefault();
+          return;
+        }
       }
       e.dataTransfer?.setData("text/kitsupin", clip.id);
     };
@@ -713,14 +722,15 @@ async function renderIntegrationView(container: HTMLElement) {
           <div class="diag-item"><span>Native host установлен</span>${status.nativeHostBinaryExists && status.nativeHostExecutable ? '<span class="status-ok">✓ Исполняемый файл найден</span>' : '<span class="status-err">✗ Отсутствует или нет прав +x</span>'}</div>
           <div class="diag-item"><span>Native socket</span>${status.nativeSocketAvailable ? '<span class="status-ok">✓ Работает</span>' : '<span class="status-err">✗ Недоступен</span>'}</div>
           <div class="diag-item"><span>Автозапуск</span>${status.autostartEnabled ? '<span class="status-ok">✓ Включён</span>' : '<span class="status-info">Отключён</span>'}</div>
-          <div class="diag-item"><span>Горячая клавиша</span>${status.shortcutRegistered ? '<span class="status-ok">✓ Зарегистрирована</span>' : '<span class="status-warn">⚠ Не доступна</span>'}</div>
+          <div class="diag-item"><span>Горячая клавиша</span>${status.shortcutRegistered === true ? '<span class="status-ok">✓ Зарегистрирована</span>' : status.shortcutRegistered === false ? '<span class="status-warn">⚠ Не доступна</span>' : '<span class="status-info">Неизвестно</span>'}</div>
         </div>
 
         <div class="diag-group">
-          <h4>Chrome и расширение</h4>
-          <div class="diag-item"><span>Google Chrome</span>${status.chromeDetected ? '<span class="status-ok">✓ Обнаружен</span>' : '<span class="status-warn">⚠ Не найден</span>'}</div>
-          <div class="diag-item"><span>Manifest и Extension ID</span>${status.nativeManifestValid ? `<span class="status-ok">✓ ${esc(status.extensionId || '')}</span>` : '<span class="status-warn">⚠ Не настроен</span>'}</div>
-          <div class="diag-item"><span>Native Messaging</span>${status.nativeMessagingConnected ? '<span class="status-ok">✓ Подключён</span>' : '<span class="status-warn">⚠ Не подключён</span>'}</div>
+          <h4>Chrome / Chromium и расширение</h4>
+          <div class="diag-item"><span>Браузер</span>${status.chromeDetected ? '<span class="status-ok">✓ Обнаружен</span>' : '<span class="status-warn">⚠ Не найден</span>'}</div>
+          <div class="diag-item"><span>Chrome Manifest</span>${status.chromeManifestValid ? `<span class="status-ok">✓ ${esc(status.extensionId || '')}</span>` : '<span class="status-warn">⚠ Не настроен</span>'}</div>
+          <div class="diag-item"><span>Chromium Manifest</span>${status.chromiumManifestValid ? `<span class="status-ok">✓ ${esc(status.extensionId || '')}</span>` : '<span class="status-warn">⚠ Не настроен</span>'}</div>
+          <div class="diag-item"><span>Native Messaging</span>${status.nativeMessagingConnected ? '<span class="status-ok">✓ Подключён</span>' : status.nativeMessagingConfigured ? '<span class="status-info">ℹ Настроено</span>' : '<span class="status-warn">⚠ Не подключён</span>'}</div>
         </div>
 
         ${status.problems.map(p => `
