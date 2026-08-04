@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "KitsuPin для Chrome",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Добавляет к локальной истории KitsuPin домен и заголовок страницы.",
   "permissions": ["nativeMessaging", "storage", "scripting", "clipboardRead"],
   "host_permissions": ["http://*/*", "https://*/*"],

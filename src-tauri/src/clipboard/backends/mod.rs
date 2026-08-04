@@ -1,5 +1,4 @@
 pub mod disabled;
-pub mod polling;
 pub mod wayland;
 pub mod x11;
 

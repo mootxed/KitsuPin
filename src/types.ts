@@ -19,7 +19,7 @@ export interface IntegrationProblem {
 }
 
 export interface CapabilityStatus {
-  status: "available" | "unavailable" | "failed" | "notTested";
+  status: "available" | "degraded" | "unavailable" | "failed" | "notTested";
   message?: string;
 }
 

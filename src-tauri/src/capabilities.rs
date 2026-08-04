@@ -18,6 +18,7 @@ pub struct PlatformCapabilities {
 #[serde(tag = "status", content = "message", rename_all = "camelCase")]
 pub enum CapabilityStatus {
     Available,
+    Degraded(String),
     Unavailable,
     Failed(String),
     NotTested,
@@ -163,6 +164,17 @@ mod tests {
         assert_eq!(
             runtime.shortcut,
             CapabilityStatus::Failed("Key registration error".to_string())
+        );
+
+        update_clipboard_monitoring_status(CapabilityStatus::Degraded(
+            "XFixes недоступен, используется polling каждые 350 мс".to_string(),
+        ));
+        let runtime = get_runtime_capabilities();
+        assert_eq!(
+            runtime.clipboard_monitoring,
+            CapabilityStatus::Degraded(
+                "XFixes недоступен, используется polling каждые 350 мс".to_string()
+            )
         );
     }
 }

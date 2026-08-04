@@ -20,20 +20,13 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError},
+        mpsc::{Receiver, RecvTimeoutError},
         Arc,
     },
     time::Duration,
 };
 use tauri::{AppHandle, Emitter};
-use x11rb::{
-    connection::Connection,
-    protocol::{
-        xfixes::{ConnectionExt as XfixesExt, SelectionEventMask},
-        xproto::ConnectionExt as XprotoExt,
-        Event,
-    },
-};
+use x11rb::protocol::xproto::ConnectionExt as XprotoExt;
 
 pub trait ClipboardReader {
     fn file_list(&self) -> Result<Vec<PathBuf>, arboard::Error>;
@@ -370,7 +363,9 @@ pub fn start(
             Err(error) => {
                 log::warn!("Clipboard monitor startup failed: {error}. Falling back to polling.");
                 crate::capabilities::update_clipboard_monitoring_status(
-                    crate::capabilities::CapabilityStatus::Failed(error.to_string()),
+                    crate::capabilities::CapabilityStatus::Degraded(
+                        "XFixes недоступен, используется polling каждые 350 мс".to_string(),
+                    ),
                 );
                 backends::MonitorMode::Polling(Duration::from_millis(350))
             }
@@ -418,8 +413,8 @@ pub fn start(
                             "Clipboard notifications channel disconnected. Switching to emergency polling fallback."
                         );
                         crate::capabilities::update_clipboard_monitoring_status(
-                            crate::capabilities::CapabilityStatus::Failed(
-                                "Event notifications stream disconnected".to_string(),
+                            crate::capabilities::CapabilityStatus::Degraded(
+                                "XFixes недоступен, используется polling каждые 350 мс".to_string(),
                             ),
                         );
                         notifications = None;

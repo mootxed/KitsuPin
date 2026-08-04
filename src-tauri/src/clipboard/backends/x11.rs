@@ -48,7 +48,9 @@ impl X11ClipboardMonitor {
                 Ok(_) => {}
                 Err(error) => {
                     log::warn!("XFixes Clipboard notifications stopped: {error}");
-                    update_clipboard_monitoring_status(CapabilityStatus::Failed(error.to_string()));
+                    update_clipboard_monitoring_status(CapabilityStatus::Degraded(
+                        "XFixes недоступен, используется polling каждые 350 мс".to_string(),
+                    ));
                     break;
                 }
             }
@@ -79,7 +81,9 @@ impl ClipboardMonitor for X11ClipboardMonitor {
             }
             Err(error) => {
                 log::warn!("X11 XFixes initialization failed: {error}. Falling back to polling.");
-                update_clipboard_monitoring_status(CapabilityStatus::Failed(error.to_string()));
+                update_clipboard_monitoring_status(CapabilityStatus::Degraded(
+                    "XFixes недоступен, используется polling каждые 350 мс".to_string(),
+                ));
                 Ok(MonitorMode::Polling(Duration::from_millis(350)))
             }
         }
