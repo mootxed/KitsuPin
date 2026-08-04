@@ -15,10 +15,6 @@ impl ClipboardMonitor for WaylandClipboardMonitor {
         SessionType::Wayland
     }
 
-    fn supports_passive_monitoring(&self) -> bool {
-        false
-    }
-
     fn start(&self, _generation: Arc<ClipboardGeneration>) -> anyhow::Result<MonitorMode> {
         log::info!(
             "Passive global clipboard monitoring disabled for Wayland session. KitsuPin running in limited support mode."

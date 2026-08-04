@@ -69,10 +69,6 @@ impl ClipboardMonitor for X11ClipboardMonitor {
         SessionType::X11
     }
 
-    fn supports_passive_monitoring(&self) -> bool {
-        true
-    }
-
     fn start(&self, generation: Arc<ClipboardGeneration>) -> anyhow::Result<MonitorMode> {
         match self.try_start_xfixes(generation) {
             Ok(receiver) => {

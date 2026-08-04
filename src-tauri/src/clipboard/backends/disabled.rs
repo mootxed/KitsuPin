@@ -15,10 +15,6 @@ impl ClipboardMonitor for DisabledClipboardMonitor {
         SessionType::Unknown
     }
 
-    fn supports_passive_monitoring(&self) -> bool {
-        false
-    }
-
     fn start(&self, _generation: Arc<ClipboardGeneration>) -> anyhow::Result<MonitorMode> {
         log::info!("Passive global clipboard monitoring disabled for unknown graphics session.");
         update_clipboard_monitoring_status(CapabilityStatus::Unavailable);

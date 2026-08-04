@@ -9,6 +9,7 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipboardNotification {
+    #[allow(dead_code)]
     Changed {
         sequence: u64,
     },
@@ -39,8 +40,6 @@ pub enum MonitorMode {
 pub trait ClipboardMonitor: Send + Sync {
     fn name(&self) -> &'static str;
     fn session_type(&self) -> SessionType;
-    #[allow(dead_code)]
-    fn supports_passive_monitoring(&self) -> bool;
     fn start(&self, generation: Arc<ClipboardGeneration>) -> anyhow::Result<MonitorMode>;
 }
 

@@ -294,8 +294,8 @@ jobs:
           dnf install -y procps-ng
           dnf install -y "$RPM"
 
-          echo "=== rpm -q kitsupin ==="
-          rpm -q kitsupin
+          echo "=== rpm -q kitsu-pin ==="
+          rpm -q kitsu-pin
 
           echo "=== CLI smoke tests ==="
           kitsupin --version
@@ -315,7 +315,7 @@ jobs:
           fi
 
           echo "=== Testing dnf remove ==="
-          dnf remove -y kitsupin
+          dnf remove -y kitsu-pin
 
           test ! -e /usr/bin/kitsupin
           test ! -e /usr/lib/kitsupin
