@@ -1204,7 +1204,9 @@ pub fn run() {
 
             if let Err(error) = setup_tray(app) {
                 log::error!("KDE System Tray недоступен: {error}");
-                capabilities::update_tray_status(capabilities::CapabilityStatus::Failed(error.to_string()));
+                capabilities::update_tray_status(capabilities::CapabilityStatus::Failed(
+                    error.to_string(),
+                ));
             } else {
                 capabilities::update_tray_status(capabilities::CapabilityStatus::Available);
             }
@@ -1214,7 +1216,9 @@ pub fn run() {
                 log::error!("Горячая клавиша недоступна: {e}");
                 // Clear tracked shortcut so user can re-set it via settings.
                 *app.state::<AppState>().registered_shortcut.lock() = None;
-                capabilities::update_shortcut_status(capabilities::CapabilityStatus::Failed(e.to_string()));
+                capabilities::update_shortcut_status(capabilities::CapabilityStatus::Failed(
+                    e.to_string(),
+                ));
             } else {
                 capabilities::update_shortcut_status(capabilities::CapabilityStatus::Available);
             }

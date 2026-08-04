@@ -432,16 +432,20 @@ pub fn start(
             let captured_owner_before = access.inspect_x11_clipboard("watcher before read");
             let captured_gen = generation.current();
 
-            if let (Some(n), Some(curr_owner)) = (notif, captured_owner_before) {
-                if let ClipboardNotification::X11Changed { owner, sequence, .. } = n {
-                    if owner != curr_owner && owner != 0 {
-                        log::info!(
-                            "X11 event sequence {} owner window ID {} differs from current owner window ID {}; reading current selection",
-                            sequence,
-                            owner,
-                            curr_owner
-                        );
-                    }
+            if let (
+                Some(ClipboardNotification::X11Changed {
+                    owner, sequence, ..
+                }),
+                Some(curr_owner),
+            ) = (notif, captured_owner_before)
+            {
+                if owner != curr_owner && owner != 0 {
+                    log::info!(
+                        "X11 event sequence {} owner window ID {} differs from current owner window ID {}; reading current selection",
+                        sequence,
+                        owner,
+                        curr_owner
+                    );
                 }
             }
 
