@@ -1,5 +1,6 @@
 mod blob_store;
 pub mod browser_metadata;
+pub mod capabilities;
 mod clipboard;
 pub mod diagnostics;
 mod domain;
@@ -515,6 +516,11 @@ fn hide_popup(app: AppHandle) -> CommandResult<()> {
         mgr.hide(&app);
     }
     Ok(())
+}
+
+#[tauri::command]
+fn get_platform_capabilities() -> capabilities::PlatformCapabilities {
+    capabilities::get_platform_capabilities()
 }
 
 fn show_main(app: &AppHandle) {
@@ -1164,7 +1170,8 @@ pub fn run() {
             configure_extension_id,
             open_extension_dir,
             open_chrome_extensions_page,
-            hide_popup
+            hide_popup,
+            get_platform_capabilities
         ])
         .setup(move |app| {
             let popup_window = WebviewWindowBuilder::new(

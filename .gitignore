@@ -10,4 +10,5 @@ staging/
 *.key
 *.crx
 *.deb
+*.rpm
 *.sha256

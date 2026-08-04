@@ -27,6 +27,7 @@ pub struct IntegrationStatus {
     pub handshake_active: bool,
     pub shortcut_registered: Option<bool>,
     pub autostart_enabled: bool,
+    pub platform_capabilities: Option<crate::capabilities::PlatformCapabilities>,
     pub problems: Vec<IntegrationProblem>,
 }
 
@@ -403,6 +404,8 @@ pub fn get_integration_status(
         });
     }
 
+    let platform_capabilities = Some(crate::capabilities::get_platform_capabilities());
+
     IntegrationStatus {
         is_linux,
         desktop_environment,
@@ -425,6 +428,7 @@ pub fn get_integration_status(
         handshake_active,
         shortcut_registered,
         autostart_enabled,
+        platform_capabilities,
         problems,
     }
 }

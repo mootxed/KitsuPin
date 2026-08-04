@@ -25,7 +25,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["deb"],
+    "targets": ["deb", "rpm"],
     "category": "Utility",
     "shortDescription": "Локальная история буфера обмена",
     "longDescription": "KitsuPin сохраняет текст и растровые изображения из обычного X11 Clipboard и показывает историю через KDE tray.",
@@ -39,6 +39,14 @@
           "/usr/lib/kitsupin/resources/scripts/uninstall-user-data.sh": "../scripts/uninstall-user-data.sh"
         },
         "preInstallScript": "../packaging/preinst"
+      },
+      "rpm": {
+        "files": {
+          "/usr/lib/kitsupin/kitsupin-native-host": "target/release/kitsupin-native-host",
+          "/etc/xdg/autostart/kitsupin.desktop": "../packaging/kitsupin-autostart.desktop",
+          "/usr/lib/kitsupin/resources/chrome-extension": "../chrome-extension",
+          "/usr/lib/kitsupin/resources/scripts/uninstall-user-data.sh": "../scripts/uninstall-user-data.sh"
+        }
       }
     },
     "resources": {}

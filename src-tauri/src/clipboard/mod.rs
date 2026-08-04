@@ -1,3 +1,6 @@
+pub mod backend;
+pub mod session;
+
 use crate::{
     browser_metadata::MetadataBuffer,
     domain::{
@@ -396,7 +399,24 @@ pub fn start(
 ) {
     let generation = Arc::new(ClipboardGeneration::default());
     let generation_clone = Arc::clone(&generation);
+    let selected_backend = backend::select_backend();
+    log::info!(
+        "Clipboard watcher starting with backend: {} (session: {})",
+        selected_backend.name(),
+        selected_backend.session_type()
+    );
+
     std::thread::spawn(move || {
+        if !selected_backend.supports_passive_monitoring() {
+            log::info!(
+                "Passive global clipboard monitoring disabled for session type '{}'. KitsuPin running in limited support mode.",
+                selected_backend.session_type()
+            );
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        }
+
         let notifications = match x11_notifications(generation_clone) {
             Ok(receiver) => Some(receiver),
             Err(error) => {

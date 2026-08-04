@@ -77,9 +77,9 @@ jobs:
       - name: Run core tests
         run: cargo test --manifest-path src-tauri/core-tests/Cargo.toml
 
-  # ── Tauri system check / build ─────────────────────────────────────────────
+  # ── Tauri system check / build (DEB) ──────────────────────────────────────
   tauri-check:
-    name: Tauri (check · clippy · test · build)
+    name: Tauri DEB (check · clippy · test · build)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -146,7 +146,7 @@ jobs:
       - name: Remove stale bundles
         run: rm -rf src-tauri/target/release/bundle
 
-      - name: Tauri build
+      - name: Tauri build .deb
         run: npm run tauri build -- --bundles deb -c staging/tauri.conf.json
         env:
           TAURI_SIGNING_PRIVATE_KEY: ""
@@ -175,3 +175,93 @@ jobs:
           path: src-tauri/target/release/bundle/deb/*.deb
           if-no-files-found: warn
           retention-days: 14
+
+  # ── Tauri RPM build ───────────────────────────────────────────────────────
+  tauri-rpm-build:
+    name: Tauri RPM (build · verify)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies (Ubuntu 24.04 + rpm)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libx11-dev \
+            libxi-dev \
+            libxtst-dev \
+            libxfixes-dev \
+            pkg-config \
+            patchelf \
+            build-essential \
+            rpm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-tauri-rpm-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-tauri-rpm-
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build native host binary
+        run: cargo build --release --manifest-path src-tauri/Cargo.toml --bin kitsupin-native-host
+
+      - name: Prepare packaging files
+        run: ./scripts/prepare-release-packaging.sh dev
+
+      - name: Remove stale bundles
+        run: rm -rf src-tauri/target/release/bundle
+
+      - name: Tauri build .rpm
+        run: npm run tauri build -- --bundles rpm -c staging/tauri.conf.json
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ""
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+
+      - name: Verify .rpm package layout
+        run: |
+          VERSION=$(jq -r '.version' package.json)
+          RPM=$(find src-tauri/target/release/bundle/rpm \
+            -maxdepth 1 \
+            -type f \
+            -name "*.rpm" \
+            -print -quit)
+
+          if [[ -z "$RPM" ]]; then
+            echo "::error::RPM package for version $VERSION was not found"
+            exit 1
+          fi
+
+          ./scripts/verify-rpm-layout.sh "$RPM"
+
+      - name: Upload .rpm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kitsupin-rpm
+          path: src-tauri/target/release/bundle/rpm/*.rpm
+          if-no-files-found: warn
+          retention-days: 14
+

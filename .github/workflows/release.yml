@@ -57,7 +57,8 @@ jobs:
             libxfixes-dev \
             pkg-config \
             patchelf \
-            build-essential
+            build-essential \
+            rpm
 
       - name: Install frontend dependencies
         run: npm ci
@@ -113,8 +114,8 @@ jobs:
       - name: Remove stale bundles
         run: rm -rf src-tauri/target/release/bundle
 
-      - name: Build Tauri .deb bundle
-        run: npm run tauri build -- --bundles deb -c staging/tauri.conf.json
+      - name: Build Tauri bundles (.deb, .rpm)
+        run: npm run tauri build -- --bundles deb,rpm -c staging/tauri.conf.json
         env:
           TAURI_SIGNING_PRIVATE_KEY: ""
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
@@ -145,6 +146,27 @@ jobs:
           ./scripts/verify-deb-layout.sh "$FINAL_DEB"
 
           sha256sum "$FINAL_DEB" > "${FINAL_DEB}.sha256"
+
+      - name: Inspect and Verify .rpm package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ORIG_RPM=$(find src-tauri/target/release/bundle/rpm \
+            -maxdepth 1 \
+            -type f \
+            -name "*.rpm" \
+            -print -quit)
+
+          if [[ -z "$ORIG_RPM" ]]; then
+            echo "::error::RPM package for version $VERSION was not found"
+            exit 1
+          fi
+
+          FINAL_RPM="KitsuPin_${VERSION}_x86_64.rpm"
+          cp "$ORIG_RPM" "$FINAL_RPM"
+
+          ./scripts/verify-rpm-layout.sh "$FINAL_RPM"
+
+          sha256sum "$FINAL_RPM" > "${FINAL_RPM}.sha256"
 
       - name: Test .deb installation, upgrade cleanup, and uninstall
         run: |
@@ -190,6 +212,8 @@ jobs:
           files: |
             KitsuPin_${{ steps.version.outputs.version }}_amd64.deb
             KitsuPin_${{ steps.version.outputs.version }}_amd64.deb.sha256
+            KitsuPin_${{ steps.version.outputs.version }}_x86_64.rpm
+            KitsuPin_${{ steps.version.outputs.version }}_x86_64.rpm.sha256
           draft: false
           prerelease: true
           generate_release_notes: true

@@ -84,6 +84,7 @@ if [[ -n "$EXTENSION_ID" ]]; then
   cat <<EOF > "$TAURI_OVERRIDE_CONF"
 {
   "bundle": {
+    "targets": ["deb", "rpm"],
     "resources": {},
     "linux": {
       "deb": {
@@ -96,6 +97,16 @@ if [[ -n "$EXTENSION_ID" ]]; then
           "/usr/share/google-chrome/extensions/${EXTENSION_ID}.json": "../staging/usr/share/google-chrome/extensions/${EXTENSION_ID}.json"
         },
         "preInstallScript": "../packaging/preinst"
+      },
+      "rpm": {
+        "files": {
+          "/usr/lib/kitsupin/kitsupin-native-host": "target/release/kitsupin-native-host",
+          "/etc/xdg/autostart/kitsupin.desktop": "../packaging/kitsupin-autostart.desktop",
+          "/usr/lib/kitsupin/resources/chrome-extension": "../chrome-extension",
+          "/usr/lib/kitsupin/resources/scripts/uninstall-user-data.sh": "../scripts/uninstall-user-data.sh",
+          "/etc/opt/chrome/native-messaging-hosts/io.github.mootxed.kitsupin.native.json": "../staging/etc/opt/chrome/native-messaging-hosts/io.github.mootxed.kitsupin.native.json",
+          "/usr/share/google-chrome/extensions/${EXTENSION_ID}.json": "../staging/usr/share/google-chrome/extensions/${EXTENSION_ID}.json"
+        }
       }
     }
   }
@@ -105,6 +116,7 @@ else
   cat <<EOF > "$TAURI_OVERRIDE_CONF"
 {
   "bundle": {
+    "targets": ["deb", "rpm"],
     "resources": {},
     "linux": {
       "deb": {
@@ -115,6 +127,14 @@ else
           "/usr/lib/kitsupin/resources/scripts/uninstall-user-data.sh": "../scripts/uninstall-user-data.sh"
         },
         "preInstallScript": "../packaging/preinst"
+      },
+      "rpm": {
+        "files": {
+          "/usr/lib/kitsupin/kitsupin-native-host": "target/release/kitsupin-native-host",
+          "/etc/xdg/autostart/kitsupin.desktop": "../packaging/kitsupin-autostart.desktop",
+          "/usr/lib/kitsupin/resources/chrome-extension": "../chrome-extension",
+          "/usr/lib/kitsupin/resources/scripts/uninstall-user-data.sh": "../scripts/uninstall-user-data.sh"
+        }
       }
     }
   }
