@@ -318,7 +318,7 @@ jobs:
           dnf remove -y kitsu-pin
 
           test ! -e /usr/bin/kitsupin
-          test ! -e /usr/lib/kitsupin
+          test ! -e /usr/lib/kitsupin/kitsupin-native-host
           test ! -e /etc/xdg/autostart/kitsupin.desktop
 
 

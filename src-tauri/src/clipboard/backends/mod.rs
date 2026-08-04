@@ -10,9 +10,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipboardNotification {
     #[allow(dead_code)]
-    Changed {
-        sequence: u64,
-    },
+    Changed { sequence: u64 },
     X11Changed {
         sequence: u64,
         owner: u32,
