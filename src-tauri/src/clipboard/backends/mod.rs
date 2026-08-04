@@ -41,10 +41,7 @@ pub trait ClipboardMonitor: Send + Sync {
     fn session_type(&self) -> SessionType;
     #[allow(dead_code)]
     fn supports_passive_monitoring(&self) -> bool;
-    fn start(
-        &self,
-        generation: Arc<ClipboardGeneration>,
-    ) -> anyhow::Result<MonitorMode>;
+    fn start(&self, generation: Arc<ClipboardGeneration>) -> anyhow::Result<MonitorMode>;
 }
 
 pub fn select_monitor() -> Box<dyn ClipboardMonitor> {
@@ -65,4 +62,3 @@ mod tests {
         assert!(!monitor.name().is_empty());
     }
 }
-

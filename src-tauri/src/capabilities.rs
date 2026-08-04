@@ -149,8 +149,7 @@ mod tests {
 
     #[test]
     fn wayland_capabilities_have_limited_monitoring() {
-        let caps =
-            get_platform_capabilities_with_env(mock_env(&[("XDG_SESSION_TYPE", "wayland")]));
+        let caps = get_platform_capabilities_with_env(mock_env(&[("XDG_SESSION_TYPE", "wayland")]));
         assert_eq!(caps.session_type, SessionType::Wayland);
         assert!(!caps.global_clipboard_monitoring);
         assert!(!caps.global_shortcuts);
@@ -159,7 +158,9 @@ mod tests {
 
     #[test]
     fn runtime_capabilities_tracks_status_updates() {
-        update_shortcut_status(CapabilityStatus::Failed("Key registration error".to_string()));
+        update_shortcut_status(CapabilityStatus::Failed(
+            "Key registration error".to_string(),
+        ));
         let runtime = get_runtime_capabilities();
         assert_eq!(
             runtime.shortcut,

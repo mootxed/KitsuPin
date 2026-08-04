@@ -30,7 +30,6 @@ pub struct IntegrationStatus {
     pub platform_capabilities: Option<crate::capabilities::PlatformCapabilities>,
     pub runtime_capabilities: Option<crate::capabilities::RuntimeCapabilities>,
     pub problems: Vec<IntegrationProblem>,
-
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -319,8 +318,8 @@ pub fn get_integration_status(
             id: "wayland_session".into(),
             severity: "warning".into(),
             title: "Сеанс Wayland обнаружен".into(),
-            description:
-                "В Wayland автоматический фоновый мониторинг Clipboard сейчас отключён.".into(),
+            description: "В Wayland автоматический фоновый мониторинг Clipboard сейчас отключён."
+                .into(),
             action: None,
         });
     }
