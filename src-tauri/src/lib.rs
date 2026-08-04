@@ -523,6 +523,12 @@ fn get_platform_capabilities() -> capabilities::PlatformCapabilities {
     capabilities::get_platform_capabilities()
 }
 
+#[tauri::command]
+fn get_runtime_capabilities() -> capabilities::RuntimeCapabilities {
+    capabilities::get_runtime_capabilities()
+}
+
+
 fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
@@ -1171,7 +1177,8 @@ pub fn run() {
             open_extension_dir,
             open_chrome_extensions_page,
             hide_popup,
-            get_platform_capabilities
+            get_platform_capabilities,
+            get_runtime_capabilities
         ])
         .setup(move |app| {
             let popup_window = WebviewWindowBuilder::new(
@@ -1197,6 +1204,9 @@ pub fn run() {
 
             if let Err(error) = setup_tray(app) {
                 log::error!("KDE System Tray недоступен: {error}");
+                capabilities::update_tray_status(capabilities::CapabilityStatus::Failed(error.to_string()));
+            } else {
+                capabilities::update_tray_status(capabilities::CapabilityStatus::Available);
             }
 
             let shortcut = settings.get().shortcut;
@@ -1204,7 +1214,11 @@ pub fn run() {
                 log::error!("Горячая клавиша недоступна: {e}");
                 // Clear tracked shortcut so user can re-set it via settings.
                 *app.state::<AppState>().registered_shortcut.lock() = None;
+                capabilities::update_shortcut_status(capabilities::CapabilityStatus::Failed(e.to_string()));
+            } else {
+                capabilities::update_shortcut_status(capabilities::CapabilityStatus::Available);
             }
+
 
             // Set up late-reconciliation callback: when Chrome metadata arrives via socket,
             // try to attach it to a recently saved clipboard entry.

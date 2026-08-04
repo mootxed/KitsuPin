@@ -28,7 +28,9 @@ pub struct IntegrationStatus {
     pub shortcut_registered: Option<bool>,
     pub autostart_enabled: bool,
     pub platform_capabilities: Option<crate::capabilities::PlatformCapabilities>,
+    pub runtime_capabilities: Option<crate::capabilities::RuntimeCapabilities>,
     pub problems: Vec<IntegrationProblem>,
+
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -405,6 +407,7 @@ pub fn get_integration_status(
     }
 
     let platform_capabilities = Some(crate::capabilities::get_platform_capabilities());
+    let runtime_capabilities = Some(crate::capabilities::get_runtime_capabilities());
 
     IntegrationStatus {
         is_linux,
@@ -429,8 +432,10 @@ pub fn get_integration_status(
         shortcut_registered,
         autostart_enabled,
         platform_capabilities,
+        runtime_capabilities,
         problems,
     }
+
 }
 
 pub fn save_user_extension_manifest(extension_id: &str) -> Result<PathBuf, String> {

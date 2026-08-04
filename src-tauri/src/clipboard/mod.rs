@@ -1,5 +1,7 @@
-pub mod backend;
+pub mod backends;
 pub mod session;
+
+pub use backends::ClipboardNotification;
 
 use crate::{
     browser_metadata::MetadataBuffer,
@@ -316,13 +318,6 @@ impl ClipboardGeneration {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct X11ClipboardNotification {
-    pub sequence: u64,
-    pub owner: u32,
-    pub timestamp: u32,
-}
-
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum RepublishDecision {
     Republish,
@@ -351,43 +346,6 @@ pub fn evaluate_republish(
     }
 }
 
-fn x11_notifications(
-    generation: Arc<ClipboardGeneration>,
-) -> anyhow::Result<Receiver<X11ClipboardNotification>> {
-    let (sender, receiver) = mpsc::channel();
-    let (connection, screen_number) = x11rb::connect(None)?;
-    connection.xfixes_query_version(5, 0)?.reply()?;
-    let clipboard = connection.intern_atom(false, b"CLIPBOARD")?.reply()?.atom;
-    let root = connection.setup().roots[screen_number].root;
-    connection.xfixes_select_selection_input(
-        root,
-        clipboard,
-        SelectionEventMask::SET_SELECTION_OWNER,
-    )?;
-    connection.flush()?;
-    std::thread::spawn(move || loop {
-        match connection.wait_for_event() {
-            Ok(Event::XfixesSelectionNotify(event)) if event.selection == clipboard => {
-                let sequence = generation.next();
-                let notification = X11ClipboardNotification {
-                    sequence,
-                    owner: event.owner,
-                    timestamp: event.timestamp,
-                };
-                if sender.send(notification).is_err() {
-                    break;
-                }
-            }
-            Ok(_) => {}
-            Err(error) => {
-                log::warn!("XFixes Clipboard notifications stopped: {error}");
-                break;
-            }
-        }
-    });
-    Ok(receiver)
-}
-
 pub fn start(
     app: AppHandle,
     repo: Arc<Repository>,
@@ -399,31 +357,31 @@ pub fn start(
 ) {
     let generation = Arc::new(ClipboardGeneration::default());
     let generation_clone = Arc::clone(&generation);
-    let selected_backend = backend::select_backend();
+    let selected_monitor = backends::select_monitor();
     log::info!(
-        "Clipboard watcher starting with backend: {} (session: {})",
-        selected_backend.name(),
-        selected_backend.session_type()
+        "Clipboard watcher starting with monitor: {} (session: {})",
+        selected_monitor.name(),
+        selected_monitor.session_type()
     );
 
     std::thread::spawn(move || {
-        if !selected_backend.supports_passive_monitoring() {
-            log::info!(
-                "Passive global clipboard monitoring disabled for session type '{}'. KitsuPin running in limited support mode.",
-                selected_backend.session_type()
-            );
-            loop {
-                std::thread::sleep(Duration::from_secs(3600));
-            }
-        }
-
-        let notifications = match x11_notifications(generation_clone) {
-            Ok(receiver) => Some(receiver),
+        let notifications = match selected_monitor.start(generation_clone) {
+            Ok(receiver) => receiver,
             Err(error) => {
-                log::warn!("XFixes unavailable, using Clipboard polling fallback: {error}");
+                log::warn!("Clipboard monitor startup failed: {error}");
                 None
             }
         };
+
+        if !selected_monitor.supports_passive_monitoring() || notifications.is_none() {
+            log::info!(
+                "Passive global clipboard monitoring disabled for session type '{}'. KitsuPin running in limited support mode.",
+                selected_monitor.session_type()
+            );
+            return;
+        }
+
+        let notifications = notifications.expect("notifications receiver exists");
         let initial_limits = settings.get();
         let mut last_fingerprint = access
             .read_payload(initial_limits.max_image_size_mb as u64 * 1024 * 1024)
@@ -432,24 +390,20 @@ pub fn start(
             .unwrap_or_default();
 
         loop {
-            let (from_event, notif) = if let Some(receiver) = &notifications {
-                match receiver.recv_timeout(Duration::from_millis(500)) {
-                    Ok(mut first_notif) => {
-                        while let Ok(newer_notif) = receiver.try_recv() {
-                            first_notif = newer_notif;
-                        }
-                        (true, Some(first_notif))
+            let (from_event, notif) = match notifications.recv_timeout(Duration::from_millis(500)) {
+                Ok(mut first_notif) => {
+                    while let Ok(newer_notif) = notifications.try_recv() {
+                        first_notif = newer_notif;
                     }
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => {
-                        std::thread::sleep(Duration::from_millis(350));
-                        (false, None)
-                    }
+                    (true, Some(first_notif))
                 }
-            } else {
-                std::thread::sleep(Duration::from_millis(350));
-                (false, None)
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    log::warn!("Clipboard notifications channel disconnected");
+                    break;
+                }
             };
+
 
             let captured_owner_before = access.inspect_x11_clipboard("watcher before read");
             let captured_gen = generation.current();

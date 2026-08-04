@@ -1096,3 +1096,33 @@ body.is-dragging-card .chip.user-chip {
   from { transform: translate(-50%, -10px); opacity: 0; }
   to { transform: translate(-50%, 0); opacity: 1; }
 }
+
+/* ── Wayland Warning Banner ────────────────────────────────────────────────── */
+.wayland-warning-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  background: color-mix(in oklch, var(--warning) 12%, var(--surface));
+  border: 1px solid color-mix(in oklch, var(--warning) 35%, transparent);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.wayland-warning-banner svg {
+  width: 20px;
+  height: 20px;
+  color: var(--warning);
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.wayland-warning-banner strong {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+

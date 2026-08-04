@@ -10,7 +10,8 @@ KitsuPin состоит из одного долгоживущего Tauri-пр�
 |---|---|
 | `src-tauri/src/domain` | Нормализация, классификация, модели, дедупликация |
 | `src-tauri/src/persistence` | SQLite, миграции 1–8, trigram FTS5, short-query fallback, attach_metadata_with_receipt |
-| `src-tauri/src/clipboard` | XFixes-события только для `CLIPBOARD`, чтение и подавление собственных событий; polling 350 мс — аварийный fallback |
+| `src-tauri/src/clipboard` | Модульный `ClipboardMonitor` trait (`x11.rs`, `wayland.rs`, `disabled.rs`); XFixes-события для X11 `CLIPBOARD`, чтение и подавление собственных событий; passive limited mode для Wayland |
+| `src-tauri/src/capabilities.rs` | Платформенные `PlatformCapabilities` и динаимческие `RuntimeCapabilities` со статусами `CapabilityStatus` (`Available`, `Unavailable`, `Failed`, `NotTested`) |
 | `src-tauri/src/browser_metadata` | Unix socket, буфер событий Chrome с `event_id: Uuid`, `ClipUpsertReceipt`, `take_matching_receipt`, cleanup по времени |
 | `src-tauri/src/jobs` | Очистка устаревшей незакреплённой истории |
 | `src-tauri/src/settings` | Настройки (write-fsync-rename), XDG Autostart, consume_invalid_warning |
@@ -20,7 +21,8 @@ KitsuPin состоит из одного долгоживущего Tauri-пр�
 | `src-tauri/src/lib.rs` | Команды Tauri, окна, tray, регистрация горячих клавиш с обработкой `registered_shortcut = None`, single-instance lock |
 | `src/` | TypeScript UI; режим выбирается по query `?mode=popup` |
 | `chrome-extension/` | Manifest V3 content script, service worker, status page |
-| `scripts/` | Установка native manifest и autostart для текущего пользователя |
+| `scripts/` | Установка native manifest, autostart и проверка структуры RPM/DEB |
+
 
 ---
 

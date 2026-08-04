@@ -18,6 +18,27 @@ export interface IntegrationProblem {
   action: string | null;
 }
 
+export interface CapabilityStatus {
+  status: "available" | "unavailable" | "failed" | "notTested";
+  message?: string;
+}
+
+export interface PlatformCapabilities {
+  sessionType: string;
+  globalClipboardMonitoring: boolean;
+  imageClipboard: boolean;
+  globalShortcuts: boolean;
+  tray: boolean;
+  monitoringModeDescription: string;
+}
+
+export interface RuntimeCapabilities {
+  platform: PlatformCapabilities;
+  clipboardMonitoring: CapabilityStatus;
+  shortcut: CapabilityStatus;
+  tray: CapabilityStatus;
+}
+
 export interface IntegrationStatus {
   isLinux: boolean;
   desktopEnvironment: string | null;
@@ -40,5 +61,8 @@ export interface IntegrationStatus {
   handshakeActive: boolean;
   shortcutRegistered: boolean | null;
   autostartEnabled: boolean;
+  platformCapabilities?: PlatformCapabilities;
+  runtimeCapabilities?: RuntimeCapabilities;
   problems: IntegrationProblem[];
 }
+

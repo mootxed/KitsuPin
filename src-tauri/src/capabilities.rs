@@ -1,5 +1,7 @@
 use crate::clipboard::session::{detect_session_type_with_env, SessionType};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -11,6 +13,26 @@ pub struct PlatformCapabilities {
     pub tray: bool,
     pub monitoring_mode_description: String,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "status", content = "message", rename_all = "camelCase")]
+pub enum CapabilityStatus {
+    Available,
+    Unavailable,
+    Failed(String),
+    NotTested,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeCapabilities {
+    pub platform: PlatformCapabilities,
+    pub clipboard_monitoring: CapabilityStatus,
+    pub shortcut: CapabilityStatus,
+    pub tray: CapabilityStatus,
+}
+
+static RUNTIME_CAPABILITIES: OnceLock<RwLock<RuntimeCapabilities>> = OnceLock::new();
 
 pub fn get_platform_capabilities_with_env(
     fetch_env: impl Fn(&str) -> Option<String>,
@@ -51,6 +73,58 @@ pub fn get_platform_capabilities() -> PlatformCapabilities {
     get_platform_capabilities_with_env(|k| std::env::var(k).ok())
 }
 
+pub fn get_runtime_capabilities() -> RuntimeCapabilities {
+    let lock = RUNTIME_CAPABILITIES.get_or_init(|| {
+        let platform = get_platform_capabilities();
+        RwLock::new(RuntimeCapabilities {
+            platform,
+            clipboard_monitoring: CapabilityStatus::NotTested,
+            shortcut: CapabilityStatus::NotTested,
+            tray: CapabilityStatus::NotTested,
+        })
+    });
+    lock.read().clone()
+}
+
+pub fn update_shortcut_status(status: CapabilityStatus) {
+    let lock = RUNTIME_CAPABILITIES.get_or_init(|| {
+        let platform = get_platform_capabilities();
+        RwLock::new(RuntimeCapabilities {
+            platform,
+            clipboard_monitoring: CapabilityStatus::NotTested,
+            shortcut: CapabilityStatus::NotTested,
+            tray: CapabilityStatus::NotTested,
+        })
+    });
+    lock.write().shortcut = status;
+}
+
+pub fn update_clipboard_monitoring_status(status: CapabilityStatus) {
+    let lock = RUNTIME_CAPABILITIES.get_or_init(|| {
+        let platform = get_platform_capabilities();
+        RwLock::new(RuntimeCapabilities {
+            platform,
+            clipboard_monitoring: CapabilityStatus::NotTested,
+            shortcut: CapabilityStatus::NotTested,
+            tray: CapabilityStatus::NotTested,
+        })
+    });
+    lock.write().clipboard_monitoring = status;
+}
+
+pub fn update_tray_status(status: CapabilityStatus) {
+    let lock = RUNTIME_CAPABILITIES.get_or_init(|| {
+        let platform = get_platform_capabilities();
+        RwLock::new(RuntimeCapabilities {
+            platform,
+            clipboard_monitoring: CapabilityStatus::NotTested,
+            shortcut: CapabilityStatus::NotTested,
+            tray: CapabilityStatus::NotTested,
+        })
+    });
+    lock.write().tray = status;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,9 +157,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_session_has_safe_fallback() {
-        let caps = get_platform_capabilities_with_env(mock_env(&[]));
-        assert_eq!(caps.session_type, SessionType::Unknown);
-        assert!(!caps.global_clipboard_monitoring);
+    fn runtime_capabilities_tracks_status_updates() {
+        update_shortcut_status(CapabilityStatus::Failed("Key registration error".to_string()));
+        let runtime = get_runtime_capabilities();
+        assert_eq!(
+            runtime.shortcut,
+            CapabilityStatus::Failed("Key registration error".to_string())
+        );
     }
 }

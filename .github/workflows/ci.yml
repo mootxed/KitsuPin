@@ -265,3 +265,38 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # ── Fedora 43 RPM Install & CLI Smoke Test ───────────────────────────────
+  fedora-container-test:
+    name: Fedora 43 RPM (install · CLI smoke test)
+    needs: tauri-rpm-build
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:43
+    steps:
+      - name: Download RPM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: kitsupin-rpm
+          path: ./rpm-dist
+
+      - name: Install RPM and test CLI in Fedora 43
+        run: |
+          RPM=$(find ./rpm-dist -type f -name "*.rpm" -print -quit)
+          if [[ -z "$RPM" ]]; then
+            echo "::error::RPM package was not found in ./rpm-dist"
+            exit 1
+          fi
+
+          echo "=== Installing RPM on Fedora 43 via dnf ==="
+          dnf install -y procps-ng
+          dnf install -y "$RPM"
+
+          echo "=== rpm -q kitsupin ==="
+          rpm -q kitsupin
+
+          echo "=== CLI smoke tests ==="
+          kitsupin --version
+          kitsupin --help
+          kitsupin --diagnose || true
+
+

@@ -1241,6 +1241,25 @@ async function reload() {
   // Update recording status indicator
   if (!popup && state.settings) updateRecordingStatus(state.settings.paused);
 
+  // Check Wayland session status & show banner if limited mode active
+  if (!popup && isTauri) {
+    try {
+      const status = await api.getIntegrationStatus();
+      if (status.sessionType === "Wayland" || status.runtimeCapabilities?.clipboardMonitoring.status === "unavailable") {
+        const waylandBanner = document.querySelector<HTMLElement>("#wayland-warning");
+        if (waylandBanner) waylandBanner.hidden = false;
+
+        const dot = document.querySelector<HTMLElement>("#status-dot");
+        const text = document.querySelector<HTMLElement>("#status-text");
+        if (dot) dot.className = "dot paused";
+        if (text) text.textContent = "Wayland ограниченный режим";
+      }
+    } catch {
+      // Ignore errors fetching status
+    }
+  }
+
+
   // 6.4: show invalid-settings warning only once per session (not on each reload).
   if (!invalidWarningConsumed && !popup) {
     const shouldWarn = await api.consumeInvalidSettingsWarning();
