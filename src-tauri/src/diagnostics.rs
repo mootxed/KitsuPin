@@ -309,7 +309,7 @@ pub fn get_integration_status(
             id: "os_not_linux".into(),
             severity: "error".into(),
             title: "Операционная система не Linux".into(),
-            description: "KitsuPin официально поддерживается только в Linux (Ubuntu 24.04).".into(),
+            description: "KitsuPin поддерживает Ubuntu/Debian через DEB и Fedora через RPM.".into(),
             action: None,
         });
     }
@@ -319,7 +319,7 @@ pub fn get_integration_status(
             id: "wayland_session".into(),
             severity: "warning".into(),
             title: "Сеанс Wayland обнаружен".into(),
-            description: "В сеансе Wayland глобальные горячие клавиши и доступ к буферу обмена X11 могут работать с ограничениями. Рекомендуется сеанс X11.".into(),
+            description: "В Wayland автоматический фоновый мониторинг Clipboard сейчас отключён.".into(),
             action: None,
         });
     }
@@ -360,7 +360,7 @@ pub fn get_integration_status(
             id: "manifest_missing".into(),
             severity: "warning".into(),
             title: "Native Messaging manifest отсутствует".into(),
-            description: "Chrome-расширение не сможет подключиться к KitsuPin. Введите ID расширения или используйте production .deb пакет.".into(),
+            description: "Chrome-расширение не сможет подключиться к KitsuPin. Введите ID расширения или используйте официальный DEB- или RPM-пакет.".into(),
             action: Some("configure_id".into()),
         });
     } else if !native_manifest_valid {

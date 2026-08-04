@@ -265,13 +265,16 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # ── Fedora 43 RPM Install & CLI Smoke Test ───────────────────────────────
+  # ── Fedora RPM Install & CLI Smoke Test (Matrix Fedora 42 & 43) ───────────
   fedora-container-test:
-    name: Fedora 43 RPM (install · CLI smoke test)
+    name: Fedora ${{ matrix.fedora }} RPM (install · CLI smoke test)
     needs: tauri-rpm-build
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        fedora: ["42", "43"]
     container:
-      image: fedora:43
+      image: fedora:${{ matrix.fedora }}
     steps:
       - name: Download RPM artifact
         uses: actions/download-artifact@v4
@@ -279,7 +282,7 @@ jobs:
           name: kitsupin-rpm
           path: ./rpm-dist
 
-      - name: Install RPM and test CLI in Fedora 43
+      - name: Install RPM and test CLI in Fedora ${{ matrix.fedora }}
         run: |
           RPM=$(find ./rpm-dist -type f -name "*.rpm" -print -quit)
           if [[ -z "$RPM" ]]; then
@@ -287,7 +290,7 @@ jobs:
             exit 1
           fi
 
-          echo "=== Installing RPM on Fedora 43 via dnf ==="
+          echo "=== Installing RPM on Fedora ${{ matrix.fedora }} via dnf ==="
           dnf install -y procps-ng
           dnf install -y "$RPM"
 
@@ -297,6 +300,25 @@ jobs:
           echo "=== CLI smoke tests ==="
           kitsupin --version
           kitsupin --help
-          kitsupin --diagnose || true
+
+          set +e
+          DIAG_OUTPUT=$(kitsupin --diagnose 2>&1)
+          DIAG_CODE=$?
+          set -e
+
+          printf '%s\n' "$DIAG_OUTPUT"
+          grep -q "KitsuPin Integration Diagnostics" <<< "$DIAG_OUTPUT"
+
+          if [[ "$DIAG_CODE" -ne 0 && "$DIAG_CODE" -ne 1 ]]; then
+            echo "::error::Unexpected diagnose exit code: $DIAG_CODE"
+            exit 1
+          fi
+
+          echo "=== Testing dnf remove ==="
+          dnf remove -y kitsupin
+
+          test ! -e /usr/bin/kitsupin
+          test ! -e /usr/lib/kitsupin
+          test ! -e /etc/xdg/autostart/kitsupin.desktop
 
 

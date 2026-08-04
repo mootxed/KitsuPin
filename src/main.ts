@@ -1245,7 +1245,13 @@ async function reload() {
   if (!popup && isTauri) {
     try {
       const status = await api.getIntegrationStatus();
-      if (status.sessionType === "Wayland" || status.runtimeCapabilities?.clipboardMonitoring.status === "unavailable") {
+      const isWayland =
+        status.sessionType?.toLowerCase() === "wayland" ||
+        status.runtimeCapabilities?.platform.sessionType?.toLowerCase() === "wayland";
+      const isUnavailable =
+        status.runtimeCapabilities?.clipboardMonitoring.status === "unavailable";
+
+      if (isWayland || isUnavailable) {
         const waylandBanner = document.querySelector<HTMLElement>("#wayland-warning");
         if (waylandBanner) waylandBanner.hidden = false;
 

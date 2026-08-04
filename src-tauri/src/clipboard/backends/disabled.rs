@@ -1,8 +1,7 @@
 use crate::capabilities::{update_clipboard_monitoring_status, CapabilityStatus};
-use crate::clipboard::backends::{ClipboardMonitor, ClipboardNotification};
+use crate::clipboard::backends::{ClipboardMonitor, MonitorMode};
 use crate::clipboard::session::SessionType;
 use crate::clipboard::ClipboardGeneration;
-use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
 pub struct DisabledClipboardMonitor;
@@ -23,9 +22,9 @@ impl ClipboardMonitor for DisabledClipboardMonitor {
     fn start(
         &self,
         _generation: Arc<ClipboardGeneration>,
-    ) -> anyhow::Result<Option<Receiver<ClipboardNotification>>> {
+    ) -> anyhow::Result<MonitorMode> {
         log::info!("Passive global clipboard monitoring disabled for unknown graphics session.");
         update_clipboard_monitoring_status(CapabilityStatus::Unavailable);
-        Ok(None)
+        Ok(MonitorMode::Disabled)
     }
 }

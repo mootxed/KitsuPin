@@ -1,16 +1,39 @@
 pub mod disabled;
+pub mod polling;
 pub mod wayland;
 pub mod x11;
 
 use crate::clipboard::session::{detect_session_type, SessionType};
 use crate::clipboard::ClipboardGeneration;
 use std::sync::{mpsc::Receiver, Arc};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClipboardNotification {
-    pub sequence: u64,
-    pub owner: u32,
-    pub timestamp: u32,
+pub enum ClipboardNotification {
+    Changed {
+        sequence: u64,
+    },
+    X11Changed {
+        sequence: u64,
+        owner: u32,
+        timestamp: u32,
+    },
+}
+
+impl ClipboardNotification {
+    pub fn sequence(&self) -> u64 {
+        match self {
+            ClipboardNotification::Changed { sequence } => *sequence,
+            ClipboardNotification::X11Changed { sequence, .. } => *sequence,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum MonitorMode {
+    EventDriven(Receiver<ClipboardNotification>),
+    Polling(Duration),
+    Disabled,
 }
 
 pub trait ClipboardMonitor: Send + Sync {
@@ -20,7 +43,7 @@ pub trait ClipboardMonitor: Send + Sync {
     fn start(
         &self,
         generation: Arc<ClipboardGeneration>,
-    ) -> anyhow::Result<Option<Receiver<ClipboardNotification>>>;
+    ) -> anyhow::Result<MonitorMode>;
 }
 
 pub fn select_monitor() -> Box<dyn ClipboardMonitor> {
@@ -41,3 +64,4 @@ mod tests {
         assert!(!monitor.name().is_empty());
     }
 }
+

@@ -365,23 +365,37 @@ pub fn start(
     );
 
     std::thread::spawn(move || {
-        let notifications = match selected_monitor.start(generation_clone) {
-            Ok(receiver) => receiver,
+        let mode = match selected_monitor.start(generation_clone) {
+            Ok(mode) => mode,
             Err(error) => {
-                log::warn!("Clipboard monitor startup failed: {error}");
-                None
+                log::warn!("Clipboard monitor startup failed: {error}. Falling back to polling.");
+                crate::capabilities::update_clipboard_monitoring_status(
+                    crate::capabilities::CapabilityStatus::Failed(error.to_string()),
+                );
+                backends::MonitorMode::Polling(Duration::from_millis(350))
             }
         };
 
-        if !selected_monitor.supports_passive_monitoring() || notifications.is_none() {
-            log::info!(
-                "Passive global clipboard monitoring disabled for session type '{}'. KitsuPin running in limited support mode.",
-                selected_monitor.session_type()
-            );
-            return;
+        let mut polling_interval: Option<Duration> = None;
+        let mut notifications: Option<Receiver<ClipboardNotification>> = None;
+
+        match mode {
+            backends::MonitorMode::Disabled => {
+                log::info!(
+                    "Passive global clipboard monitoring disabled for session type '{}'. KitsuPin running in limited support mode.",
+                    selected_monitor.session_type()
+                );
+                return;
+            }
+            backends::MonitorMode::EventDriven(rx) => {
+                notifications = Some(rx);
+            }
+            backends::MonitorMode::Polling(interval) => {
+                log::info!("Clipboard watcher starting in polling fallback mode ({interval:?})");
+                polling_interval = Some(interval);
+            }
         }
 
-        let notifications = notifications.expect("notifications receiver exists");
         let initial_limits = settings.get();
         let mut last_fingerprint = access
             .read_payload(initial_limits.max_image_size_mb as u64 * 1024 * 1024)
@@ -390,32 +404,49 @@ pub fn start(
             .unwrap_or_default();
 
         loop {
-            let (from_event, notif) = match notifications.recv_timeout(Duration::from_millis(500)) {
-                Ok(mut first_notif) => {
-                    while let Ok(newer_notif) = notifications.try_recv() {
-                        first_notif = newer_notif;
+            let (from_event, notif) = if let Some(ref rx) = notifications {
+                match rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(mut first_notif) => {
+                        while let Ok(newer_notif) = rx.try_recv() {
+                            first_notif = newer_notif;
+                        }
+                        (true, Some(first_notif))
                     }
-                    (true, Some(first_notif))
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        log::warn!(
+                            "Clipboard notifications channel disconnected. Switching to emergency polling fallback."
+                        );
+                        crate::capabilities::update_clipboard_monitoring_status(
+                            crate::capabilities::CapabilityStatus::Failed(
+                                "Event notifications stream disconnected".to_string(),
+                            ),
+                        );
+                        notifications = None;
+                        polling_interval = Some(Duration::from_millis(350));
+                        continue;
+                    }
                 }
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => {
-                    log::warn!("Clipboard notifications channel disconnected");
-                    break;
-                }
+            } else if let Some(interval) = polling_interval {
+                std::thread::sleep(interval);
+                (false, None)
+            } else {
+                break;
             };
-
 
             let captured_owner_before = access.inspect_x11_clipboard("watcher before read");
             let captured_gen = generation.current();
 
             if let (Some(n), Some(curr_owner)) = (notif, captured_owner_before) {
-                if n.owner != curr_owner && n.owner != 0 {
-                    log::info!(
-                        "X11 event sequence {} owner window ID {} differs from current owner window ID {}; reading current selection",
-                        n.sequence,
-                        n.owner,
-                        curr_owner
-                    );
+                if let ClipboardNotification::X11Changed { owner, sequence, .. } = n {
+                    if owner != curr_owner && owner != 0 {
+                        log::info!(
+                            "X11 event sequence {} owner window ID {} differs from current owner window ID {}; reading current selection",
+                            sequence,
+                            owner,
+                            curr_owner
+                        );
+                    }
                 }
             }
 

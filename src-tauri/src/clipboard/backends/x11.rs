@@ -1,9 +1,9 @@
 use crate::capabilities::{update_clipboard_monitoring_status, CapabilityStatus};
-use crate::clipboard::backends::{ClipboardMonitor, ClipboardNotification};
+use crate::clipboard::backends::{ClipboardMonitor, ClipboardNotification, MonitorMode};
 use crate::clipboard::session::SessionType;
 use crate::clipboard::ClipboardGeneration;
 use std::sync::{mpsc, Arc};
-use std::sync::mpsc::Receiver;
+use std::time::Duration;
 use x11rb::{
     connection::Connection,
     protocol::{
@@ -15,23 +15,11 @@ use x11rb::{
 
 pub struct X11ClipboardMonitor;
 
-impl ClipboardMonitor for X11ClipboardMonitor {
-    fn name(&self) -> &'static str {
-        "x11-xfixes"
-    }
-
-    fn session_type(&self) -> SessionType {
-        SessionType::X11
-    }
-
-    fn supports_passive_monitoring(&self) -> bool {
-        true
-    }
-
-    fn start(
+impl X11ClipboardMonitor {
+    fn try_start_xfixes(
         &self,
         generation: Arc<ClipboardGeneration>,
-    ) -> anyhow::Result<Option<Receiver<ClipboardNotification>>> {
+    ) -> anyhow::Result<mpsc::Receiver<ClipboardNotification>> {
         let (sender, receiver) = mpsc::channel();
         let (connection, screen_number) = x11rb::connect(None)?;
         connection.xfixes_query_version(5, 0)?.reply()?;
@@ -44,13 +32,11 @@ impl ClipboardMonitor for X11ClipboardMonitor {
         )?;
         connection.flush()?;
 
-        update_clipboard_monitoring_status(CapabilityStatus::Available);
-
         std::thread::spawn(move || loop {
             match connection.wait_for_event() {
                 Ok(Event::XfixesSelectionNotify(event)) if event.selection == clipboard => {
                     let sequence = generation.next();
-                    let notification = ClipboardNotification {
+                    let notification = ClipboardNotification::X11Changed {
                         sequence,
                         owner: event.owner,
                         timestamp: event.timestamp,
@@ -68,6 +54,34 @@ impl ClipboardMonitor for X11ClipboardMonitor {
             }
         });
 
-        Ok(Some(receiver))
+        Ok(receiver)
+    }
+}
+
+impl ClipboardMonitor for X11ClipboardMonitor {
+    fn name(&self) -> &'static str {
+        "x11-xfixes"
+    }
+
+    fn session_type(&self) -> SessionType {
+        SessionType::X11
+    }
+
+    fn supports_passive_monitoring(&self) -> bool {
+        true
+    }
+
+    fn start(&self, generation: Arc<ClipboardGeneration>) -> anyhow::Result<MonitorMode> {
+        match self.try_start_xfixes(generation) {
+            Ok(receiver) => {
+                update_clipboard_monitoring_status(CapabilityStatus::Available);
+                Ok(MonitorMode::EventDriven(receiver))
+            }
+            Err(error) => {
+                log::warn!("X11 XFixes initialization failed: {error}. Falling back to polling.");
+                update_clipboard_monitoring_status(CapabilityStatus::Failed(error.to_string()));
+                Ok(MonitorMode::Polling(Duration::from_millis(350)))
+            }
+        }
     }
 }
