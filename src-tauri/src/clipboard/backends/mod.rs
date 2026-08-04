@@ -20,6 +20,7 @@ pub enum ClipboardNotification {
 }
 
 impl ClipboardNotification {
+    #[allow(dead_code)]
     pub fn sequence(&self) -> u64 {
         match self {
             ClipboardNotification::Changed { sequence } => *sequence,
@@ -38,6 +39,7 @@ pub enum MonitorMode {
 pub trait ClipboardMonitor: Send + Sync {
     fn name(&self) -> &'static str;
     fn session_type(&self) -> SessionType;
+    #[allow(dead_code)]
     fn supports_passive_monitoring(&self) -> bool;
     fn start(
         &self,

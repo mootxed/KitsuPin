@@ -319,7 +319,8 @@ pub fn get_integration_status(
             id: "wayland_session".into(),
             severity: "warning".into(),
             title: "Сеанс Wayland обнаружен".into(),
-            description: "В Wayland автоматический фоновый мониторинг Clipboard сейчас отключён.".into(),
+            description:
+                "В Wayland автоматический фоновый мониторинг Clipboard сейчас отключён.".into(),
             action: None,
         });
     }
@@ -435,7 +436,6 @@ pub fn get_integration_status(
         runtime_capabilities,
         problems,
     }
-
 }
 
 pub fn save_user_extension_manifest(extension_id: &str) -> Result<PathBuf, String> {

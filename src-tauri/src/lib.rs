@@ -528,7 +528,6 @@ fn get_runtime_capabilities() -> capabilities::RuntimeCapabilities {
     capabilities::get_runtime_capabilities()
 }
 
-
 fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
@@ -1222,7 +1221,6 @@ pub fn run() {
             } else {
                 capabilities::update_shortcut_status(capabilities::CapabilityStatus::Available);
             }
-
 
             // Set up late-reconciliation callback: when Chrome metadata arrives via socket,
             // try to attach it to a recently saved clipboard entry.
